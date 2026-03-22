@@ -206,12 +206,13 @@ impl DefinitionStore {
         let published_at = now_unix_seconds();
         let mut published_definition = draft.definition;
         published_definition.workflow_version = workflow_version;
+        let published_content_hash = content_hash(&published_definition)?;
 
         let published = StoredWorkflowDefinition {
             workflow_id: workflow_id.to_owned(),
             workflow_version,
             definition: published_definition,
-            content_hash: validated_content_hash.to_owned(),
+            content_hash: published_content_hash,
             created_at: published_at,
             published_at: Some(published_at),
         };

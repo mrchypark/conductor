@@ -4,6 +4,7 @@ use workflow_definition::{
     StepMetadata, TaskMetadata, Trigger, WorkflowDefaults,
 };
 use workflow_engine::{PublishDraftError, ValidationIssue, WorkflowEngineApp};
+use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn definition_publish_creates_new_immutable_workflow_version() {
@@ -39,6 +40,11 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
             .expect("task metadata")
             .handler,
         "inventory.reserve"
+    );
+    assert_eq!(
+        published_v1.content_hash,
+        definition_hash(&published_v1.definition),
+        "published content hash should match the immutable published payload"
     );
 
     harness
@@ -93,6 +99,11 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
             .expect("task metadata")
             .handler,
         "inventory.reserve.v2"
+    );
+    assert_eq!(
+        published_v2.content_hash,
+        definition_hash(&published_v2.definition),
+        "published content hash should match the immutable published payload"
     );
 
     let published_versions = harness
@@ -261,4 +272,11 @@ fn invalid_definition_missing_trigger(workflow_id: &str) -> FlowDefinition {
         trigger: None,
         ..valid_definition(workflow_id, "inventory.reserve.invalid")
     }
+}
+
+fn definition_hash(definition: &FlowDefinition) -> String {
+    let json = serde_json::to_vec(definition).expect("definition should serialize");
+    let mut hasher = Sha256::new();
+    hasher.update(json);
+    format!("{:x}", hasher.finalize())
 }

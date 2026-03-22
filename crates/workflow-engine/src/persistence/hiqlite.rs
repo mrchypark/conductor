@@ -174,7 +174,7 @@ impl HiqlitePersistence {
                     created_at,
                     published_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, NULL, $6, $7)
                 "#,
                 params!(
                     record.workflow_id.clone(),
@@ -345,8 +345,8 @@ fn local_node_config(base_dir: &Path) -> NodeConfig {
         addr_raft: raft_addr.clone(),
         addr_api: api_addr.clone(),
     }];
-    config.listen_addr_api = api_addr.into();
-    config.listen_addr_raft = raft_addr.into();
+    config.listen_addr_api = "127.0.0.1".into();
+    config.listen_addr_raft = "127.0.0.1".into();
     config.data_dir = PathBuf::from(base_dir.join("hiqlite"))
         .display()
         .to_string()
