@@ -1,0 +1,87 @@
+use std::collections::HashSet;
+
+use crate::{FlowDefinition, StepDefinition, StepKind};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    MissingTrigger,
+    DuplicateStepId {
+        step_id: String,
+    },
+    UnknownEdgeSource {
+        edge_from: String,
+        edge_to: String,
+    },
+    UnknownEdgeTarget {
+        edge_from: String,
+        edge_to: String,
+    },
+    UnsupportedStepKindMetadata {
+        step_id: String,
+        kind: StepKind,
+        metadata_field: String,
+    },
+}
+
+pub fn validate_definition(definition: &FlowDefinition) -> Result<(), ValidationError> {
+    if definition.trigger.is_none() {
+        return Err(ValidationError::MissingTrigger);
+    }
+
+    let mut step_ids = HashSet::new();
+    for step in &definition.steps {
+        if !step_ids.insert(step.step_id.as_str()) {
+            return Err(ValidationError::DuplicateStepId {
+                step_id: step.step_id.clone(),
+            });
+        }
+
+        validate_step_metadata(step)?;
+    }
+
+    for edge in &definition.edges {
+        if !step_ids.contains(edge.from.as_str()) {
+            return Err(ValidationError::UnknownEdgeSource {
+                edge_from: edge.from.clone(),
+                edge_to: edge.to.clone(),
+            });
+        }
+
+        if !step_ids.contains(edge.to.as_str()) {
+            return Err(ValidationError::UnknownEdgeTarget {
+                edge_from: edge.from.clone(),
+                edge_to: edge.to.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_step_metadata(step: &StepDefinition) -> Result<(), ValidationError> {
+    let expected = match step.kind {
+        StepKind::Task => "task",
+        StepKind::Sleep => "sleep",
+        StepKind::WaitForEvent => "wait_for_event",
+        StepKind::Branch => "branch",
+        StepKind::EmitEvent => "emit_event",
+    };
+
+    for metadata_field in [
+        ("task", step.metadata.task.is_some()),
+        ("sleep", step.metadata.sleep.is_some()),
+        ("wait_for_event", step.metadata.wait_for_event.is_some()),
+        ("branch", step.metadata.branch.is_some()),
+        ("emit_event", step.metadata.emit_event.is_some()),
+    ] {
+        if metadata_field.1 && metadata_field.0 != expected {
+            return Err(ValidationError::UnsupportedStepKindMetadata {
+                step_id: step.step_id.clone(),
+                kind: step.kind,
+                metadata_field: metadata_field.0.to_owned(),
+            });
+        }
+    }
+
+    Ok(())
+}
