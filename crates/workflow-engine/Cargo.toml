@@ -5,3 +5,16 @@ edition = "2021"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+hiqlite = { version = "0.12.2", default-features = false, features = ["sqlite"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+workflow-definition = { path = "../workflow-definition" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+workflow-definition = { path = "../workflow-definition" }
