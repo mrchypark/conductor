@@ -4,8 +4,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use workflow_definition::{
-    EventTrigger, FlowDefinition, StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger,
-    WaitForEventMetadata, WorkflowDefaults,
+    BranchMetadata, EventTrigger, FlowDefinition, StepDefinition, StepKind, StepMetadata,
+    TaskMetadata, Trigger, WaitForEventMetadata, WorkflowDefaults,
 };
 use workflow_engine::WorkflowEngineApp;
 use workflow_worker::{Capability, InProcessWorker, RunOnceOutcome, WorkerRegistry};
@@ -454,6 +454,61 @@ async fn http_run_subresources_return_not_found_for_unknown_run() {
     }
 }
 
+#[tokio::test]
+async fn http_event_ingest_returns_conflict_for_invalid_runtime_definition() {
+    let harness = TestHarness::start().await;
+    harness
+        .app
+        .replace_draft(invalid_branch_definition("orders"))
+        .await
+        .expect("draft should replace");
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("draft should validate");
+    assert!(validation.ok);
+    harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect("draft should publish");
+
+    let response = harness
+        .app
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/events")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "events": [
+                            {
+                                "id": "evt-invalid-1",
+                                "name": "order.created",
+                                "data": {
+                                    "order_id": "ord-123"
+                                }
+                            }
+                        ]
+                    }))
+                    .expect("event request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("event request should complete");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let body = String::from_utf8(body.to_vec()).expect("body should be utf-8");
+    assert!(body.contains("branch expression"));
+}
+
 struct TestHarness {
     _tempdir: TempDir,
     app: WorkflowEngineApp,
@@ -534,5 +589,27 @@ fn waiting_definition(workflow_id: &str) -> FlowDefinition {
                 to: "notify_customer".to_owned(),
             },
         ],
+    }
+}
+
+fn invalid_branch_definition(workflow_id: &str) -> FlowDefinition {
+    FlowDefinition {
+        workflow_id: workflow_id.to_owned(),
+        workflow_version: 0,
+        defaults: WorkflowDefaults::default(),
+        trigger: Some(Trigger::Event(EventTrigger {
+            event_type: "order.created".to_owned(),
+        })),
+        steps: vec![StepDefinition {
+            id: "unsupported_branch".to_owned(),
+            kind: StepKind::Branch,
+            metadata: StepMetadata {
+                branch: Some(BranchMetadata {
+                    expression: "event.data.priority > 1".to_owned(),
+                }),
+                ..StepMetadata::default()
+            },
+        }],
+        edges: Vec::new(),
     }
 }

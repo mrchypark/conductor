@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{EventEnvelope, EventIngestResult, WorkflowEngineApp};
+use crate::{EventEnvelope, EventIngestResult, TaskRuntimeError, WorkflowEngineApp};
 
 #[derive(Debug, Deserialize)]
 pub struct EventsRequest {
@@ -35,7 +35,20 @@ pub async fn post_events(
     app.ingest_events(envelopes)
         .await
         .map(Json)
-        .map_err(internal_error)
+        .map_err(runtime_error)
+}
+
+fn runtime_error(error: TaskRuntimeError) -> (StatusCode, String) {
+    match error {
+        TaskRuntimeError::RunNotFound { .. } => (StatusCode::NOT_FOUND, "run not found".to_owned()),
+        TaskRuntimeError::MissingHandlerMetadata { .. }
+        | TaskRuntimeError::PublishedWorkflowVersionNotFound { .. }
+        | TaskRuntimeError::UnsupportedStepKind { .. }
+        | TaskRuntimeError::UnsupportedBranchExpression { .. } => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        other => internal_error(other),
+    }
 }
 
 fn internal_error(error: impl ToString) -> (StatusCode, String) {

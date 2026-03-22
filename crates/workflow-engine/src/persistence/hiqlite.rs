@@ -1003,10 +1003,15 @@ impl HiqlitePersistence {
         lease_expiry: i64,
         leased_at: i64,
     ) -> Result<Option<TaskLeaseRecord>, PersistenceError> {
-        let queued_rows = self
-            .client
-            .query_as::<TaskQueueRow, _>(
-                r#"
+        if poll.queues.is_empty() || poll.capabilities.is_empty() {
+            return Ok(None);
+        }
+
+        let queue_placeholders = sql_placeholders(3, poll.queues.len());
+        let capability_placeholders =
+            sql_placeholders(3 + poll.queues.len(), poll.capabilities.len());
+        let query = format!(
+            r#"
                 SELECT
                     t.task_id,
                     t.run_id,
@@ -1025,20 +1030,22 @@ impl HiqlitePersistence {
                     t.leased_by_worker_id
                 FROM task_queue t
                 INNER JOIN workflow_runs r ON r.run_id = t.run_id
-                WHERE t.status = $1 AND r.status = $2
+                WHERE t.status = $1
+                    AND r.status = $2
+                    AND t.queue_name IN ({queue_placeholders})
+                    AND t.capability IN ({capability_placeholders})
                 ORDER BY t.created_at ASC
-                "#,
-                params!(TASK_STATUS_QUEUED, "running".to_owned()),
-            )
+                "#
+        );
+        let mut query_params = params!(TASK_STATUS_QUEUED, "running".to_owned());
+        query_params.extend(poll.queues.iter().cloned().map(Param::from));
+        query_params.extend(poll.capabilities.iter().cloned().map(Param::from));
+        let queued_rows = self
+            .client
+            .query_as::<TaskQueueRow, _>(query, query_params)
             .await?;
 
-        for row in queued_rows.into_iter().filter(|row| {
-            poll.queues.iter().any(|queue| queue == &row.queue_name)
-                && poll
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == &row.capability)
-        }) {
+        for row in queued_rows {
             let attempt_sequence = row.attempt_sequence + 1;
             let attempt_id = format!("attempt-{attempt_sequence}");
             let fencing_token = row.active_fencing_token.unwrap_or(0) + 1;
@@ -2050,6 +2057,13 @@ fn txn_counts(results: Vec<Result<usize, hiqlite::Error>>) -> Result<Vec<usize>,
         .into_iter()
         .map(|result| result.map_err(PersistenceError::Hiqlite))
         .collect()
+}
+
+fn sql_placeholders(start_index: usize, count: usize) -> String {
+    (start_index..start_index + count)
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn free_port() -> u16 {
