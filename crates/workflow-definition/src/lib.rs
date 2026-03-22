@@ -12,19 +12,21 @@ mod tests {
         validate::{validate_definition, ValidationError},
         BranchMetadata, Edge, EmitEventMetadata, EventTrigger, FlowDefinition, SleepMetadata,
         StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger, WaitForEventMetadata,
+        WorkflowDefaults,
     };
 
     #[test]
     fn definition_roundtrip_serializes() {
         let definition = FlowDefinition {
-            flow_id: "order-fulfillment".to_owned(),
-            version: 1,
+            workflow_id: "order-fulfillment".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
             trigger: Some(Trigger::Event(EventTrigger {
                 event_type: "order.created".to_owned(),
             })),
             steps: vec![
                 StepDefinition {
-                    step_id: "reserve_inventory".to_owned(),
+                    id: "reserve_inventory".to_owned(),
                     kind: StepKind::Task,
                     metadata: StepMetadata {
                         task: Some(TaskMetadata {
@@ -34,7 +36,7 @@ mod tests {
                     },
                 },
                 StepDefinition {
-                    step_id: "wait_payment".to_owned(),
+                    id: "wait_payment".to_owned(),
                     kind: StepKind::WaitForEvent,
                     metadata: StepMetadata {
                         wait_for_event: Some(WaitForEventMetadata {
@@ -44,7 +46,7 @@ mod tests {
                     },
                 },
                 StepDefinition {
-                    step_id: "notify".to_owned(),
+                    id: "notify".to_owned(),
                     kind: StepKind::EmitEvent,
                     metadata: StepMetadata {
                         emit_event: Some(EmitEventMetadata {
@@ -71,29 +73,30 @@ mod tests {
         assert_eq!(
             json,
             json!({
-                "flow_id": "order-fulfillment",
-                "version": 1,
+                "workflow_id": "order-fulfillment",
+                "workflow_version": 1,
+                "defaults": {},
                 "trigger": {
                     "type": "event",
                     "event_type": "order.created"
                 },
                 "steps": [
                     {
-                        "step_id": "reserve_inventory",
+                        "id": "reserve_inventory",
                         "kind": "task",
                         "task": {
                             "handler": "inventory.reserve"
                         }
                     },
                     {
-                        "step_id": "wait_payment",
+                        "id": "wait_payment",
                         "kind": "wait_for_event",
                         "wait_for_event": {
                             "event_type": "payment.captured"
                         }
                     },
                     {
-                        "step_id": "notify",
+                        "id": "notify",
                         "kind": "emit_event",
                         "emit_event": {
                             "event_type": "order.ready"
@@ -122,13 +125,14 @@ mod tests {
     #[test]
     fn definition_rejects_unknown_edge_target() {
         let definition = FlowDefinition {
-            flow_id: "missing-edge-target".to_owned(),
-            version: 1,
+            workflow_id: "missing-edge-target".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
             trigger: Some(Trigger::Event(EventTrigger {
                 event_type: "order.created".to_owned(),
             })),
             steps: vec![StepDefinition {
-                step_id: "start".to_owned(),
+                id: "start".to_owned(),
                 kind: StepKind::Task,
                 metadata: StepMetadata {
                     task: Some(TaskMetadata {
@@ -158,14 +162,15 @@ mod tests {
     #[test]
     fn definition_rejects_duplicate_step_ids() {
         let definition = FlowDefinition {
-            flow_id: "duplicate-step".to_owned(),
-            version: 1,
+            workflow_id: "duplicate-step".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
             trigger: Some(Trigger::Event(EventTrigger {
                 event_type: "order.created".to_owned(),
             })),
             steps: vec![
                 StepDefinition {
-                    step_id: "start".to_owned(),
+                    id: "start".to_owned(),
                     kind: StepKind::Task,
                     metadata: StepMetadata {
                         task: Some(TaskMetadata {
@@ -175,7 +180,7 @@ mod tests {
                     },
                 },
                 StepDefinition {
-                    step_id: "start".to_owned(),
+                    id: "start".to_owned(),
                     kind: StepKind::Sleep,
                     metadata: StepMetadata {
                         sleep: Some(SleepMetadata { seconds: 30 }),
@@ -200,8 +205,9 @@ mod tests {
     #[test]
     fn definition_rejects_missing_trigger() {
         let definition = FlowDefinition {
-            flow_id: "missing-trigger".to_owned(),
-            version: 1,
+            workflow_id: "missing-trigger".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
             trigger: None,
             steps: vec![],
             edges: vec![],
@@ -216,13 +222,14 @@ mod tests {
     #[test]
     fn definition_rejects_unsupported_step_kind_metadata() {
         let definition = FlowDefinition {
-            flow_id: "invalid-metadata".to_owned(),
-            version: 1,
+            workflow_id: "invalid-metadata".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
             trigger: Some(Trigger::Event(EventTrigger {
                 event_type: "order.created".to_owned(),
             })),
             steps: vec![StepDefinition {
-                step_id: "branch".to_owned(),
+                id: "branch".to_owned(),
                 kind: StepKind::Branch,
                 metadata: StepMetadata {
                     task: Some(TaskMetadata {
@@ -262,13 +269,14 @@ mod tests {
 
         for (step_id, kind, metadata_field) in cases {
             let definition = FlowDefinition {
-                flow_id: format!("missing-{metadata_field}"),
-                version: 1,
+                workflow_id: format!("missing-{metadata_field}"),
+                workflow_version: 1,
+                defaults: WorkflowDefaults::default(),
                 trigger: Some(Trigger::Event(EventTrigger {
                     event_type: "order.created".to_owned(),
                 })),
                 steps: vec![StepDefinition {
-                    step_id: step_id.to_owned(),
+                    id: step_id.to_owned(),
                     kind,
                     metadata: StepMetadata::default(),
                 }],

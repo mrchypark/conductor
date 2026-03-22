@@ -9,7 +9,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        CompleteTask, EmitEvent, FailTask, HeartbeatLease, TaskMutationContext, TaskOutput,
+        CompleteTask, EmitEvent, FailTask, FailurePayload, HeartbeatLease, PollTask,
+        TaskMutationContext, TaskOutput,
     };
 
     #[test]
@@ -47,6 +48,72 @@ mod tests {
     }
 
     #[test]
+    fn poll_task_serializes_worker_boundary() {
+        let poll = PollTask {
+            worker_id: "worker-a".into(),
+            worker_name: "payments-worker".into(),
+            queues: vec!["payments".into(), "priority".into()],
+            capabilities: vec!["emit_event".into(), "sleep".into()],
+            max_inflight: 32,
+        };
+
+        let json = serde_json::to_value(&poll).expect("poll task serializes");
+
+        assert_eq!(
+            json,
+            json!({
+                "worker_id": "worker-a",
+                "worker_name": "payments-worker",
+                "queues": ["payments", "priority"],
+                "capabilities": ["emit_event", "sleep"],
+                "max_inflight": 32
+            })
+        );
+    }
+
+    #[test]
+    fn fail_task_contains_structured_failure_payload() {
+        let fail = FailTask {
+            lease: TaskMutationContext {
+                task_id: "task-123".into(),
+                attempt_id: "attempt-9".into(),
+                worker_id: "worker-a".into(),
+                fencing_token: 42,
+            },
+            failure: FailurePayload {
+                classification: "application".into(),
+                code: "PAYMENT_DECLINED".into(),
+                message: "processor rejected the card".into(),
+                retryable: false,
+                details: json!({
+                    "provider": "stripe"
+                }),
+            },
+        };
+
+        let json = serde_json::to_value(&fail).expect("fail task serializes");
+
+        assert_eq!(
+            json,
+            json!({
+                "task_id": "task-123",
+                "attempt_id": "attempt-9",
+                "worker_id": "worker-a",
+                "fencing_token": 42,
+                "failure": {
+                    "classification": "application",
+                    "code": "PAYMENT_DECLINED",
+                    "message": "processor rejected the card",
+                    "retryable": false,
+                    "details": {
+                        "provider": "stripe"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
     fn task_mutations_share_lease_fields() {
         let heartbeat = serde_json::to_value(HeartbeatLease {
             lease: TaskMutationContext {
@@ -65,7 +132,13 @@ mod tests {
                 worker_id: "worker-a".into(),
                 fencing_token: 42,
             },
-            error: "task failed".into(),
+            failure: FailurePayload {
+                classification: "application".into(),
+                code: "PAYMENT_DECLINED".into(),
+                message: "task failed".into(),
+                retryable: false,
+                details: json!({}),
+            },
         })
         .expect("fail task serializes");
 

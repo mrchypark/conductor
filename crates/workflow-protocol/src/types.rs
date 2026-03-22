@@ -5,6 +5,9 @@ pub type RunId = String;
 pub type TaskId = String;
 pub type AttemptId = String;
 pub type WorkerId = String;
+pub type WorkerName = String;
+pub type QueueName = String;
+pub type Capability = String;
 pub type FencingToken = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,4 +21,13 @@ pub struct TaskMutationContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOutput {
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailurePayload {
+    pub classification: String,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub details: Value,
 }

@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowDefinition {
-    pub flow_id: String,
-    pub version: u32,
+    #[serde(alias = "flow_id")]
+    pub workflow_id: String,
+    #[serde(alias = "version")]
+    pub workflow_version: u32,
+    #[serde(default)]
+    pub defaults: WorkflowDefaults,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<Trigger>,
     #[serde(default)]
@@ -25,11 +29,15 @@ pub struct EventTrigger {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepDefinition {
-    pub step_id: String,
+    #[serde(alias = "step_id")]
+    pub id: String,
     pub kind: StepKind,
     #[serde(flatten)]
     pub metadata: StepMetadata,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefaults {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

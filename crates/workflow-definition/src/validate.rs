@@ -35,9 +35,9 @@ pub fn validate_definition(definition: &FlowDefinition) -> Result<(), Validation
 
     let mut step_ids = HashSet::new();
     for step in &definition.steps {
-        if !step_ids.insert(step.step_id.as_str()) {
+        if !step_ids.insert(step.id.as_str()) {
             return Err(ValidationError::DuplicateStepId {
-                step_id: step.step_id.clone(),
+                step_id: step.id.clone(),
             });
         }
 
@@ -74,7 +74,7 @@ fn validate_step_metadata(step: &StepDefinition) -> Result<(), ValidationError> 
 
     if !present {
         return Err(ValidationError::MissingRequiredStepMetadata {
-            step_id: step.step_id.clone(),
+            step_id: step.id.clone(),
             kind: step.kind,
             metadata_field: expected.to_owned(),
         });
@@ -89,7 +89,7 @@ fn validate_step_metadata(step: &StepDefinition) -> Result<(), ValidationError> 
     ] {
         if metadata_field.1 && metadata_field.0 != expected {
             return Err(ValidationError::UnsupportedStepKindMetadata {
-                step_id: step.step_id.clone(),
+                step_id: step.id.clone(),
                 kind: step.kind,
                 metadata_field: metadata_field.0.to_owned(),
             });
