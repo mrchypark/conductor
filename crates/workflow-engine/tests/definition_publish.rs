@@ -157,24 +157,42 @@ async fn definition_publish_persists_run_pinning_metadata() {
     let harness = TestHarness::start().await;
 
     harness.publish("orders", "inventory.reserve").await;
-    harness.publish("orders", "inventory.reserve.v2").await;
 
-    let created_run = harness
+    let pinned_run_v1 = harness
         .app
         .create_run_for_latest_published("run-001", "orders")
         .await
         .expect("run metadata should persist");
-    assert_eq!(created_run.run_id, "run-001");
-    assert_eq!(created_run.workflow_id, "orders");
-    assert_eq!(created_run.workflow_version, 2);
+    assert_eq!(pinned_run_v1.run_id, "run-001");
+    assert_eq!(pinned_run_v1.workflow_id, "orders");
+    assert_eq!(pinned_run_v1.workflow_version, 1);
 
-    let persisted_run = harness
+    harness.publish("orders", "inventory.reserve.v2").await;
+
+    let persisted_pinned_run_v1 = harness
         .app
         .get_run("run-001")
         .await
         .expect("run lookup should succeed")
         .expect("run metadata should exist");
-    assert_eq!(persisted_run, created_run);
+    assert_eq!(persisted_pinned_run_v1, pinned_run_v1);
+    assert_eq!(persisted_pinned_run_v1.workflow_version, 1);
+
+    let new_run_v2 = harness
+        .app
+        .create_run_for_latest_published("run-002", "orders")
+        .await
+        .expect("new run metadata should persist");
+    assert_eq!(new_run_v2.workflow_version, 2);
+
+    let persisted_new_run_v2 = harness
+        .app
+        .get_run("run-002")
+        .await
+        .expect("new run lookup should succeed")
+        .expect("new run metadata should exist");
+    assert_eq!(persisted_new_run_v2, new_run_v2);
+    assert_eq!(persisted_new_run_v2.workflow_version, 2);
 }
 
 struct TestHarness {
