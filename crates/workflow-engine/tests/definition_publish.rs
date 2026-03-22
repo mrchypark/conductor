@@ -211,7 +211,8 @@ async fn definition_publish_persists_run_pinning_metadata() {
 async fn rust_builder_compiles_and_validates_before_publish() {
     fn fetch_order() {}
 
-    let harness = TestHarness::start().await;
+    let registry = WorkerRegistry::new();
+    let harness = TestHarness::start_with_registry(registry.clone()).await;
     let compiled = WorkflowBuilder::new("orders")
         .workflow_version(7)
         .event_trigger("order.created")
@@ -321,7 +322,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
 
     let missing_handler = harness
         .app
-        .publish_draft_with_registry("orders", &validation.content_hash, &WorkerRegistry::new())
+        .publish_draft("orders", &validation.content_hash)
         .await
         .expect_err("publish should reject missing handler metadata");
     assert!(matches!(
@@ -330,7 +331,6 @@ async fn rust_builder_compiles_and_validates_before_publish() {
             if handler_id == "orders.fetch" && capability == Capability::Task.as_str()
     ));
 
-    let registry = WorkerRegistry::new();
     registry
         .register("orders.fetch", fetch_order)
         .capability(Capability::Task)
@@ -351,7 +351,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
 
     let published = harness
         .app
-        .publish_draft_with_registry("orders", &validation.content_hash, &registry)
+        .publish_draft("orders", &validation.content_hash)
         .await
         .expect("publish should succeed once manifest metadata exists");
 
@@ -377,6 +377,18 @@ impl TestHarness {
     async fn start() -> Self {
         let tempdir = TempDir::new().expect("temporary directory should exist");
         let app = WorkflowEngineApp::for_test(tempdir.path())
+            .await
+            .expect("test app should start");
+
+        Self {
+            _tempdir: tempdir,
+            app,
+        }
+    }
+
+    async fn start_with_registry(registry: WorkerRegistry) -> Self {
+        let tempdir = TempDir::new().expect("temporary directory should exist");
+        let app = WorkflowEngineApp::for_test_with_registry(tempdir.path(), registry)
             .await
             .expect("test app should start");
 

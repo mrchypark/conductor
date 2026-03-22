@@ -1,4 +1,7 @@
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
@@ -21,8 +24,9 @@ pub struct HandlerRegistration {
     pub timeout_seconds: Option<u64>,
 }
 
+#[derive(Clone)]
 pub struct WorkerRegistry {
-    registrations: RefCell<BTreeMap<String, HandlerRegistration>>,
+    registrations: Arc<RwLock<BTreeMap<String, HandlerRegistration>>>,
 }
 
 impl Default for WorkerRegistry {
@@ -34,7 +38,7 @@ impl Default for WorkerRegistry {
 impl WorkerRegistry {
     pub fn new() -> Self {
         Self {
-            registrations: RefCell::new(BTreeMap::new()),
+            registrations: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -47,7 +51,10 @@ impl WorkerRegistry {
         F: 'static,
     {
         let handler_id = handler_id.into();
-        self.registrations.borrow_mut().insert(
+        self.registrations
+            .write()
+            .expect("worker registry lock should not be poisoned")
+            .insert(
             handler_id.clone(),
             HandlerRegistration {
                 handler_id: handler_id.clone(),
@@ -65,14 +72,19 @@ impl WorkerRegistry {
 
     pub fn manifest(&self) -> Vec<HandlerRegistration> {
         self.registrations
-            .borrow()
+            .read()
+            .expect("worker registry lock should not be poisoned")
             .values()
             .cloned()
             .collect::<Vec<_>>()
     }
 
     pub fn registration(&self, handler_id: &str) -> Option<HandlerRegistration> {
-        self.registrations.borrow().get(handler_id).cloned()
+        self.registrations
+            .read()
+            .expect("worker registry lock should not be poisoned")
+            .get(handler_id)
+            .cloned()
     }
 }
 
@@ -99,7 +111,8 @@ impl<'a> HandlerRegistrationBuilder<'a> {
         if let Some(registration) = self
             .registry
             .registrations
-            .borrow_mut()
+            .write()
+            .expect("worker registry lock should not be poisoned")
             .get_mut(self.handler_id.as_str())
         {
             apply(registration);

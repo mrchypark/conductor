@@ -120,11 +120,22 @@ pub enum PublishDraftError {
 #[derive(Clone)]
 pub struct DefinitionStore {
     persistence: HiqlitePersistence,
+    registry: Option<WorkerRegistry>,
 }
 
 impl DefinitionStore {
     pub fn new(persistence: HiqlitePersistence) -> Self {
-        Self { persistence }
+        Self {
+            persistence,
+            registry: None,
+        }
+    }
+
+    pub fn with_registry(persistence: HiqlitePersistence, registry: WorkerRegistry) -> Self {
+        Self {
+            persistence,
+            registry: Some(registry),
+        }
     }
 
     pub async fn replace_draft(
@@ -191,20 +202,9 @@ impl DefinitionStore {
         let draft = self
             .validated_draft_for_publish(workflow_id, validated_content_hash)
             .await?;
-
-        self.publish_loaded_draft(workflow_id, draft).await
-    }
-
-    pub async fn publish_draft_with_registry(
-        &self,
-        workflow_id: &str,
-        validated_content_hash: &str,
-        registry: &WorkerRegistry,
-    ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
-        let draft = self
-            .validated_draft_for_publish(workflow_id, validated_content_hash)
-            .await?;
-        validate_task_handlers(&draft.definition, registry)?;
+        if let Some(registry) = self.registry.as_ref() {
+            validate_task_handlers(&draft.definition, registry)?;
+        }
 
         self.publish_loaded_draft(workflow_id, draft).await
     }

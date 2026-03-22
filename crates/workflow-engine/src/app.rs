@@ -20,6 +20,15 @@ impl WorkflowEngineApp {
         Ok(Self { definitions })
     }
 
+    pub async fn for_test_with_registry(
+        base_dir: &Path,
+        registry: WorkerRegistry,
+    ) -> Result<Self, WorkflowEngineError> {
+        let persistence = HiqlitePersistence::for_test(base_dir).await?;
+        let definitions = DefinitionStore::with_registry(persistence, registry);
+        Ok(Self { definitions })
+    }
+
     pub async fn replace_draft(
         &self,
         definition: FlowDefinition,
@@ -41,17 +50,6 @@ impl WorkflowEngineApp {
     ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
         self.definitions
             .publish_draft(workflow_id, validated_content_hash)
-            .await
-    }
-
-    pub async fn publish_draft_with_registry(
-        &self,
-        workflow_id: &str,
-        validated_content_hash: &str,
-        registry: &WorkerRegistry,
-    ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
-        self.definitions
-            .publish_draft_with_registry(workflow_id, validated_content_hash, registry)
             .await
     }
 
