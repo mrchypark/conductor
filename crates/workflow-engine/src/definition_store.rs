@@ -217,6 +217,8 @@ impl DefinitionStore {
         let draft = self
             .validated_draft_for_publish(workflow_id, validated_content_hash)
             .await?;
+        // Published definitions are immutable, so reject drafts that reference
+        // task handlers the current worker manifest cannot execute.
         validate_task_handlers(&draft.definition, &self.registry)?;
 
         self.publish_loaded_draft(workflow_id, draft).await
