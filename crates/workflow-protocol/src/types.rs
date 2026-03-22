@@ -2,12 +2,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub type RunId = String;
+pub type WorkflowId = String;
+pub type WorkflowVersion = u32;
 pub type TaskId = String;
 pub type AttemptId = String;
 pub type WorkerId = String;
 pub type WorkerName = String;
 pub type QueueName = String;
 pub type Capability = String;
+pub type StepId = String;
+pub type StepKindName = String;
+pub type RunStatus = String;
 pub type FencingToken = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

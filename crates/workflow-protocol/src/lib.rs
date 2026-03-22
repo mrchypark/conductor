@@ -9,8 +9,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        CompleteTask, EmitEvent, FailTask, FailurePayload, HeartbeatLease, PollTask,
-        TaskMutationContext, TaskOutput,
+        AssignedTask, CompleteTask, EmitEvent, FailTask, FailurePayload, GetRunResponse,
+        HeartbeatLease, PollTask, PollTaskResponse, TaskMutationContext, TaskOutput,
     };
 
     #[test]
@@ -67,6 +67,73 @@ mod tests {
                 "queues": ["payments", "priority"],
                 "capabilities": ["emit_event", "sleep"],
                 "max_inflight": 32
+            })
+        );
+    }
+
+    #[test]
+    fn poll_task_response_serializes_assigned_or_empty() {
+        let assigned = serde_json::to_value(PollTaskResponse::Assigned(AssignedTask {
+            task_id: "task-123".into(),
+            run_id: "run-456".into(),
+            attempt_id: "attempt-9".into(),
+            fencing_token: 42,
+            workflow_id: "order-fulfillment".into(),
+            workflow_version: 1,
+            step_id: "reserve_inventory".into(),
+            step_kind: "task".into(),
+            input: json!({
+                "order_id": "ord-1"
+            }),
+        }))
+        .expect("assigned poll response serializes");
+
+        let empty =
+            serde_json::to_value(PollTaskResponse::NoTaskAvailable).expect("empty poll serializes");
+
+        assert_eq!(
+            assigned,
+            json!({
+                "status": "assigned",
+                "task_id": "task-123",
+                "run_id": "run-456",
+                "attempt_id": "attempt-9",
+                "fencing_token": 42,
+                "workflow_id": "order-fulfillment",
+                "workflow_version": 1,
+                "step_id": "reserve_inventory",
+                "step_kind": "task",
+                "input": {
+                    "order_id": "ord-1"
+                }
+            })
+        );
+        assert_eq!(
+            empty,
+            json!({
+                "status": "no_task_available"
+            })
+        );
+    }
+
+    #[test]
+    fn get_run_response_serializes_basic_run_inspection() {
+        let response = GetRunResponse {
+            run_id: "run-456".into(),
+            workflow_id: "order-fulfillment".into(),
+            workflow_version: 1,
+            status: "running".into(),
+        };
+
+        let json = serde_json::to_value(&response).expect("get run response serializes");
+
+        assert_eq!(
+            json,
+            json!({
+                "run_id": "run-456",
+                "workflow_id": "order-fulfillment",
+                "workflow_version": 1,
+                "status": "running"
             })
         );
     }
