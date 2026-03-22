@@ -243,8 +243,6 @@ async fn definition_publish_requires_handler_metadata_in_default_app_constructio
 
 #[tokio::test]
 async fn rust_builder_compiles_and_validates_before_publish() {
-    fn fetch_order() {}
-
     let harness = TestHarness::start().await;
     let compiled = WorkflowBuilder::new("orders")
         .workflow_version(7)
@@ -367,7 +365,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
 
     harness
         .registry
-        .register("orders.fetch", fetch_order)
+        .define_handler("orders.fetch")
         .capability(Capability::Task)
         .default_queue("orders")
         .timeout_seconds(45);
@@ -703,12 +701,10 @@ impl TestHarness {
 
     fn register_task_handler(&self, handler: &str) {
         self.registry
-            .register(handler, noop_handler)
+            .define_handler(handler)
             .capability(Capability::Task);
     }
 }
-
-fn noop_handler() {}
 
 fn valid_definition(workflow_id: &str, handler: &str) -> FlowDefinition {
     FlowDefinition {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use workflow_definition::Trigger;
 
 use super::{
@@ -122,7 +123,7 @@ impl TaskRuntime {
         payload: &Value,
         now: i64,
     ) -> Result<Vec<StartedRun>, TaskRuntimeError> {
-        let published_definitions = self.persistence.list_all_published_definitions().await?;
+        let published_definitions = self.persistence.list_latest_published_definitions().await?;
         let mut started_runs = Vec::new();
 
         for definition in
@@ -133,7 +134,11 @@ impl TaskRuntime {
                     None => false,
                 })
         {
-            let run_id = next_runtime_id("run");
+            let run_id = deterministic_run_id(
+                event_id,
+                &definition.workflow_id,
+                definition.workflow_version,
+            );
             let run = crate::definition_store::WorkflowRunRecord {
                 run_id: run_id.clone(),
                 workflow_id: definition.workflow_id.clone(),
@@ -144,7 +149,14 @@ impl TaskRuntime {
                 cancel_requested_at: None,
                 created_at: now,
             };
-            self.persistence.insert_run(&run).await?;
+            if !self.persistence.insert_run_if_absent(&run).await? {
+                started_runs.push(StartedRun {
+                    run_id,
+                    workflow_id: definition.workflow_id,
+                    workflow_version: definition.workflow_version,
+                });
+                continue;
+            }
             self.record_transition(
                 &run_id,
                 "run_started",
@@ -236,4 +248,15 @@ impl TaskRuntime {
 
         Ok(started_runs)
     }
+}
+
+fn deterministic_run_id(event_id: &str, workflow_id: &str, workflow_version: u32) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(event_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(workflow_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(workflow_version.to_string().as_bytes());
+    let digest = hasher.finalize();
+    format!("run-{digest:x}")
 }

@@ -11,11 +11,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = app.worker_registry();
 
     registry
-        .register("orders.fetch", noop_handler)
+        .define_handler("orders.fetch")
         .capability(Capability::Task)
         .default_queue("default");
     registry
-        .register("orders.notify", noop_handler)
+        .define_handler("orders.notify")
         .capability(Capability::Task)
         .default_queue("default");
 
@@ -127,5 +127,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
-fn noop_handler() {}

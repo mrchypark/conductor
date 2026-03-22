@@ -42,14 +42,7 @@ impl WorkerRegistry {
         }
     }
 
-    pub fn register<F>(
-        &self,
-        handler_id: impl Into<String>,
-        _handler: F,
-    ) -> HandlerRegistrationBuilder<'_>
-    where
-        F: 'static,
-    {
+    pub fn define_handler(&self, handler_id: impl Into<String>) -> HandlerRegistrationBuilder<'_> {
         let handler_id = handler_id.into();
         self.registrations
             .write()
@@ -68,6 +61,17 @@ impl WorkerRegistry {
             registry: self,
             handler_id,
         }
+    }
+
+    pub fn register<F>(
+        &self,
+        handler_id: impl Into<String>,
+        _handler: F,
+    ) -> HandlerRegistrationBuilder<'_>
+    where
+        F: 'static,
+    {
+        self.define_handler(handler_id)
     }
 
     pub fn manifest(&self) -> Vec<HandlerRegistration> {

@@ -37,6 +37,8 @@ pub enum PersistenceError {
     Hiqlite(#[from] hiqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Invariant(String),
 }
 
 #[derive(Clone)]
@@ -245,7 +247,7 @@ impl HiqlitePersistence {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    pub async fn list_all_published_definitions(
+    pub async fn list_latest_published_definitions(
         &self,
     ) -> Result<Vec<StoredWorkflowDefinition>, PersistenceError> {
         let rows = self
@@ -253,16 +255,24 @@ impl HiqlitePersistence {
             .query_as::<WorkflowDefinitionRow, _>(
                 r#"
                 SELECT
-                    workflow_id,
-                    workflow_version,
-                    definition_json,
-                    content_hash,
-                    last_validated_content_hash,
-                    created_at,
-                    published_at
-                FROM workflow_definitions
-                WHERE status = $1
-                ORDER BY workflow_id ASC, workflow_version DESC
+                    wd.workflow_id,
+                    wd.workflow_version,
+                    wd.definition_json,
+                    wd.content_hash,
+                    wd.last_validated_content_hash,
+                    wd.created_at,
+                    wd.published_at
+                FROM workflow_definitions wd
+                INNER JOIN (
+                    SELECT workflow_id, MAX(workflow_version) AS workflow_version
+                    FROM workflow_definitions
+                    WHERE status = $1
+                    GROUP BY workflow_id
+                ) latest
+                    ON latest.workflow_id = wd.workflow_id
+                    AND latest.workflow_version = wd.workflow_version
+                WHERE wd.status = $1
+                ORDER BY wd.workflow_id ASC
                 "#,
                 params!(STATUS_PUBLISHED),
             )
@@ -304,6 +314,47 @@ impl HiqlitePersistence {
     }
 
     pub async fn insert_run(&self, run: &WorkflowRunRecord) -> Result<(), PersistenceError> {
+        self.insert_run_if_absent(run).await?;
+        Ok(())
+    }
+
+    pub async fn insert_run_if_absent(
+        &self,
+        run: &WorkflowRunRecord,
+    ) -> Result<bool, PersistenceError> {
+        let inserted = self
+            .client
+            .execute(
+                r#"
+                INSERT OR IGNORE INTO workflow_runs (
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    status,
+                    cancel_reason,
+                    cancel_requested_by,
+                    cancel_requested_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                "#,
+                params!(
+                    run.run_id.clone(),
+                    run.workflow_id.clone(),
+                    run.workflow_version,
+                    run.status.clone(),
+                    run.cancel_reason.clone(),
+                    run.cancel_requested_by.clone(),
+                    run.cancel_requested_at,
+                    run.created_at
+                ),
+            )
+            .await?;
+        Ok(inserted == 1)
+    }
+
+    pub async fn insert_run_strict(&self, run: &WorkflowRunRecord) -> Result<(), PersistenceError> {
         self.client
             .execute(
                 r#"
@@ -1045,7 +1096,7 @@ impl HiqlitePersistence {
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
                     "#,
                     params!(
-                        attempt_id.clone(),
+                        format!("{}:{attempt_id}", row.task_id),
                         row.task_id.clone(),
                         attempt_id.clone(),
                         poll.worker_id.clone(),
@@ -1131,53 +1182,83 @@ impl HiqlitePersistence {
             return Ok(MutationApplyResult::AlreadyApplied);
         }
 
-        self.client
-            .execute(
-                r#"
-                UPDATE task_queue
-                SET status = $1, updated_at = $2
-                WHERE task_id = $3
-                "#,
-                params!(TASK_STATUS_COMPLETED, updated_at, lease.task_id.clone()),
-            )
-            .await?;
-        self.client
-            .execute(
-                r#"
-                DELETE FROM leases
-                WHERE task_id = $1 AND attempt_id = $2 AND worker_id = $3 AND fencing_token = $4
-                "#,
-                params!(
-                    lease.task_id.clone(),
-                    lease.attempt_id.clone(),
-                    lease.worker_id.clone(),
-                    lease.fencing_token as i64
+        let results = self
+            .client
+            .txn([
+                (
+                    r#"
+                    UPDATE task_queue
+                    SET status = $1, updated_at = $2
+                    WHERE task_id = $3
+                        AND status = $4
+                        AND active_attempt_id = $5
+                        AND active_fencing_token = $6
+                        AND leased_by_worker_id = $7
+                    "#,
+                    params!(
+                        TASK_STATUS_COMPLETED,
+                        updated_at,
+                        lease.task_id.clone(),
+                        TASK_STATUS_LEASED,
+                        lease.attempt_id.clone(),
+                        lease.fencing_token as i64,
+                        lease.worker_id.clone()
+                    ),
                 ),
-            )
-            .await?;
-        self.client
-            .execute(
-                r#"
-                UPDATE step_instances
-                SET status = $1,
-                    attempt_count = $2,
-                    output_json = $3,
-                    error_json = NULL,
-                    updated_at = $4
-                WHERE run_id = $5 AND step_id = $6
-                "#,
-                params!(
-                    TASK_STATUS_COMPLETED,
-                    row.attempt_sequence,
-                    serde_json::to_string(&result.payload)?,
-                    updated_at,
-                    row.run_id.clone(),
-                    row.step_id.clone()
+                (
+                    r#"
+                    DELETE FROM leases
+                    WHERE task_id = $1 AND attempt_id = $2 AND worker_id = $3 AND fencing_token = $4
+                    "#,
+                    params!(
+                        lease.task_id.clone(),
+                        lease.attempt_id.clone(),
+                        lease.worker_id.clone(),
+                        lease.fencing_token as i64
+                    ),
                 ),
-            )
+                (
+                    r#"
+                    UPDATE step_instances
+                    SET status = $1,
+                        attempt_count = $2,
+                        output_json = $3,
+                        error_json = NULL,
+                        updated_at = $4
+                    WHERE run_id = $5
+                        AND step_id = $6
+                        AND EXISTS (
+                            SELECT 1
+                            FROM task_queue
+                            WHERE task_id = $7
+                                AND status = $1
+                                AND active_attempt_id = $8
+                                AND active_fencing_token = $9
+                        )
+                    "#,
+                    params!(
+                        TASK_STATUS_COMPLETED,
+                        row.attempt_sequence,
+                        serde_json::to_string(&result.payload)?,
+                        updated_at,
+                        row.run_id.clone(),
+                        row.step_id.clone(),
+                        lease.task_id.clone(),
+                        lease.attempt_id.clone(),
+                        lease.fencing_token as i64
+                    ),
+                ),
+            ])
             .await?;
 
-        Ok(MutationApplyResult::Applied)
+        let counts = txn_counts(results)?;
+        match counts.as_slice() {
+            [1, 1, 1] => Ok(MutationApplyResult::Applied),
+            [0, 0, 0] => Ok(MutationApplyResult::Stale),
+            _ => Err(PersistenceError::Invariant(format!(
+                "complete_task produced unexpected row counts: {counts:?}"
+            ))),
+        }
     }
 
     pub async fn fail_task(
@@ -1198,53 +1279,83 @@ impl HiqlitePersistence {
             return Ok(MutationApplyResult::AlreadyApplied);
         }
 
-        self.client
-            .execute(
-                r#"
-                UPDATE task_queue
-                SET status = $1, updated_at = $2
-                WHERE task_id = $3
-                "#,
-                params!(TASK_STATUS_FAILED, updated_at, lease.task_id.clone()),
-            )
-            .await?;
-        self.client
-            .execute(
-                r#"
-                DELETE FROM leases
-                WHERE task_id = $1 AND attempt_id = $2 AND worker_id = $3 AND fencing_token = $4
-                "#,
-                params!(
-                    lease.task_id.clone(),
-                    lease.attempt_id.clone(),
-                    lease.worker_id.clone(),
-                    lease.fencing_token as i64
+        let results = self
+            .client
+            .txn([
+                (
+                    r#"
+                    UPDATE task_queue
+                    SET status = $1, updated_at = $2
+                    WHERE task_id = $3
+                        AND status = $4
+                        AND active_attempt_id = $5
+                        AND active_fencing_token = $6
+                        AND leased_by_worker_id = $7
+                    "#,
+                    params!(
+                        TASK_STATUS_FAILED,
+                        updated_at,
+                        lease.task_id.clone(),
+                        TASK_STATUS_LEASED,
+                        lease.attempt_id.clone(),
+                        lease.fencing_token as i64,
+                        lease.worker_id.clone()
+                    ),
                 ),
-            )
-            .await?;
-        self.client
-            .execute(
-                r#"
-                UPDATE step_instances
-                SET status = $1,
-                    attempt_count = $2,
-                    output_json = NULL,
-                    error_json = $3,
-                    updated_at = $4
-                WHERE run_id = $5 AND step_id = $6
-                "#,
-                params!(
-                    TASK_STATUS_FAILED,
-                    row.attempt_sequence,
-                    serde_json::to_string(failure)?,
-                    updated_at,
-                    row.run_id.clone(),
-                    row.step_id.clone()
+                (
+                    r#"
+                    DELETE FROM leases
+                    WHERE task_id = $1 AND attempt_id = $2 AND worker_id = $3 AND fencing_token = $4
+                    "#,
+                    params!(
+                        lease.task_id.clone(),
+                        lease.attempt_id.clone(),
+                        lease.worker_id.clone(),
+                        lease.fencing_token as i64
+                    ),
                 ),
-            )
+                (
+                    r#"
+                    UPDATE step_instances
+                    SET status = $1,
+                        attempt_count = $2,
+                        output_json = NULL,
+                        error_json = $3,
+                        updated_at = $4
+                    WHERE run_id = $5
+                        AND step_id = $6
+                        AND EXISTS (
+                            SELECT 1
+                            FROM task_queue
+                            WHERE task_id = $7
+                                AND status = $1
+                                AND active_attempt_id = $8
+                                AND active_fencing_token = $9
+                        )
+                    "#,
+                    params!(
+                        TASK_STATUS_FAILED,
+                        row.attempt_sequence,
+                        serde_json::to_string(failure)?,
+                        updated_at,
+                        row.run_id.clone(),
+                        row.step_id.clone(),
+                        lease.task_id.clone(),
+                        lease.attempt_id.clone(),
+                        lease.fencing_token as i64
+                    ),
+                ),
+            ])
             .await?;
 
-        Ok(MutationApplyResult::Applied)
+        let counts = txn_counts(results)?;
+        match counts.as_slice() {
+            [1, 1, 1] => Ok(MutationApplyResult::Applied),
+            [0, 0, 0] => Ok(MutationApplyResult::Stale),
+            _ => Err(PersistenceError::Invariant(format!(
+                "fail_task produced unexpected row counts: {counts:?}"
+            ))),
+        }
     }
 
     pub(crate) async fn get_task_snapshot(
@@ -1304,23 +1415,27 @@ impl HiqlitePersistence {
             .query_as::<TaskQueueRow, _>(
                 r#"
                 SELECT
-                    task_id,
-                    run_id,
-                    workflow_id,
-                    workflow_version,
-                    step_id,
-                    step_kind,
-                    handler_id,
-                    capability,
-                    queue_name,
-                    input_json,
-                    status,
-                    attempt_sequence,
-                    active_attempt_id,
-                    active_fencing_token,
-                    leased_by_worker_id
-                FROM task_queue
-                WHERE status = $1 AND (updated_at + 30) <= $2
+                    t.task_id,
+                    t.run_id,
+                    t.workflow_id,
+                    t.workflow_version,
+                    t.step_id,
+                    t.step_kind,
+                    t.handler_id,
+                    t.capability,
+                    t.queue_name,
+                    t.input_json,
+                    t.status,
+                    t.attempt_sequence,
+                    t.active_attempt_id,
+                    t.active_fencing_token,
+                    t.leased_by_worker_id
+                FROM task_queue t
+                INNER JOIN leases l
+                    ON l.task_id = t.task_id
+                    AND l.attempt_id = t.active_attempt_id
+                    AND l.fencing_token = t.active_fencing_token
+                WHERE t.status = $1 AND l.expires_at <= $2
                 "#,
                 params!(TASK_STATUS_LEASED, now),
             )
@@ -1328,47 +1443,53 @@ impl HiqlitePersistence {
 
         let mut requeued = Vec::new();
         for row in rows {
-            let updated = self
+            let results = self
                 .client
-                .execute(
-                    r#"
-                    UPDATE task_queue
-                    SET status = $1,
-                        leased_by_worker_id = NULL,
-                        updated_at = $2
-                    WHERE task_id = $3
-                        AND status = $4
-                        AND active_attempt_id = $5
-                        AND active_fencing_token = $6
-                    "#,
-                    params!(
-                        TASK_STATUS_QUEUED,
-                        now,
-                        row.task_id.clone(),
-                        TASK_STATUS_LEASED,
-                        row.active_attempt_id.clone(),
-                        row.active_fencing_token
+                .txn([
+                    (
+                        r#"
+                        UPDATE task_queue
+                        SET status = $1,
+                            leased_by_worker_id = NULL,
+                            updated_at = $2
+                        WHERE task_id = $3
+                            AND status = $4
+                            AND active_attempt_id = $5
+                            AND active_fencing_token = $6
+                        "#,
+                        params!(
+                            TASK_STATUS_QUEUED,
+                            now,
+                            row.task_id.clone(),
+                            TASK_STATUS_LEASED,
+                            row.active_attempt_id.clone(),
+                            row.active_fencing_token
+                        ),
                     ),
-                )
+                    (
+                        r#"
+                        DELETE FROM leases
+                        WHERE task_id = $1 AND attempt_id = $2 AND fencing_token = $3
+                        "#,
+                        params!(
+                            row.task_id.clone(),
+                            row.active_attempt_id.clone(),
+                            row.active_fencing_token
+                        ),
+                    ),
+                ])
                 .await?;
-            if updated != 1 {
-                continue;
-            }
 
-            self.client
-                .execute(
-                    r#"
-                    DELETE FROM leases
-                    WHERE task_id = $1 AND attempt_id = $2 AND fencing_token = $3
-                    "#,
-                    params!(
-                        row.task_id.clone(),
-                        row.active_attempt_id.clone(),
-                        row.active_fencing_token
-                    ),
-                )
-                .await?;
-            requeued.push(row.try_into()?);
+            let counts = txn_counts(results)?;
+            match counts.as_slice() {
+                [1, 1] => requeued.push(row.try_into()?),
+                [0, 0] => {}
+                _ => {
+                    return Err(PersistenceError::Invariant(format!(
+                        "requeue_expired_leases produced unexpected row counts: {counts:?}"
+                    )))
+                }
+            }
         }
 
         Ok(requeued)
@@ -1922,6 +2043,13 @@ fn local_node_config(base_dir: &Path) -> NodeConfig {
         secret_raft: "workflow-engine-raft-secret".to_owned(),
         ..NodeConfig::default()
     }
+}
+
+fn txn_counts(results: Vec<Result<usize, hiqlite::Error>>) -> Result<Vec<usize>, PersistenceError> {
+    results
+        .into_iter()
+        .map(|result| result.map_err(PersistenceError::Hiqlite))
+        .collect()
 }
 
 fn free_port() -> u16 {

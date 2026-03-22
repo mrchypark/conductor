@@ -1,8 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
+use uuid::Uuid;
 use workflow_definition::{FlowDefinition, RetryPolicy, StepDefinition, StepKind};
 use workflow_protocol::{
     AssignedTask, CompleteTask, FailTask, HeartbeatLease, PollTask, PollTaskResponse,
@@ -36,8 +35,6 @@ pub(crate) const WAITER_STATUS_TIMED_OUT: &str = "timed_out";
 pub(crate) const TIMER_KIND_SLEEP: &str = "sleep";
 pub(crate) const TIMER_KIND_RETRY: &str = "retry";
 pub(crate) const TIMER_KIND_WAIT_TIMEOUT: &str = "wait_timeout";
-
-static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartedRun {
@@ -922,8 +919,7 @@ pub(crate) fn downstream_steps<'a>(
 }
 
 pub(crate) fn next_runtime_id(prefix: &str) -> String {
-    let id = NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{id}")
+    format!("{prefix}-{}", Uuid::new_v4())
 }
 
 pub(crate) fn now_unix_seconds() -> i64 {

@@ -125,11 +125,9 @@ impl TestHarness {
     }
 
     fn register_metadata(&self, handler_id: &str) {
-        self.registry.register(handler_id, noop_handler);
+        self.registry.define_handler(handler_id);
     }
 }
-
-fn noop_handler() {}
 
 fn single_task_definition(workflow_id: &str, handler_id: &str) -> FlowDefinition {
     FlowDefinition {

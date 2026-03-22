@@ -348,7 +348,7 @@ impl DefinitionStore {
             created_at: now_unix_seconds(),
         };
 
-        self.persistence.insert_run(&run).await?;
+        self.persistence.insert_run_strict(&run).await?;
         Ok(run)
     }
 

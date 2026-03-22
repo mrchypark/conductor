@@ -283,13 +283,11 @@ impl TestHarness {
 
     fn register_metadata(&self, handler_id: &str, queue: &str) {
         self.registry
-            .register(handler_id, noop_handler)
+            .define_handler(handler_id)
             .capability(Capability::Task)
             .default_queue(queue);
     }
 }
-
-fn noop_handler() {}
 
 fn order_workflow_definition() -> FlowDefinition {
     FlowDefinition {
