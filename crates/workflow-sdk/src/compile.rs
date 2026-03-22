@@ -40,7 +40,10 @@ fn compile_step(step: BuilderStep) -> StepDefinition {
             id,
             kind: StepKind::WaitForEvent,
             metadata: StepMetadata {
-                wait_for_event: Some(WaitForEventMetadata { event_type }),
+                wait_for_event: Some(WaitForEventMetadata {
+                    event_type,
+                    timeout_seconds: None,
+                }),
                 ..StepMetadata::default()
             },
         },

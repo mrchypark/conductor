@@ -1,13 +1,18 @@
 use async_trait::async_trait;
+use axum::Router;
 use serde_json::Value;
 use std::path::Path;
 use workflow_protocol::{CompleteTask, FailTask, HeartbeatLease, PollTask, PollTaskResponse};
 use workflow_worker::{TaskClientError, TaskExecutionClient};
 
 use crate::{
-    definition_store::{DefinitionStore, PublishDraftError, WorkflowEngineError},
+    api,
+    definition_store::{DefinitionStore, PublishDraftError, WorkflowEngineError, WorkflowSummary},
     persistence::HiqlitePersistence,
-    runtime::{StartedRun, StepInstanceRecord, TaskRuntime, TaskRuntimeError},
+    runtime::{
+        EventEnvelope, EventIngestResult, StartedRun, StepInstanceRecord, TaskRuntime,
+        TaskRuntimeError, TransitionRecord, WaiterRecord,
+    },
     DefinitionValidation, StoredWorkflowDefinition, WorkflowRunRecord,
 };
 use workflow_definition::FlowDefinition;
@@ -84,11 +89,39 @@ impl WorkflowEngineApp {
             .await
     }
 
+    pub async fn draft_definition(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
+        self.definitions.draft_definition(workflow_id).await
+    }
+
     pub async fn list_published_versions(
         &self,
         workflow_id: &str,
     ) -> Result<Vec<StoredWorkflowDefinition>, WorkflowEngineError> {
         self.definitions.list_published_versions(workflow_id).await
+    }
+
+    pub async fn published_definition(
+        &self,
+        workflow_id: &str,
+        workflow_version: u32,
+    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
+        self.definitions
+            .published_definition(workflow_id, workflow_version)
+            .await
+    }
+
+    pub async fn workflow_summary(
+        &self,
+        workflow_id: &str,
+    ) -> Result<WorkflowSummary, WorkflowEngineError> {
+        Ok(WorkflowSummary {
+            workflow_id: workflow_id.to_owned(),
+            draft: self.draft_definition(workflow_id).await?,
+            latest_published: self.latest_published_definition(workflow_id).await?,
+        })
     }
 
     pub async fn create_run_for_latest_published(
@@ -116,6 +149,13 @@ impl WorkflowEngineApp {
         self.runtime.ingest_event(event_type, payload).await
     }
 
+    pub async fn ingest_events(
+        &self,
+        events: Vec<EventEnvelope>,
+    ) -> Result<Vec<EventIngestResult>, TaskRuntimeError> {
+        self.runtime.ingest_events(events).await
+    }
+
     pub async fn poll_task(&self, request: PollTask) -> Result<PollTaskResponse, TaskRuntimeError> {
         self.runtime.poll_task(request).await
     }
@@ -137,6 +177,34 @@ impl WorkflowEngineApp {
         run_id: &str,
     ) -> Result<Vec<StepInstanceRecord>, TaskRuntimeError> {
         self.runtime.list_step_instances(run_id).await
+    }
+
+    pub async fn list_waiters(&self, run_id: &str) -> Result<Vec<WaiterRecord>, TaskRuntimeError> {
+        self.runtime.list_waiters(run_id).await
+    }
+
+    pub async fn list_transitions(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<TransitionRecord>, TaskRuntimeError> {
+        self.runtime.list_transitions(run_id).await
+    }
+
+    pub async fn recovery_scan_at(&self, now: i64) -> Result<(), TaskRuntimeError> {
+        self.runtime.recovery_scan_at(now).await
+    }
+
+    pub async fn cancel_run(
+        &self,
+        run_id: &str,
+        reason: Option<&str>,
+        requested_by: Option<&str>,
+    ) -> Result<(), TaskRuntimeError> {
+        self.runtime.cancel_run(run_id, reason, requested_by).await
+    }
+
+    pub fn router(&self) -> Router {
+        api::router(self.clone())
     }
 }
 

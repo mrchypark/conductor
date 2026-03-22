@@ -1,5 +1,8 @@
+use axum::body::Body;
+use http::{Request, StatusCode};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tower::ServiceExt;
 use workflow_definition::{
     validate::ValidationError, BranchMetadata, Edge, EmitEventMetadata, EventTrigger,
     FlowDefinition, SleepMetadata, StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger,
@@ -249,7 +252,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
         .task_step("fetch_order", "orders.fetch")
         .sleep_step("wait_retry", 30)
         .wait_for_event_step("wait_payment", "payment.captured")
-        .branch_step("check_priority", "payload.priority == true")
+        .branch_step("check_priority", "event.data.priority == true")
         .emit_event_step("emit_ready", "order.ready")
         .edge("fetch_order", "wait_retry")
         .edge("wait_retry", "wait_payment")
@@ -291,6 +294,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
                     metadata: StepMetadata {
                         wait_for_event: Some(WaitForEventMetadata {
                             event_type: "payment.captured".to_owned(),
+                            timeout_seconds: None,
                         }),
                         ..StepMetadata::default()
                     },
@@ -300,7 +304,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
                     kind: StepKind::Branch,
                     metadata: StepMetadata {
                         branch: Some(BranchMetadata {
-                            expression: "payload.priority == true".to_owned(),
+                            expression: "event.data.priority == true".to_owned(),
                         }),
                         ..StepMetadata::default()
                     },
@@ -397,6 +401,265 @@ async fn rust_builder_compiles_and_validates_before_publish() {
             .handler,
         "orders.fetch"
     );
+}
+
+#[tokio::test]
+async fn http_definition_endpoints_manage_draft_validate_publish() {
+    let harness = TestHarness::start().await;
+    harness.register_task_handler("inventory.reserve");
+
+    let router = harness.app.router();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/workflows/orders/draft")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&valid_definition("orders", "inventory.reserve"))
+                        .expect("draft should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("draft request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/orders/draft:validate")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("validate request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let validation: workflow_engine::DefinitionValidation = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("validation should deserialize");
+    assert!(validation.ok);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/orders/draft:publish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "content_hash": validation.content_hash,
+                    }))
+                    .expect("publish request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("publish request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let published: workflow_engine::StoredWorkflowDefinition = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("publish response should deserialize");
+    assert_eq!(published.workflow_id, "orders");
+    assert_eq!(published.workflow_version, 1);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/workflows/orders")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("summary request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let summary: workflow_engine::WorkflowSummary = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("summary should deserialize");
+    assert_eq!(summary.workflow_id, "orders");
+    assert!(summary.draft.is_some());
+    assert_eq!(
+        summary
+            .latest_published
+            .as_ref()
+            .expect("latest published should exist")
+            .workflow_version,
+        1
+    );
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/workflows/orders/versions")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("versions request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let versions: Vec<workflow_engine::StoredWorkflowDefinition> = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("versions should deserialize");
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].workflow_version, 1);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/workflows/orders/versions/1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("version request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let version: workflow_engine::StoredWorkflowDefinition = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("version should deserialize");
+    assert_eq!(version.workflow_version, 1);
+}
+
+#[tokio::test]
+async fn http_definition_endpoints_return_expected_error_statuses() {
+    let harness = TestHarness::start().await;
+    let router = harness.app.router();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/missing/draft:validate")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("validate request should succeed");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/workflows/orders/draft")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&valid_definition("orders", "inventory.reserve"))
+                        .expect("draft should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("draft request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let draft: workflow_engine::StoredWorkflowDefinition = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("draft should deserialize");
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/orders/draft:publish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "content_hash": draft.content_hash,
+                    }))
+                    .expect("publish request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("publish request should succeed");
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/orders/draft:validate")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("validate request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let validation: workflow_engine::DefinitionValidation = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("validation should deserialize");
+    assert!(validation.ok);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/workflows/orders/draft")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&valid_definition("orders", "inventory.reserve.v2"))
+                        .expect("draft should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("draft request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/orders/draft:publish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "content_hash": validation.content_hash,
+                    }))
+                    .expect("publish request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("publish request should succeed");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 struct TestHarness {

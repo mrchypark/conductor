@@ -78,6 +78,29 @@ async fn event_creates_runnable_task_that_worker_can_lease_and_complete() {
             "reserved_order_id": "ord-123"
         }))
     );
+
+    harness
+        .app
+        .cancel_run(&run_id, Some("late_cancel"), Some("tester@example.com"))
+        .await
+        .expect("late cancel should be a no-op");
+
+    let run = harness
+        .app
+        .get_run(&run_id)
+        .await
+        .expect("run should still load")
+        .expect("run should still exist");
+    assert_eq!(run.status, "completed");
+
+    let transitions = harness
+        .app
+        .list_transitions(&run_id)
+        .await
+        .expect("transitions should load");
+    assert!(!transitions
+        .iter()
+        .any(|record| record.transition_type == "run_cancel_requested"));
 }
 
 struct TestHarness {

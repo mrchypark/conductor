@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_id TEXT NOT NULL,
     workflow_version INTEGER NOT NULL,
     status TEXT NOT NULL,
+    cancel_reason TEXT,
+    cancel_requested_by TEXT,
+    cancel_requested_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -66,16 +69,25 @@ CREATE INDEX IF NOT EXISTS idx_task_queue_poll
 CREATE TABLE IF NOT EXISTS timers (
     timer_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    timer_kind TEXT NOT NULL,
     due_at INTEGER NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    payload_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS waiters (
     waiter_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    timeout_at INTEGER,
+    resume_event_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS leases (
@@ -88,17 +100,29 @@ CREATE TABLE IF NOT EXISTS leases (
     heartbeat_at INTEGER NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_task_id
+    ON leases(task_id);
+
 CREATE TABLE IF NOT EXISTS event_inbox (
     event_id TEXT PRIMARY KEY,
     event_type TEXT NOT NULL,
     processing_state TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    payload_json TEXT NOT NULL,
+    dedupe_key TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    applied_at INTEGER
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_inbox_dedupe
+    ON event_inbox(dedupe_key)
+    WHERE dedupe_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS transition_log (
     transition_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     transition_type TEXT NOT NULL,
+    payload_json TEXT,
     created_at INTEGER NOT NULL
 );
 "#;

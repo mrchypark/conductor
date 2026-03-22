@@ -74,11 +74,21 @@ pub struct StoredWorkflowDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    pub workflow_id: String,
+    pub draft: Option<StoredWorkflowDefinition>,
+    pub latest_published: Option<StoredWorkflowDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunRecord {
     pub run_id: String,
     pub workflow_id: String,
     pub workflow_version: u32,
     pub status: String,
+    pub cancel_reason: Option<String>,
+    pub cancel_requested_by: Option<String>,
+    pub cancel_requested_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -275,6 +285,24 @@ impl DefinitionStore {
             .await?)
     }
 
+    pub async fn draft_definition(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
+        Ok(self
+            .persistence
+            .get_draft(workflow_id)
+            .await?
+            .map(|draft| StoredWorkflowDefinition {
+                workflow_id: workflow_id.to_owned(),
+                workflow_version: 0,
+                definition: draft.definition,
+                content_hash: draft.content_hash,
+                created_at: draft.created_at,
+                published_at: None,
+            }))
+    }
+
     pub async fn list_published_versions(
         &self,
         workflow_id: &str,
@@ -282,6 +310,17 @@ impl DefinitionStore {
         Ok(self
             .persistence
             .list_published_versions(workflow_id)
+            .await?)
+    }
+
+    pub async fn published_definition(
+        &self,
+        workflow_id: &str,
+        workflow_version: u32,
+    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
+        Ok(self
+            .persistence
+            .get_published_definition(workflow_id, workflow_version)
             .await?)
     }
 
@@ -303,6 +342,9 @@ impl DefinitionStore {
             workflow_id: workflow_id.to_owned(),
             workflow_version: latest.workflow_version,
             status: "created".to_owned(),
+            cancel_reason: None,
+            cancel_requested_by: None,
+            cancel_requested_at: None,
             created_at: now_unix_seconds(),
         };
 

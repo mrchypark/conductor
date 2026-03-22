@@ -41,6 +41,7 @@ mod tests {
                     metadata: StepMetadata {
                         wait_for_event: Some(WaitForEventMetadata {
                             event_type: "payment.captured".to_owned(),
+                            timeout_seconds: None,
                         }),
                         ..StepMetadata::default()
                     },
