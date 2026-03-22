@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/workflow-definition",
+    "crates/workflow-protocol",
+    "crates/workflow-sdk",
+    "crates/workflow-worker",
+    "crates/workflow-engine",
+]
+resolver = "2"

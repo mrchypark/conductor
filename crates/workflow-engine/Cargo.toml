@@ -1,0 +1,29 @@
+[package]
+name = "workflow-engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json"] }
+hiqlite = { version = "0.12.2", default-features = false, features = ["sqlite"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+workflow-definition = { path = "../workflow-definition" }
+workflow-protocol = { path = "../workflow-protocol" }
+workflow-worker = { path = "../workflow-worker" }
+
+[dev-dependencies]
+http = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+workflow-definition = { path = "../workflow-definition" }
+workflow-sdk = { path = "../workflow-sdk" }
+workflow-worker = { path = "../workflow-worker" }
