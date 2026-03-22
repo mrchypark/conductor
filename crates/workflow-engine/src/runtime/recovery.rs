@@ -55,12 +55,24 @@ impl TaskRuntime {
                         .as_ref()
                         .and_then(|value| value.get("task_id"))
                         .and_then(|value| value.as_str())
-                        .expect("retry timer payload should include task id");
+                        .ok_or_else(|| {
+                            TaskRuntimeError::Persistence(
+                                crate::persistence::PersistenceError::Invariant(
+                                    "retry timer payload missing task_id".to_owned(),
+                                ),
+                            )
+                        })?;
                     let task = self
                         .persistence
                         .get_task_snapshot(task_id)
                         .await?
-                        .expect("retry timer task should exist");
+                        .ok_or_else(|| {
+                            TaskRuntimeError::Persistence(
+                                crate::persistence::PersistenceError::Invariant(format!(
+                                    "retry timer references unknown task '{task_id}'"
+                                )),
+                            )
+                        })?;
                     self.persistence.requeue_task(&task.task_id, now).await?;
                     self.persistence
                         .update_step_instance(
@@ -136,7 +148,13 @@ impl TaskRuntime {
                         .as_ref()
                         .and_then(|value| value.get("waiter_id"))
                         .and_then(|value| value.as_str())
-                        .expect("wait timeout timer payload should include waiter id");
+                        .ok_or_else(|| {
+                            TaskRuntimeError::Persistence(
+                                crate::persistence::PersistenceError::Invariant(
+                                    "wait timeout timer payload missing waiter_id".to_owned(),
+                                ),
+                            )
+                        })?;
                     if self
                         .persistence
                         .mark_waiter_status(waiter_id, WAITER_STATUS_TIMED_OUT, None, now)
@@ -191,5 +209,56 @@ impl TaskRuntime {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::TempDir;
+    use workflow_worker::WorkerRegistry;
+
+    use crate::{
+        persistence::HiqlitePersistence,
+        runtime::{
+            tasks::{TimerRecord, TIMER_KIND_RETRY, TIMER_STATUS_PENDING},
+            TaskRuntime, TaskRuntimeError,
+        },
+    };
+
+    #[tokio::test]
+    async fn recovery_returns_invariant_error_for_malformed_retry_timer_payload() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let persistence = HiqlitePersistence::for_test(tempdir.path())
+            .await
+            .expect("persistence should start");
+        let runtime = TaskRuntime::new(persistence.clone(), WorkerRegistry::new());
+        let now = 1_700_000_000;
+
+        persistence
+            .insert_timer(&TimerRecord {
+                timer_id: "timer-1".to_owned(),
+                run_id: "run-1".to_owned(),
+                step_id: "step-1".to_owned(),
+                timer_kind: TIMER_KIND_RETRY.to_owned(),
+                due_at: now,
+                status: TIMER_STATUS_PENDING.to_owned(),
+                payload: Some(json!({})),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("timer should insert");
+
+        let error = runtime
+            .recovery_scan_at(now)
+            .await
+            .expect_err("malformed retry timer should return an invariant error");
+
+        assert!(matches!(
+            error,
+            TaskRuntimeError::Persistence(crate::persistence::PersistenceError::Invariant(ref message))
+                if message == "retry timer payload missing task_id"
+        ));
     }
 }

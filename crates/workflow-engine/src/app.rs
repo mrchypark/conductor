@@ -211,34 +211,29 @@ impl WorkflowEngineApp {
 #[async_trait]
 impl TaskExecutionClient for WorkflowEngineApp {
     async fn poll_task(&self, request: PollTask) -> Result<PollTaskResponse, TaskClientError> {
-        self.poll_task(request)
-            .await
-            .map_err(|error| TaskClientError::Message {
-                message: error.to_string(),
-            })
+        self.poll_task(request).await.map_err(task_client_error)
     }
 
     async fn heartbeat_lease(&self, request: HeartbeatLease) -> Result<(), TaskClientError> {
         self.heartbeat_lease(request)
             .await
-            .map_err(|error| TaskClientError::Message {
-                message: error.to_string(),
-            })
+            .map_err(task_client_error)
     }
 
     async fn complete_task(&self, request: CompleteTask) -> Result<(), TaskClientError> {
-        self.complete_task(request)
-            .await
-            .map_err(|error| TaskClientError::Message {
-                message: error.to_string(),
-            })
+        self.complete_task(request).await.map_err(task_client_error)
     }
 
     async fn fail_task(&self, request: FailTask) -> Result<(), TaskClientError> {
-        self.fail_task(request)
-            .await
-            .map_err(|error| TaskClientError::Message {
-                message: error.to_string(),
-            })
+        self.fail_task(request).await.map_err(task_client_error)
+    }
+}
+
+fn task_client_error(error: TaskRuntimeError) -> TaskClientError {
+    match error {
+        TaskRuntimeError::StaleLease { task_id } => TaskClientError::StaleLease { task_id },
+        other => TaskClientError::Message {
+            message: other.to_string(),
+        },
     }
 }

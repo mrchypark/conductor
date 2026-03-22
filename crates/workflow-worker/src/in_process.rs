@@ -37,6 +37,8 @@ impl RunOnceOutcome {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TaskClientError {
+    #[error("stale lease for task '{task_id}'")]
+    StaleLease { task_id: String },
     #[error("{message}")]
     Message { message: String },
 }
