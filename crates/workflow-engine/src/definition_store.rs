@@ -6,6 +6,8 @@ use workflow_worker::{Capability, WorkerRegistry};
 
 use crate::persistence::{HiqlitePersistence, PersistenceError};
 
+const MAX_CONCURRENT_PUBLISH_RETRIES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationIssue {
     pub code: String,
@@ -123,6 +125,8 @@ pub enum PublishDraftError {
         handler_id: String,
         capability: String,
     },
+    #[error("concurrent publish contention for workflow '{workflow_id}' exceeded retry budget")]
+    ConcurrentPublishContention { workflow_id: String },
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
 }
@@ -254,25 +258,36 @@ impl DefinitionStore {
         workflow_id: &str,
         draft: LoadedDraft,
     ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
-        let workflow_version = self.persistence.next_workflow_version(workflow_id).await?;
         let published_at = now_unix_seconds();
-        let mut published_definition = draft.definition;
-        published_definition.workflow_version = workflow_version;
-        let published_content_hash = content_hash(&published_definition)?;
+        for _ in 0..MAX_CONCURRENT_PUBLISH_RETRIES {
+            let workflow_version = self.persistence.next_workflow_version(workflow_id).await?;
+            let mut published_definition = draft.definition.clone();
+            published_definition.workflow_version = workflow_version;
+            let published_content_hash = content_hash(&published_definition)?;
 
-        let published = StoredWorkflowDefinition {
+            let published = StoredWorkflowDefinition {
+                workflow_id: workflow_id.to_owned(),
+                workflow_version,
+                definition: published_definition,
+                content_hash: published_content_hash,
+                created_at: published_at,
+                published_at: Some(published_at),
+            };
+
+            match self
+                .persistence
+                .insert_published_definition(&published)
+                .await
+            {
+                Ok(()) => return Ok(published),
+                Err(error) if is_publish_version_conflict(&error) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(PublishDraftError::ConcurrentPublishContention {
             workflow_id: workflow_id.to_owned(),
-            workflow_version,
-            definition: published_definition,
-            content_hash: published_content_hash,
-            created_at: published_at,
-            published_at: Some(published_at),
-        };
-
-        self.persistence
-            .insert_published_definition(&published)
-            .await?;
-        Ok(published)
+        })
     }
 
     pub async fn latest_published_definition(
@@ -358,6 +373,13 @@ impl DefinitionStore {
     ) -> Result<Option<WorkflowRunRecord>, WorkflowEngineError> {
         Ok(self.persistence.get_run(run_id).await?)
     }
+}
+
+fn is_publish_version_conflict(error: &PersistenceError) -> bool {
+    matches!(
+        error,
+        PersistenceError::Hiqlite(hiqlite::Error::ConstraintViolation(_))
+    )
 }
 
 struct LoadedDraft {

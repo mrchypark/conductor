@@ -110,6 +110,7 @@ fn publish_error(error: PublishDraftError) -> (StatusCode, String) {
             (StatusCode::PRECONDITION_FAILED, error.to_string())
         }
         PublishDraftError::StaleDraftContent { .. }
+        | PublishDraftError::ConcurrentPublishContention { .. }
         | PublishDraftError::HandlerManifestMismatch { .. } => {
             (StatusCode::CONFLICT, error.to_string())
         }

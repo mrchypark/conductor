@@ -170,6 +170,58 @@ async fn definition_publish_uses_latest_published_version_for_default_lookup() {
 }
 
 #[tokio::test]
+async fn concurrent_definition_publish_allocates_distinct_versions() {
+    let harness = TestHarness::start().await;
+    harness.register_task_handler("inventory.reserve");
+
+    harness
+        .app
+        .replace_draft(valid_definition("orders", "inventory.reserve"))
+        .await
+        .expect("draft should replace");
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("validation should complete");
+    assert!(validation.ok);
+
+    let left = harness.app.clone();
+    let right = harness.app.clone();
+    let content_hash = validation.content_hash.clone();
+
+    let (left_result, right_result) = tokio::join!(
+        left.publish_draft("orders", &content_hash),
+        right.publish_draft("orders", &content_hash),
+    );
+
+    let mut versions = vec![
+        left_result
+            .expect("left publish should succeed")
+            .workflow_version,
+        right_result
+            .expect("right publish should succeed")
+            .workflow_version,
+    ];
+    versions.sort_unstable();
+    assert_eq!(versions, vec![1, 2]);
+
+    let published_versions = harness
+        .app
+        .list_published_versions("orders")
+        .await
+        .expect("published versions should load");
+    assert_eq!(published_versions.len(), 2);
+    assert_eq!(
+        published_versions
+            .iter()
+            .map(|record| record.workflow_version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
 async fn definition_publish_persists_run_pinning_metadata() {
     let harness = TestHarness::start().await;
 
