@@ -19,7 +19,7 @@ pub struct PollTask {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PollTaskResponse {
-    Assigned(AssignedTask),
+    Assigned(Box<AssignedTask>),
     NoTaskAvailable,
 }
 
@@ -33,6 +33,7 @@ pub struct AssignedTask {
     pub workflow_version: WorkflowVersion,
     pub step_id: StepId,
     pub step_kind: StepKindName,
+    pub handler_id: String,
     pub input: Value,
 }
 

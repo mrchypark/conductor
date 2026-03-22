@@ -132,7 +132,10 @@ impl DefinitionStore {
     }
 
     pub fn with_registry(persistence: HiqlitePersistence, registry: WorkerRegistry) -> Self {
-        Self { persistence, registry }
+        Self {
+            persistence,
+            registry,
+        }
     }
 
     pub async fn replace_draft(

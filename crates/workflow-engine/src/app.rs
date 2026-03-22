@@ -1,8 +1,13 @@
+use async_trait::async_trait;
+use serde_json::Value;
 use std::path::Path;
+use workflow_protocol::{CompleteTask, FailTask, HeartbeatLease, PollTask, PollTaskResponse};
+use workflow_worker::{TaskClientError, TaskExecutionClient};
 
 use crate::{
     definition_store::{DefinitionStore, PublishDraftError, WorkflowEngineError},
     persistence::HiqlitePersistence,
+    runtime::{StartedRun, StepInstanceRecord, TaskRuntime, TaskRuntimeError},
     DefinitionValidation, StoredWorkflowDefinition, WorkflowRunRecord,
 };
 use workflow_definition::FlowDefinition;
@@ -10,6 +15,7 @@ use workflow_worker::WorkerRegistry;
 
 #[derive(Clone)]
 pub struct WorkflowEngineApp {
+    runtime: TaskRuntime,
     definitions: DefinitionStore,
     registry: WorkerRegistry,
 }
@@ -18,8 +24,10 @@ impl WorkflowEngineApp {
     pub async fn for_test(base_dir: &Path) -> Result<Self, WorkflowEngineError> {
         let registry = WorkerRegistry::new();
         let persistence = HiqlitePersistence::for_test(base_dir).await?;
-        let definitions = DefinitionStore::with_registry(persistence, registry.clone());
+        let definitions = DefinitionStore::with_registry(persistence.clone(), registry.clone());
+        let runtime = TaskRuntime::new(persistence, registry.clone());
         Ok(Self {
+            runtime,
             definitions,
             registry,
         })
@@ -30,8 +38,10 @@ impl WorkflowEngineApp {
         registry: WorkerRegistry,
     ) -> Result<Self, WorkflowEngineError> {
         let persistence = HiqlitePersistence::for_test(base_dir).await?;
-        let definitions = DefinitionStore::with_registry(persistence, registry.clone());
+        let definitions = DefinitionStore::with_registry(persistence.clone(), registry.clone());
+        let runtime = TaskRuntime::new(persistence, registry.clone());
         Ok(Self {
+            runtime,
             definitions,
             registry,
         })
@@ -96,5 +106,71 @@ impl WorkflowEngineApp {
         run_id: &str,
     ) -> Result<Option<WorkflowRunRecord>, WorkflowEngineError> {
         self.definitions.get_run(run_id).await
+    }
+
+    pub async fn ingest_event(
+        &self,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<Vec<StartedRun>, TaskRuntimeError> {
+        self.runtime.ingest_event(event_type, payload).await
+    }
+
+    pub async fn poll_task(&self, request: PollTask) -> Result<PollTaskResponse, TaskRuntimeError> {
+        self.runtime.poll_task(request).await
+    }
+
+    pub async fn heartbeat_lease(&self, request: HeartbeatLease) -> Result<(), TaskRuntimeError> {
+        self.runtime.heartbeat_lease(request).await
+    }
+
+    pub async fn complete_task(&self, request: CompleteTask) -> Result<(), TaskRuntimeError> {
+        self.runtime.complete_task(request).await
+    }
+
+    pub async fn fail_task(&self, request: FailTask) -> Result<(), TaskRuntimeError> {
+        self.runtime.fail_task(request).await
+    }
+
+    pub async fn list_step_instances(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<StepInstanceRecord>, TaskRuntimeError> {
+        self.runtime.list_step_instances(run_id).await
+    }
+}
+
+#[async_trait]
+impl TaskExecutionClient for WorkflowEngineApp {
+    async fn poll_task(&self, request: PollTask) -> Result<PollTaskResponse, TaskClientError> {
+        self.poll_task(request)
+            .await
+            .map_err(|error| TaskClientError::Message {
+                message: error.to_string(),
+            })
+    }
+
+    async fn heartbeat_lease(&self, request: HeartbeatLease) -> Result<(), TaskClientError> {
+        self.heartbeat_lease(request)
+            .await
+            .map_err(|error| TaskClientError::Message {
+                message: error.to_string(),
+            })
+    }
+
+    async fn complete_task(&self, request: CompleteTask) -> Result<(), TaskClientError> {
+        self.complete_task(request)
+            .await
+            .map_err(|error| TaskClientError::Message {
+                message: error.to_string(),
+            })
+    }
+
+    async fn fail_task(&self, request: FailTask) -> Result<(), TaskClientError> {
+        self.fail_task(request)
+            .await
+            .map_err(|error| TaskClientError::Message {
+                message: error.to_string(),
+            })
     }
 }

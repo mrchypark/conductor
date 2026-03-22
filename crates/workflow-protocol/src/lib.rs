@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn poll_task_response_serializes_assigned_or_empty() {
-        let assigned = serde_json::to_value(PollTaskResponse::Assigned(AssignedTask {
+        let assigned = serde_json::to_value(PollTaskResponse::Assigned(Box::new(AssignedTask {
             task_id: "task-123".into(),
             run_id: "run-456".into(),
             attempt_id: "attempt-9".into(),
@@ -82,10 +82,11 @@ mod tests {
             workflow_version: 1,
             step_id: "reserve_inventory".into(),
             step_kind: "task".into(),
+            handler_id: "inventory.reserve".into(),
             input: json!({
                 "order_id": "ord-1"
             }),
-        }))
+        })))
         .expect("assigned poll response serializes");
 
         let empty =
@@ -103,6 +104,7 @@ mod tests {
                 "workflow_version": 1,
                 "step_id": "reserve_inventory",
                 "step_kind": "task",
+                "handler_id": "inventory.reserve",
                 "input": {
                     "order_id": "ord-1"
                 }

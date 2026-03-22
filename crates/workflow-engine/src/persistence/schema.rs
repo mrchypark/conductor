@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_id TEXT NOT NULL,
     workflow_version INTEGER NOT NULL,
     status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS step_instances (
@@ -31,16 +32,36 @@ CREATE TABLE IF NOT EXISTS step_instances (
     run_id TEXT NOT NULL,
     step_id TEXT NOT NULL,
     status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    attempt_count INTEGER NOT NULL,
+    input_json TEXT,
+    output_json TEXT,
+    error_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_queue (
     task_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_version INTEGER NOT NULL,
     step_id TEXT NOT NULL,
+    step_kind TEXT NOT NULL,
+    handler_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    queue_name TEXT NOT NULL,
+    input_json TEXT NOT NULL,
     status TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    attempt_sequence INTEGER NOT NULL,
+    active_attempt_id TEXT,
+    active_fencing_token INTEGER,
+    leased_by_worker_id TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_task_queue_poll
+    ON task_queue(status, queue_name, capability, created_at);
 
 CREATE TABLE IF NOT EXISTS timers (
     timer_id TEXT PRIMARY KEY,
@@ -60,9 +81,11 @@ CREATE TABLE IF NOT EXISTS waiters (
 CREATE TABLE IF NOT EXISTS leases (
     lease_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
     worker_id TEXT NOT NULL,
     fencing_token INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS event_inbox (

@@ -55,14 +55,14 @@ impl WorkerRegistry {
             .write()
             .expect("worker registry lock should not be poisoned")
             .insert(
-            handler_id.clone(),
-            HandlerRegistration {
-                handler_id: handler_id.clone(),
-                capability: Capability::Task,
-                default_queue: "default".to_owned(),
-                timeout_seconds: None,
-            },
-        );
+                handler_id.clone(),
+                HandlerRegistration {
+                    handler_id: handler_id.clone(),
+                    capability: Capability::Task,
+                    default_queue: "default".to_owned(),
+                    timeout_seconds: None,
+                },
+            );
 
         HandlerRegistrationBuilder {
             registry: self,

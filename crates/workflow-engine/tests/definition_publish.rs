@@ -68,8 +68,7 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
         vec![ValidationIssue::from(ValidationError::MissingTrigger)]
     );
 
-    harness
-        .register_task_handler("inventory.reserve.v2");
+    harness.register_task_handler("inventory.reserve.v2");
     harness
         .app
         .replace_draft(valid_definition("orders", "inventory.reserve.v2"))
