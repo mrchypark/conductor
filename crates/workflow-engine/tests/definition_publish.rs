@@ -1,10 +1,13 @@
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use workflow_definition::{
-    validate::ValidationError, Edge, EventTrigger, FlowDefinition, StepDefinition, StepKind,
-    StepMetadata, TaskMetadata, Trigger, WorkflowDefaults,
+    validate::ValidationError, BranchMetadata, Edge, EmitEventMetadata, EventTrigger,
+    FlowDefinition, SleepMetadata, StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger,
+    WaitForEventMetadata, WorkflowDefaults,
 };
 use workflow_engine::{PublishDraftError, ValidationIssue, WorkflowEngineApp};
-use sha2::{Digest, Sha256};
+use workflow_sdk::WorkflowBuilder;
+use workflow_worker::{Capability, HandlerRegistration, WorkerRegistry};
 
 #[tokio::test]
 async fn definition_publish_creates_new_immutable_workflow_version() {
@@ -116,9 +119,7 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
         .map(|record| {
             (
                 record.workflow_version,
-                record
-                    .definition
-                    .steps[0]
+                record.definition.steps[0]
                     .metadata
                     .task
                     .as_ref()
@@ -204,6 +205,167 @@ async fn definition_publish_persists_run_pinning_metadata() {
         .expect("new run metadata should exist");
     assert_eq!(persisted_new_run_v2, new_run_v2);
     assert_eq!(persisted_new_run_v2.workflow_version, 2);
+}
+
+#[tokio::test]
+async fn rust_builder_compiles_and_validates_before_publish() {
+    fn fetch_order() {}
+
+    let harness = TestHarness::start().await;
+    let compiled = WorkflowBuilder::new("orders")
+        .workflow_version(7)
+        .event_trigger("order.created")
+        .task_step("fetch_order", "orders.fetch")
+        .sleep_step("wait_retry", 30)
+        .wait_for_event_step("wait_payment", "payment.captured")
+        .branch_step("check_priority", "payload.priority == true")
+        .emit_event_step("emit_ready", "order.ready")
+        .edge("fetch_order", "wait_retry")
+        .edge("wait_retry", "wait_payment")
+        .edge("wait_payment", "check_priority")
+        .edge("check_priority", "emit_ready")
+        .compile();
+
+    assert_eq!(
+        compiled,
+        FlowDefinition {
+            workflow_id: "orders".to_owned(),
+            workflow_version: 7,
+            defaults: WorkflowDefaults::default(),
+            trigger: Some(Trigger::Event(EventTrigger {
+                event_type: "order.created".to_owned(),
+            })),
+            steps: vec![
+                StepDefinition {
+                    id: "fetch_order".to_owned(),
+                    kind: StepKind::Task,
+                    metadata: StepMetadata {
+                        task: Some(TaskMetadata {
+                            handler: "orders.fetch".to_owned(),
+                        }),
+                        ..StepMetadata::default()
+                    },
+                },
+                StepDefinition {
+                    id: "wait_retry".to_owned(),
+                    kind: StepKind::Sleep,
+                    metadata: StepMetadata {
+                        sleep: Some(SleepMetadata { seconds: 30 }),
+                        ..StepMetadata::default()
+                    },
+                },
+                StepDefinition {
+                    id: "wait_payment".to_owned(),
+                    kind: StepKind::WaitForEvent,
+                    metadata: StepMetadata {
+                        wait_for_event: Some(WaitForEventMetadata {
+                            event_type: "payment.captured".to_owned(),
+                        }),
+                        ..StepMetadata::default()
+                    },
+                },
+                StepDefinition {
+                    id: "check_priority".to_owned(),
+                    kind: StepKind::Branch,
+                    metadata: StepMetadata {
+                        branch: Some(BranchMetadata {
+                            expression: "payload.priority == true".to_owned(),
+                        }),
+                        ..StepMetadata::default()
+                    },
+                },
+                StepDefinition {
+                    id: "emit_ready".to_owned(),
+                    kind: StepKind::EmitEvent,
+                    metadata: StepMetadata {
+                        emit_event: Some(EmitEventMetadata {
+                            event_type: "order.ready".to_owned(),
+                        }),
+                        ..StepMetadata::default()
+                    },
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "fetch_order".to_owned(),
+                    to: "wait_retry".to_owned(),
+                },
+                Edge {
+                    from: "wait_retry".to_owned(),
+                    to: "wait_payment".to_owned(),
+                },
+                Edge {
+                    from: "wait_payment".to_owned(),
+                    to: "check_priority".to_owned(),
+                },
+                Edge {
+                    from: "check_priority".to_owned(),
+                    to: "emit_ready".to_owned(),
+                },
+            ],
+        }
+    );
+
+    harness
+        .app
+        .replace_draft(compiled)
+        .await
+        .expect("compiled draft should replace");
+
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("compiled draft should validate");
+    assert!(validation.ok);
+
+    let missing_handler = harness
+        .app
+        .publish_draft_with_registry("orders", &validation.content_hash, &WorkerRegistry::new())
+        .await
+        .expect_err("publish should reject missing handler metadata");
+    assert!(matches!(
+        missing_handler,
+        PublishDraftError::HandlerManifestMismatch { ref handler_id, ref capability }
+            if handler_id == "orders.fetch" && capability == Capability::Task.as_str()
+    ));
+
+    let registry = WorkerRegistry::new();
+    registry
+        .register("orders.fetch", fetch_order)
+        .capability(Capability::Task)
+        .default_queue("orders")
+        .timeout_seconds(45);
+
+    let manifest = registry.manifest();
+    assert_eq!(manifest.len(), 1);
+    assert_eq!(
+        manifest[0],
+        HandlerRegistration {
+            handler_id: "orders.fetch".to_owned(),
+            capability: Capability::Task,
+            default_queue: "orders".to_owned(),
+            timeout_seconds: Some(45),
+        }
+    );
+
+    let published = harness
+        .app
+        .publish_draft_with_registry("orders", &validation.content_hash, &registry)
+        .await
+        .expect("publish should succeed once manifest metadata exists");
+
+    assert_eq!(published.workflow_id, "orders");
+    assert_eq!(published.workflow_version, 1);
+    assert_eq!(
+        published.definition.steps[0]
+            .metadata
+            .task
+            .as_ref()
+            .expect("task metadata")
+            .handler,
+        "orders.fetch"
+    );
 }
 
 struct TestHarness {

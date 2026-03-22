@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use workflow_definition::{validate_definition, FlowDefinition, ValidationError};
+use workflow_worker::{Capability, WorkerRegistry};
 
 use crate::persistence::{HiqlitePersistence, PersistenceError};
 
@@ -105,6 +106,13 @@ pub enum PublishDraftError {
     },
     #[error("draft for workflow '{workflow_id}' has not been successfully validated")]
     DraftNotValidated { workflow_id: String },
+    #[error(
+        "draft for workflow references handler '{handler_id}' without required capability '{capability}' in the worker manifest"
+    )]
+    HandlerManifestMismatch {
+        handler_id: String,
+        capability: String,
+    },
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
 }
@@ -181,6 +189,32 @@ impl DefinitionStore {
         validated_content_hash: &str,
     ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
         let draft = self
+            .validated_draft_for_publish(workflow_id, validated_content_hash)
+            .await?;
+
+        self.publish_loaded_draft(workflow_id, draft).await
+    }
+
+    pub async fn publish_draft_with_registry(
+        &self,
+        workflow_id: &str,
+        validated_content_hash: &str,
+        registry: &WorkerRegistry,
+    ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
+        let draft = self
+            .validated_draft_for_publish(workflow_id, validated_content_hash)
+            .await?;
+        validate_task_handlers(&draft.definition, registry)?;
+
+        self.publish_loaded_draft(workflow_id, draft).await
+    }
+
+    async fn validated_draft_for_publish(
+        &self,
+        workflow_id: &str,
+        validated_content_hash: &str,
+    ) -> Result<LoadedDraft, PublishDraftError> {
+        let draft = self
             .persistence
             .get_draft(workflow_id)
             .await?
@@ -202,6 +236,16 @@ impl DefinitionStore {
             });
         }
 
+        Ok(LoadedDraft {
+            definition: draft.definition,
+        })
+    }
+
+    async fn publish_loaded_draft(
+        &self,
+        workflow_id: &str,
+        draft: LoadedDraft,
+    ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
         let workflow_version = self.persistence.next_workflow_version(workflow_id).await?;
         let published_at = now_unix_seconds();
         let mut published_definition = draft.definition;
@@ -217,7 +261,9 @@ impl DefinitionStore {
             published_at: Some(published_at),
         };
 
-        self.persistence.insert_published_definition(&published).await?;
+        self.persistence
+            .insert_published_definition(&published)
+            .await?;
         Ok(published)
     }
 
@@ -235,7 +281,10 @@ impl DefinitionStore {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<StoredWorkflowDefinition>, WorkflowEngineError> {
-        Ok(self.persistence.list_published_versions(workflow_id).await?)
+        Ok(self
+            .persistence
+            .list_published_versions(workflow_id)
+            .await?)
     }
 
     pub async fn create_run_for_latest_published(
@@ -269,6 +318,32 @@ impl DefinitionStore {
     ) -> Result<Option<WorkflowRunRecord>, WorkflowEngineError> {
         Ok(self.persistence.get_run(run_id).await?)
     }
+}
+
+struct LoadedDraft {
+    definition: FlowDefinition,
+}
+
+fn validate_task_handlers(
+    definition: &FlowDefinition,
+    registry: &WorkerRegistry,
+) -> Result<(), PublishDraftError> {
+    for step in &definition.steps {
+        if let Some(task) = step.metadata.task.as_ref() {
+            let registration = registry.registration(task.handler.as_str());
+            if !matches!(
+                registration,
+                Some(entry) if entry.capability == Capability::Task
+            ) {
+                return Err(PublishDraftError::HandlerManifestMismatch {
+                    handler_id: task.handler.clone(),
+                    capability: Capability::Task.as_str().to_owned(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn content_hash(definition: &FlowDefinition) -> Result<String, PersistenceError> {

@@ -1,3 +1,3 @@
-pub fn placeholder() -> &'static str {
-    "workflow-worker"
-}
+mod registry;
+
+pub use registry::{Capability, HandlerRegistration, HandlerRegistrationBuilder, WorkerRegistry};

@@ -13,8 +13,11 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 workflow-definition = { path = "../workflow-definition" }
+workflow-worker = { path = "../workflow-worker" }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 workflow-definition = { path = "../workflow-definition" }
+workflow-sdk = { path = "../workflow-sdk" }
+workflow-worker = { path = "../workflow-worker" }

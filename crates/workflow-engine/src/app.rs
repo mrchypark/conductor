@@ -6,6 +6,7 @@ use crate::{
     DefinitionValidation, StoredWorkflowDefinition, WorkflowRunRecord,
 };
 use workflow_definition::FlowDefinition;
+use workflow_worker::WorkerRegistry;
 
 #[derive(Clone)]
 pub struct WorkflowEngineApp {
@@ -43,11 +44,24 @@ impl WorkflowEngineApp {
             .await
     }
 
+    pub async fn publish_draft_with_registry(
+        &self,
+        workflow_id: &str,
+        validated_content_hash: &str,
+        registry: &WorkerRegistry,
+    ) -> Result<StoredWorkflowDefinition, PublishDraftError> {
+        self.definitions
+            .publish_draft_with_registry(workflow_id, validated_content_hash, registry)
+            .await
+    }
+
     pub async fn latest_published_definition(
         &self,
         workflow_id: &str,
     ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
-        self.definitions.latest_published_definition(workflow_id).await
+        self.definitions
+            .latest_published_definition(workflow_id)
+            .await
     }
 
     pub async fn list_published_versions(
