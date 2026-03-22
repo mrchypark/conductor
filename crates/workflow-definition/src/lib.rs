@@ -249,4 +249,43 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn definition_rejects_missing_required_step_metadata() {
+        let cases = [
+            ("task", StepKind::Task, "task"),
+            ("sleep", StepKind::Sleep, "sleep"),
+            ("wait", StepKind::WaitForEvent, "wait_for_event"),
+            ("branch", StepKind::Branch, "branch"),
+            ("emit", StepKind::EmitEvent, "emit_event"),
+        ];
+
+        for (step_id, kind, metadata_field) in cases {
+            let definition = FlowDefinition {
+                flow_id: format!("missing-{metadata_field}"),
+                version: 1,
+                trigger: Some(Trigger::Event(EventTrigger {
+                    event_type: "order.created".to_owned(),
+                })),
+                steps: vec![StepDefinition {
+                    step_id: step_id.to_owned(),
+                    kind,
+                    metadata: StepMetadata::default(),
+                }],
+                edges: vec![],
+            };
+
+            let error =
+                validate_definition(&definition).expect_err("definition should fail validation");
+
+            assert_eq!(
+                error,
+                ValidationError::MissingRequiredStepMetadata {
+                    step_id: step_id.to_owned(),
+                    kind,
+                    metadata_field: metadata_field.to_owned(),
+                }
+            );
+        }
+    }
 }

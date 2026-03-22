@@ -8,6 +8,11 @@ pub enum ValidationError {
     DuplicateStepId {
         step_id: String,
     },
+    MissingRequiredStepMetadata {
+        step_id: String,
+        kind: StepKind,
+        metadata_field: String,
+    },
     UnknownEdgeSource {
         edge_from: String,
         edge_to: String,
@@ -59,13 +64,21 @@ pub fn validate_definition(definition: &FlowDefinition) -> Result<(), Validation
 }
 
 fn validate_step_metadata(step: &StepDefinition) -> Result<(), ValidationError> {
-    let expected = match step.kind {
-        StepKind::Task => "task",
-        StepKind::Sleep => "sleep",
-        StepKind::WaitForEvent => "wait_for_event",
-        StepKind::Branch => "branch",
-        StepKind::EmitEvent => "emit_event",
+    let (expected, present) = match step.kind {
+        StepKind::Task => ("task", step.metadata.task.is_some()),
+        StepKind::Sleep => ("sleep", step.metadata.sleep.is_some()),
+        StepKind::WaitForEvent => ("wait_for_event", step.metadata.wait_for_event.is_some()),
+        StepKind::Branch => ("branch", step.metadata.branch.is_some()),
+        StepKind::EmitEvent => ("emit_event", step.metadata.emit_event.is_some()),
     };
+
+    if !present {
+        return Err(ValidationError::MissingRequiredStepMetadata {
+            step_id: step.step_id.clone(),
+            kind: step.kind,
+            metadata_field: expected.to_owned(),
+        });
+    }
 
     for metadata_field in [
         ("task", step.metadata.task.is_some()),
