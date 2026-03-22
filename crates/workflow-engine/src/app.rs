@@ -11,13 +11,18 @@ use workflow_worker::WorkerRegistry;
 #[derive(Clone)]
 pub struct WorkflowEngineApp {
     definitions: DefinitionStore,
+    registry: WorkerRegistry,
 }
 
 impl WorkflowEngineApp {
     pub async fn for_test(base_dir: &Path) -> Result<Self, WorkflowEngineError> {
+        let registry = WorkerRegistry::new();
         let persistence = HiqlitePersistence::for_test(base_dir).await?;
-        let definitions = DefinitionStore::new(persistence);
-        Ok(Self { definitions })
+        let definitions = DefinitionStore::with_registry(persistence, registry.clone());
+        Ok(Self {
+            definitions,
+            registry,
+        })
     }
 
     pub async fn for_test_with_registry(
@@ -25,8 +30,15 @@ impl WorkflowEngineApp {
         registry: WorkerRegistry,
     ) -> Result<Self, WorkflowEngineError> {
         let persistence = HiqlitePersistence::for_test(base_dir).await?;
-        let definitions = DefinitionStore::with_registry(persistence, registry);
-        Ok(Self { definitions })
+        let definitions = DefinitionStore::with_registry(persistence, registry.clone());
+        Ok(Self {
+            definitions,
+            registry,
+        })
+    }
+
+    pub fn worker_registry(&self) -> WorkerRegistry {
+        self.registry.clone()
     }
 
     pub async fn replace_draft(

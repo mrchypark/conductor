@@ -12,6 +12,7 @@ use workflow_worker::{Capability, HandlerRegistration, WorkerRegistry};
 #[tokio::test]
 async fn definition_publish_creates_new_immutable_workflow_version() {
     let harness = TestHarness::start().await;
+    harness.register_task_handler("inventory.reserve");
 
     harness
         .app
@@ -67,6 +68,8 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
         vec![ValidationIssue::from(ValidationError::MissingTrigger)]
     );
 
+    harness
+        .register_task_handler("inventory.reserve.v2");
     harness
         .app
         .replace_draft(valid_definition("orders", "inventory.reserve.v2"))
@@ -208,11 +211,39 @@ async fn definition_publish_persists_run_pinning_metadata() {
 }
 
 #[tokio::test]
+async fn definition_publish_requires_handler_metadata_in_default_app_construction() {
+    let harness = TestHarness::start().await;
+
+    harness
+        .app
+        .replace_draft(valid_definition("orders", "inventory.reserve"))
+        .await
+        .expect("draft should replace");
+
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("validation should complete");
+    assert!(validation.ok, "valid draft should validate successfully");
+
+    let publish = harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect_err("default app path should not bypass handler validation");
+    assert!(matches!(
+        publish,
+        PublishDraftError::HandlerManifestMismatch { ref handler_id, ref capability }
+            if handler_id == "inventory.reserve" && capability == Capability::Task.as_str()
+    ));
+}
+
+#[tokio::test]
 async fn rust_builder_compiles_and_validates_before_publish() {
     fn fetch_order() {}
 
-    let registry = WorkerRegistry::new();
-    let harness = TestHarness::start_with_registry(registry.clone()).await;
+    let harness = TestHarness::start().await;
     let compiled = WorkflowBuilder::new("orders")
         .workflow_version(7)
         .event_trigger("order.created")
@@ -331,13 +362,14 @@ async fn rust_builder_compiles_and_validates_before_publish() {
             if handler_id == "orders.fetch" && capability == Capability::Task.as_str()
     ));
 
-    registry
+    harness
+        .registry
         .register("orders.fetch", fetch_order)
         .capability(Capability::Task)
         .default_queue("orders")
         .timeout_seconds(45);
 
-    let manifest = registry.manifest();
+    let manifest = harness.registry.manifest();
     assert_eq!(manifest.len(), 1);
     assert_eq!(
         manifest[0],
@@ -371,6 +403,7 @@ async fn rust_builder_compiles_and_validates_before_publish() {
 struct TestHarness {
     _tempdir: TempDir,
     app: WorkflowEngineApp,
+    registry: WorkerRegistry,
 }
 
 impl TestHarness {
@@ -379,26 +412,17 @@ impl TestHarness {
         let app = WorkflowEngineApp::for_test(tempdir.path())
             .await
             .expect("test app should start");
+        let registry = app.worker_registry();
 
         Self {
             _tempdir: tempdir,
             app,
-        }
-    }
-
-    async fn start_with_registry(registry: WorkerRegistry) -> Self {
-        let tempdir = TempDir::new().expect("temporary directory should exist");
-        let app = WorkflowEngineApp::for_test_with_registry(tempdir.path(), registry)
-            .await
-            .expect("test app should start");
-
-        Self {
-            _tempdir: tempdir,
-            app,
+            registry,
         }
     }
 
     async fn publish(&self, workflow_id: &str, handler: &str) {
+        self.register_task_handler(handler);
         self.app
             .replace_draft(valid_definition(workflow_id, handler))
             .await
@@ -414,7 +438,15 @@ impl TestHarness {
             .await
             .expect("draft should publish");
     }
+
+    fn register_task_handler(&self, handler: &str) {
+        self.registry
+            .register(handler, noop_handler)
+            .capability(Capability::Task);
+    }
 }
+
+fn noop_handler() {}
 
 fn valid_definition(workflow_id: &str, handler: &str) -> FlowDefinition {
     FlowDefinition {
