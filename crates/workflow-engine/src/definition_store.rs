@@ -101,7 +101,7 @@ pub enum WorkflowEngineError {
     DraftNotFound { workflow_id: String },
     #[error("no published definition exists for workflow '{workflow_id}'")]
     PublishedDefinitionNotFound { workflow_id: String },
-    #[error(transparent)]
+    #[error("persistence error: {0}")]
     Persistence(#[from] PersistenceError),
 }
 
@@ -128,7 +128,7 @@ pub enum PublishDraftError {
     },
     #[error("concurrent publish contention for workflow '{workflow_id}' exceeded retry budget")]
     ConcurrentPublishContention { workflow_id: String },
-    #[error(transparent)]
+    #[error("persistence error: {0}")]
     Persistence(#[from] PersistenceError),
 }
 

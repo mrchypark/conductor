@@ -33,11 +33,11 @@ macro_rules! params {
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
-    #[error(transparent)]
+    #[error("hiqlite error: {0}")]
     Hiqlite(#[from] hiqlite::Error),
-    #[error(transparent)]
+    #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("{0}")]
+    #[error("persistence invariant violation: {0}")]
     Invariant(String),
 }
 

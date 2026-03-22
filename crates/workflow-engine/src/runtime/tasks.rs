@@ -170,9 +170,9 @@ pub enum TaskRuntimeError {
     WaiterNotFound { waiter_id: String },
     #[error("branch expression '{expression}' is not supported by the MVP runtime evaluator")]
     UnsupportedBranchExpression { expression: String },
-    #[error(transparent)]
+    #[error("persistence error: {0}")]
     Persistence(#[from] PersistenceError),
-    #[error(transparent)]
+    #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
 
