@@ -5,11 +5,12 @@ use workflow_definition::Trigger;
 
 use super::{
     tasks::{
-        next_runtime_id, now_unix_seconds, RUN_STATUS_RUNNING, STEP_STATUS_COMPLETED,
-        TIMER_KIND_WAIT_TIMEOUT, WAITER_STATUS_RESUMED, WAITER_STATUS_WAITING,
+        next_runtime_id, RUN_STATUS_RUNNING, STEP_STATUS_COMPLETED, TIMER_KIND_WAIT_TIMEOUT,
+        WAITER_STATUS_RESUMED, WAITER_STATUS_WAITING,
     },
     StartedRun, TaskRuntime, TaskRuntimeError,
 };
+use crate::time::now_unix_seconds;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {

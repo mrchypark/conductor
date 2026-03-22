@@ -63,14 +63,6 @@ pub async fn cancel_run(
     Path(run_id): Path<String>,
     Json(request): Json<CancelRunRequest>,
 ) -> Result<Json<WorkflowRunRecord>, (StatusCode, String)> {
-    cancel_run_inner(app, run_id, request).await
-}
-
-async fn cancel_run_inner(
-    app: WorkflowEngineApp,
-    run_id: String,
-    request: CancelRunRequest,
-) -> Result<Json<WorkflowRunRecord>, (StatusCode, String)> {
     app.cancel_run(
         &run_id,
         request.reason.as_deref(),

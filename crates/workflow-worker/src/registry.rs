@@ -63,17 +63,6 @@ impl WorkerRegistry {
         }
     }
 
-    pub fn register<F>(
-        &self,
-        handler_id: impl Into<String>,
-        _handler: F,
-    ) -> HandlerRegistrationBuilder<'_>
-    where
-        F: 'static,
-    {
-        self.define_handler(handler_id)
-    }
-
     pub fn manifest(&self) -> Vec<HandlerRegistration> {
         self.registrations
             .read()

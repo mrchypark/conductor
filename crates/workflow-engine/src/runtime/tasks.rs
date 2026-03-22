@@ -10,6 +10,7 @@ use workflow_worker::WorkerRegistry;
 
 use super::EventEnvelope;
 use crate::persistence::{HiqlitePersistence, PersistenceError};
+use crate::time::now_unix_seconds;
 
 pub(crate) const LEASE_TTL_SECONDS: i64 = 30;
 pub(crate) const RUN_STATUS_RUNNING: &str = "running";
@@ -920,15 +921,6 @@ pub(crate) fn downstream_steps<'a>(
 
 pub(crate) fn next_runtime_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
-}
-
-pub(crate) fn now_unix_seconds() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_secs() as i64
 }
 
 pub(crate) fn active_retry_policy(definition: &FlowDefinition) -> Option<&RetryPolicy> {

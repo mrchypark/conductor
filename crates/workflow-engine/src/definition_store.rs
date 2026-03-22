@@ -5,6 +5,7 @@ use workflow_definition::{validate_definition, FlowDefinition, ValidationError};
 use workflow_worker::{Capability, WorkerRegistry};
 
 use crate::persistence::{HiqlitePersistence, PersistenceError};
+use crate::time::now_unix_seconds;
 
 const MAX_CONCURRENT_PUBLISH_RETRIES: usize = 8;
 
@@ -413,11 +414,4 @@ fn content_hash(definition: &FlowDefinition) -> Result<String, PersistenceError>
     let mut hasher = Sha256::new();
     hasher.update(json);
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn now_unix_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_secs() as i64
 }

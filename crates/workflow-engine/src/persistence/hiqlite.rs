@@ -1603,11 +1603,7 @@ impl HiqlitePersistence {
                     event_id,
                     event_type,
                     processing_state,
-                    payload_json,
-                    dedupe_key,
-                    created_at,
-                    updated_at,
-                    applied_at
+                    payload_json
                 FROM event_inbox
                 WHERE dedupe_key = $1
                 LIMIT 1
@@ -1630,11 +1626,7 @@ impl HiqlitePersistence {
                     event_id,
                     event_type,
                     processing_state,
-                    payload_json,
-                    dedupe_key,
-                    created_at,
-                    updated_at,
-                    applied_at
+                    payload_json
                 FROM event_inbox
                 WHERE processing_state = $1
                 ORDER BY event_inbox.created_at ASC
@@ -1931,22 +1923,12 @@ struct EventInboxRow {
     event_type: String,
     processing_state: String,
     payload_json: String,
-    dedupe_key: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-    applied_at: Option<i64>,
 }
 
 impl TryFrom<EventInboxRow> for EventInboxRecord {
     type Error = PersistenceError;
 
     fn try_from(row: EventInboxRow) -> Result<Self, Self::Error> {
-        let _ = (
-            row.dedupe_key,
-            row.created_at,
-            row.updated_at,
-            row.applied_at,
-        );
         Ok(Self {
             event_id: row.event_id,
             event_type: row.event_type,
