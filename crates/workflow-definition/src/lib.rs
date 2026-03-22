@@ -254,7 +254,12 @@ mod tests {
         let error =
             validate_definition(&definition).expect_err("definition should fail validation");
 
-        assert_eq!(error, ValidationError::MissingTrigger);
+        assert_eq!(
+            error,
+            ValidationError::MissingTrigger {
+                workflow_id: "missing-trigger".to_owned(),
+            }
+        );
     }
 
     #[test]

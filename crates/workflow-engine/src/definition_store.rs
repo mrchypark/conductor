@@ -18,9 +18,9 @@ pub struct ValidationIssue {
 impl From<ValidationError> for ValidationIssue {
     fn from(error: ValidationError) -> Self {
         match error {
-            ValidationError::MissingTrigger => Self {
+            ValidationError::MissingTrigger { workflow_id } => Self {
                 code: "missing_trigger".to_owned(),
-                message: "workflow definitions must include a trigger".to_owned(),
+                message: format!("workflow '{workflow_id}' must include a trigger"),
             },
             ValidationError::DuplicateStepId { step_id } => Self {
                 code: "duplicate_step_id".to_owned(),

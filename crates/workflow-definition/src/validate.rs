@@ -4,7 +4,9 @@ use crate::{FlowDefinition, StepDefinition, StepKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    MissingTrigger,
+    MissingTrigger {
+        workflow_id: String,
+    },
     DuplicateStepId {
         step_id: String,
     },
@@ -30,7 +32,9 @@ pub enum ValidationError {
 
 pub fn validate_definition(definition: &FlowDefinition) -> Result<(), ValidationError> {
     if definition.trigger.is_none() {
-        return Err(ValidationError::MissingTrigger);
+        return Err(ValidationError::MissingTrigger {
+            workflow_id: definition.workflow_id.clone(),
+        });
     }
 
     let mut step_ids = HashSet::new();

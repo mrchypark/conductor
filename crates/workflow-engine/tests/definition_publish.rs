@@ -68,7 +68,9 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
     assert!(!invalid_validation.ok);
     assert_eq!(
         invalid_validation.errors,
-        vec![ValidationIssue::from(ValidationError::MissingTrigger)]
+        vec![ValidationIssue::from(ValidationError::MissingTrigger {
+            workflow_id: "orders".to_owned(),
+        })]
     );
 
     harness.register_task_handler("inventory.reserve.v2");
