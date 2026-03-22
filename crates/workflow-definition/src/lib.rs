@@ -160,6 +160,43 @@ mod tests {
     }
 
     #[test]
+    fn definition_rejects_unknown_edge_source() {
+        let definition = FlowDefinition {
+            workflow_id: "missing-edge-source".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
+            trigger: Some(Trigger::Event(EventTrigger {
+                event_type: "order.created".to_owned(),
+            })),
+            steps: vec![StepDefinition {
+                id: "end".to_owned(),
+                kind: StepKind::Task,
+                metadata: StepMetadata {
+                    task: Some(TaskMetadata {
+                        handler: "inventory.reserve".to_owned(),
+                    }),
+                    ..StepMetadata::default()
+                },
+            }],
+            edges: vec![Edge {
+                from: "missing".to_owned(),
+                to: "end".to_owned(),
+            }],
+        };
+
+        let error =
+            validate_definition(&definition).expect_err("definition should fail validation");
+
+        assert_eq!(
+            error,
+            ValidationError::UnknownEdgeSource {
+                edge_from: "missing".to_owned(),
+                edge_to: "end".to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn definition_rejects_duplicate_step_ids() {
         let definition = FlowDefinition {
             workflow_id: "duplicate-step".to_owned(),
