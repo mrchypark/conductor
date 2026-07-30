@@ -57,14 +57,6 @@ pub struct FailTask {
     pub failure: FailurePayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EmitEvent {
-    #[serde(flatten)]
-    pub lease: TaskMutationContext,
-    pub event_type: String,
-    pub payload: Value,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetRun {
     pub run_id: RunId,

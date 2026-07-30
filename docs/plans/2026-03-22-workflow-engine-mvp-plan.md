@@ -1,8 +1,10 @@
 # Rust Durable Workflow Engine MVP Implementation Plan
 
+> Historical, pre-release plan: sections that propose `wait_for_event`, `emit_event`, or waiter-driven recovery are retained only as design provenance. Those APIs were removed before release and have no authoring, execution, recovery, or compatibility surface. Current `0.2.0` policy is defined in [`rust-durable-workflow-engine-design.md`](../spec/rust-durable-workflow-engine-design.md).
+
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the MVP durable workflow engine described in the spec with a Rust-first SDK, DSL-backed runtime, `hiqlite` persistence, in-process pull-worker execution, durable waits, and inspection APIs.
+**Historical goal:** Build the originally proposed MVP with a Rust-first SDK, DSL-backed runtime, `hiqlite` persistence, in-process pull-worker execution, durable waits, and inspection APIs. Current scope excludes the proposed asynchronous wait/emit pieces.
 
 **Architecture:** Start from stable shared contracts and move inward: define the DSL and worker protocol first, then build the engine state model on top of `hiqlite`, then add the SDK compiler and in-process worker adapter, and only after that expose HTTP APIs and recovery flows. Each slice must leave the repository in a runnable, testable state with one narrow end-to-end behavior proven before the next slice expands scope.
 

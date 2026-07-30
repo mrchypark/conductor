@@ -22,10 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let definition = WorkflowBuilder::new("order-sync")
         .event_trigger("order.created")
         .task_step("fetch_order", "orders.fetch")
-        .wait_for_event_step("wait_payment", "payment.captured")
+        .sleep_step("cooldown", 1)
         .task_step("notify_customer", "orders.notify")
-        .edge("fetch_order", "wait_payment")
-        .edge("wait_payment", "notify_customer")
+        .edge("fetch_order", "cooldown")
+        .edge("cooldown", "notify_customer")
         .compile();
 
     app.replace_draft(definition).await?;
@@ -57,14 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .run_once()
     .await?;
 
-    app.ingest_event(
-        "payment.captured",
-        json!({
-            "order_id": "ord-123",
-            "payment_id": "pay-1",
-        }),
-    )
-    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    app.recovery_scan_at(now + 2).await?;
 
     InProcessWorker::new(
         app.clone(),
@@ -76,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .register_handler("orders.notify", |input| {
         Ok(json!({
             "order_id": input["order_id"].clone(),
-            "payment_id": input["payment_id"].clone(),
             "notification": "sent",
         }))
     })
@@ -103,20 +98,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         steps[1].output,
         Some(json!({
             "order_id": "ord-123",
-            "payment_id": "pay-1",
+            "status": "fetched",
         }))
     );
     assert_eq!(
         steps[2].output,
         Some(json!({
             "order_id": "ord-123",
-            "payment_id": "pay-1",
             "notification": "sent",
         }))
     );
     assert!(transitions
         .iter()
-        .any(|record| record.transition_type == "waiter_resumed"));
+        .any(|record| record.transition_type == "timer_fired"));
     assert!(transitions
         .iter()
         .any(|record| record.transition_type == "run_completed"));

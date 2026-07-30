@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS workflow_definitions (
     definition_json TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     last_validated_content_hash TEXT,
+    execution_metadata_json TEXT,
     created_at INTEGER NOT NULL,
     published_at INTEGER,
     PRIMARY KEY (workflow_id, status, workflow_version)
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS task_queue (
     capability TEXT NOT NULL,
     queue_name TEXT NOT NULL,
     input_json TEXT NOT NULL,
+    timeout_at INTEGER,
+    continuation_state TEXT,
     status TEXT NOT NULL,
     attempt_sequence INTEGER NOT NULL,
     active_attempt_id TEXT,
@@ -74,18 +77,7 @@ CREATE TABLE IF NOT EXISTS timers (
     due_at INTEGER NOT NULL,
     status TEXT NOT NULL,
     payload_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS waiters (
-    waiter_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    step_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    status TEXT NOT NULL,
-    timeout_at INTEGER,
-    resume_event_id TEXT,
+    effect_state TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -117,6 +109,9 @@ CREATE TABLE IF NOT EXISTS event_inbox (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_event_inbox_dedupe
     ON event_inbox(dedupe_key)
     WHERE dedupe_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_event_inbox_recovery
+    ON event_inbox(processing_state, created_at, event_id);
 
 CREATE TABLE IF NOT EXISTS transition_log (
     transition_id TEXT PRIMARY KEY,

@@ -97,6 +97,22 @@ async fn recovery_requeues_expired_leases_and_fires_due_timers_once() {
         .run_once()
         .await
         .expect("retry handler should fail and schedule retry");
+    let retry_pending_steps = harness
+        .app
+        .list_step_instances(&retry_runs[0].run_id)
+        .await
+        .expect("retry-pending step should load");
+    assert_eq!(retry_pending_steps[0].status, "retry_pending");
+    assert_eq!(retry_pending_steps[0].attempt_count, 1);
+    let retry_scheduled_count = harness
+        .app
+        .list_transitions(&retry_runs[0].run_id)
+        .await
+        .expect("retry transitions should load")
+        .into_iter()
+        .filter(|transition| transition.transition_type == "retry_timer_scheduled")
+        .count();
+    assert_eq!(retry_scheduled_count, 1);
 
     let advanced_now = now_unix_seconds() + 60;
     harness
@@ -267,6 +283,9 @@ fn lease_definition() -> FlowDefinition {
             metadata: StepMetadata {
                 task: Some(TaskMetadata {
                     handler: "lease.handler".to_owned(),
+                    capability: None,
+                    queue: None,
+                    timeout_seconds: None,
                 }),
                 ..StepMetadata::default()
             },
@@ -296,6 +315,9 @@ fn retry_definition() -> FlowDefinition {
             metadata: StepMetadata {
                 task: Some(TaskMetadata {
                     handler: "retry.handler".to_owned(),
+                    capability: None,
+                    queue: None,
+                    timeout_seconds: None,
                 }),
                 ..StepMetadata::default()
             },

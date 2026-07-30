@@ -8,10 +8,10 @@ use workflow_worker::{TaskClientError, TaskExecutionClient};
 use crate::{
     api,
     definition_store::{DefinitionStore, PublishDraftError, WorkflowEngineError, WorkflowSummary},
-    persistence::HiqlitePersistence,
+    persistence::{HiqlitePersistence, StoredDefinitionInspection},
     runtime::{
         EventEnvelope, EventIngestResult, StartedRun, StepInstanceRecord, TaskRuntime,
-        TaskRuntimeError, TransitionRecord, WaiterRecord,
+        TaskRuntimeError, TransitionRecord,
     },
     DefinitionValidation, StoredWorkflowDefinition, WorkflowRunRecord,
 };
@@ -26,6 +26,18 @@ pub struct WorkflowEngineApp {
 }
 
 impl WorkflowEngineApp {
+    #[cfg(test)]
+    pub(crate) fn from_test_persistence(persistence: HiqlitePersistence) -> Self {
+        let registry = WorkerRegistry::new();
+        let definitions = DefinitionStore::with_registry(persistence.clone(), registry.clone());
+        let runtime = TaskRuntime::new(persistence, registry.clone());
+        Self {
+            runtime,
+            definitions,
+            registry,
+        }
+    }
+
     pub async fn for_test(base_dir: &Path) -> Result<Self, WorkflowEngineError> {
         let registry = WorkerRegistry::new();
         let persistence = HiqlitePersistence::for_test(base_dir).await?;
@@ -56,6 +68,24 @@ impl WorkflowEngineApp {
         self.registry.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_raw_published_definition_for_test(
+        &self,
+        workflow_id: &str,
+        workflow_version: i64,
+        definition_json: &str,
+        execution_metadata_json: Option<&str>,
+    ) -> Result<(), WorkflowEngineError> {
+        self.definitions
+            .insert_raw_published_definition_for_test(
+                workflow_id,
+                workflow_version,
+                definition_json,
+                execution_metadata_json,
+            )
+            .await
+    }
+
     pub async fn replace_draft(
         &self,
         definition: FlowDefinition,
@@ -83,7 +113,7 @@ impl WorkflowEngineApp {
     pub async fn latest_published_definition(
         &self,
         workflow_id: &str,
-    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
+    ) -> Result<Option<StoredDefinitionInspection>, WorkflowEngineError> {
         self.definitions
             .latest_published_definition(workflow_id)
             .await
@@ -99,15 +129,26 @@ impl WorkflowEngineApp {
     pub async fn list_published_versions(
         &self,
         workflow_id: &str,
-    ) -> Result<Vec<StoredWorkflowDefinition>, WorkflowEngineError> {
+    ) -> Result<Vec<StoredDefinitionInspection>, WorkflowEngineError> {
         self.definitions.list_published_versions(workflow_id).await
+    }
+
+    pub(crate) async fn list_published_versions_page(
+        &self,
+        workflow_id: &str,
+        after_version: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<StoredDefinitionInspection>, WorkflowEngineError> {
+        self.definitions
+            .list_published_versions_page(workflow_id, after_version, limit)
+            .await
     }
 
     pub async fn published_definition(
         &self,
         workflow_id: &str,
-        workflow_version: u32,
-    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowEngineError> {
+        workflow_version: i64,
+    ) -> Result<Option<StoredDefinitionInspection>, WorkflowEngineError> {
         self.definitions
             .published_definition(workflow_id, workflow_version)
             .await
@@ -179,8 +220,15 @@ impl WorkflowEngineApp {
         self.runtime.list_step_instances(run_id).await
     }
 
-    pub async fn list_waiters(&self, run_id: &str) -> Result<Vec<WaiterRecord>, TaskRuntimeError> {
-        self.runtime.list_waiters(run_id).await
+    pub(crate) async fn list_step_instances_page(
+        &self,
+        run_id: &str,
+        cursor: Option<&(i64, String)>,
+        limit: u32,
+    ) -> Result<Vec<StepInstanceRecord>, TaskRuntimeError> {
+        self.runtime
+            .list_step_instances_page(run_id, cursor, limit)
+            .await
     }
 
     pub async fn list_transitions(
@@ -188,6 +236,17 @@ impl WorkflowEngineApp {
         run_id: &str,
     ) -> Result<Vec<TransitionRecord>, TaskRuntimeError> {
         self.runtime.list_transitions(run_id).await
+    }
+
+    pub(crate) async fn list_transitions_page(
+        &self,
+        run_id: &str,
+        cursor: Option<&(i64, String)>,
+        limit: u32,
+    ) -> Result<Vec<TransitionRecord>, TaskRuntimeError> {
+        self.runtime
+            .list_transitions_page(run_id, cursor, limit)
+            .await
     }
 
     pub async fn recovery_scan_at(&self, now: i64) -> Result<(), TaskRuntimeError> {

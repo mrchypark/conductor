@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{FlowDefinition, StepDefinition, StepKind};
+use crate::{FlowDefinition, StepDefinition, StepKind, MAX_TASK_TIMEOUT_SECONDS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -28,9 +28,16 @@ pub enum ValidationError {
         kind: StepKind,
         metadata_field: String,
     },
+    TaskTimeoutOutOfRange {
+        step_id: String,
+        timeout_seconds: u64,
+        max_timeout_seconds: u64,
+    },
 }
 
 pub fn validate_definition(definition: &FlowDefinition) -> Result<(), ValidationError> {
+    validate_task_timeouts(definition)?;
+
     if definition.trigger.is_none() {
         return Err(ValidationError::MissingTrigger {
             workflow_id: definition.workflow_id.clone(),
@@ -67,13 +74,36 @@ pub fn validate_definition(definition: &FlowDefinition) -> Result<(), Validation
     Ok(())
 }
 
+fn validate_task_timeouts(definition: &FlowDefinition) -> Result<(), ValidationError> {
+    for step in &definition.steps {
+        if step.kind != StepKind::Task {
+            continue;
+        }
+
+        if let Some(timeout_seconds) = step
+            .metadata
+            .task
+            .as_ref()
+            .and_then(|task| task.timeout_seconds)
+        {
+            if timeout_seconds > MAX_TASK_TIMEOUT_SECONDS {
+                return Err(ValidationError::TaskTimeoutOutOfRange {
+                    step_id: step.id.clone(),
+                    timeout_seconds,
+                    max_timeout_seconds: MAX_TASK_TIMEOUT_SECONDS,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_step_metadata(step: &StepDefinition) -> Result<(), ValidationError> {
     let (expected, present) = match step.kind {
         StepKind::Task => ("task", step.metadata.task.is_some()),
         StepKind::Sleep => ("sleep", step.metadata.sleep.is_some()),
-        StepKind::WaitForEvent => ("wait_for_event", step.metadata.wait_for_event.is_some()),
         StepKind::Branch => ("branch", step.metadata.branch.is_some()),
-        StepKind::EmitEvent => ("emit_event", step.metadata.emit_event.is_some()),
     };
 
     if !present {
@@ -87,9 +117,7 @@ fn validate_step_metadata(step: &StepDefinition) -> Result<(), ValidationError> 
     for metadata_field in [
         ("task", step.metadata.task.is_some()),
         ("sleep", step.metadata.sleep.is_some()),
-        ("wait_for_event", step.metadata.wait_for_event.is_some()),
         ("branch", step.metadata.branch.is_some()),
-        ("emit_event", step.metadata.emit_event.is_some()),
     ] {
         if metadata_field.1 && metadata_field.0 != expected {
             return Err(ValidationError::UnsupportedStepKindMetadata {

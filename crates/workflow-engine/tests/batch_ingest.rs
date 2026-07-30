@@ -126,6 +126,9 @@ fn batch_definition() -> FlowDefinition {
             metadata: StepMetadata {
                 task: Some(TaskMetadata {
                     handler: "inventory.reserve".to_owned(),
+                    capability: None,
+                    queue: None,
+                    timeout_seconds: None,
                 }),
                 ..StepMetadata::default()
             },

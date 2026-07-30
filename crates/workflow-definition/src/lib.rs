@@ -10,9 +10,8 @@ mod tests {
 
     use crate::{
         validate::{validate_definition, ValidationError},
-        BranchMetadata, Edge, EmitEventMetadata, EventTrigger, FlowDefinition, SleepMetadata,
-        StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger, WaitForEventMetadata,
-        WorkflowDefaults,
+        BranchMetadata, Edge, EventTrigger, FlowDefinition, SleepMetadata, StepDefinition,
+        StepKind, StepMetadata, TaskMetadata, Trigger, WorkflowDefaults, MAX_TASK_TIMEOUT_SECONDS,
     };
 
     #[test]
@@ -31,27 +30,27 @@ mod tests {
                     metadata: StepMetadata {
                         task: Some(TaskMetadata {
                             handler: "inventory.reserve".to_owned(),
-                        }),
-                        ..StepMetadata::default()
-                    },
-                },
-                StepDefinition {
-                    id: "wait_payment".to_owned(),
-                    kind: StepKind::WaitForEvent,
-                    metadata: StepMetadata {
-                        wait_for_event: Some(WaitForEventMetadata {
-                            event_type: "payment.captured".to_owned(),
+                            capability: None,
+                            queue: None,
                             timeout_seconds: None,
                         }),
                         ..StepMetadata::default()
                     },
                 },
                 StepDefinition {
-                    id: "notify".to_owned(),
-                    kind: StepKind::EmitEvent,
+                    id: "cooldown".to_owned(),
+                    kind: StepKind::Sleep,
                     metadata: StepMetadata {
-                        emit_event: Some(EmitEventMetadata {
-                            event_type: "order.ready".to_owned(),
+                        sleep: Some(SleepMetadata { seconds: 30 }),
+                        ..StepMetadata::default()
+                    },
+                },
+                StepDefinition {
+                    id: "notify_customer".to_owned(),
+                    kind: StepKind::Branch,
+                    metadata: StepMetadata {
+                        branch: Some(BranchMetadata {
+                            expression: "true".to_owned(),
                         }),
                         ..StepMetadata::default()
                     },
@@ -60,11 +59,11 @@ mod tests {
             edges: vec![
                 Edge {
                     from: "reserve_inventory".to_owned(),
-                    to: "wait_payment".to_owned(),
+                    to: "cooldown".to_owned(),
                 },
                 Edge {
-                    from: "wait_payment".to_owned(),
-                    to: "notify".to_owned(),
+                    from: "cooldown".to_owned(),
+                    to: "notify_customer".to_owned(),
                 },
             ],
         };
@@ -90,28 +89,28 @@ mod tests {
                         }
                     },
                     {
-                        "id": "wait_payment",
-                        "kind": "wait_for_event",
-                        "wait_for_event": {
-                            "event_type": "payment.captured"
+                        "id": "cooldown",
+                        "kind": "sleep",
+                        "sleep": {
+                            "seconds": 30
                         }
                     },
                     {
-                        "id": "notify",
-                        "kind": "emit_event",
-                        "emit_event": {
-                            "event_type": "order.ready"
+                        "id": "notify_customer",
+                        "kind": "branch",
+                        "branch": {
+                            "expression": "true"
                         }
                     }
                 ],
                 "edges": [
                     {
                         "from": "reserve_inventory",
-                        "to": "wait_payment"
+                        "to": "cooldown"
                     },
                     {
-                        "from": "wait_payment",
-                        "to": "notify"
+                        "from": "cooldown",
+                        "to": "notify_customer"
                     }
                 ]
             })
@@ -138,6 +137,9 @@ mod tests {
                 metadata: StepMetadata {
                     task: Some(TaskMetadata {
                         handler: "inventory.reserve".to_owned(),
+                        capability: None,
+                        queue: None,
+                        timeout_seconds: None,
                     }),
                     ..StepMetadata::default()
                 },
@@ -175,6 +177,9 @@ mod tests {
                 metadata: StepMetadata {
                     task: Some(TaskMetadata {
                         handler: "inventory.reserve".to_owned(),
+                        capability: None,
+                        queue: None,
+                        timeout_seconds: None,
                     }),
                     ..StepMetadata::default()
                 },
@@ -213,6 +218,9 @@ mod tests {
                     metadata: StepMetadata {
                         task: Some(TaskMetadata {
                             handler: "inventory.reserve".to_owned(),
+                            capability: None,
+                            queue: None,
+                            timeout_seconds: None,
                         }),
                         ..StepMetadata::default()
                     },
@@ -277,6 +285,9 @@ mod tests {
                 metadata: StepMetadata {
                     task: Some(TaskMetadata {
                         handler: "branch.handler".to_owned(),
+                        capability: None,
+                        queue: None,
+                        timeout_seconds: None,
                     }),
                     branch: Some(BranchMetadata {
                         expression: "payload.approved".to_owned(),
@@ -305,9 +316,7 @@ mod tests {
         let cases = [
             ("task", StepKind::Task, "task"),
             ("sleep", StepKind::Sleep, "sleep"),
-            ("wait", StepKind::WaitForEvent, "wait_for_event"),
             ("branch", StepKind::Branch, "branch"),
-            ("emit", StepKind::EmitEvent, "emit_event"),
         ];
 
         for (step_id, kind, metadata_field) in cases {
@@ -337,6 +346,108 @@ mod tests {
                     metadata_field: metadata_field.to_owned(),
                 }
             );
+        }
+    }
+
+    #[test]
+    fn definition_rejects_wait_for_event_step_kind() {
+        let error = serde_json::from_value::<FlowDefinition>(json!({
+            "workflow_id": "unsupported-wait",
+            "workflow_version": 1,
+            "defaults": {},
+            "trigger": {
+                "type": "event",
+                "event_type": "order.created"
+            },
+            "steps": [
+                {
+                    "id": "wait_payment",
+                    "kind": "wait_for_event",
+                    "wait_for_event": {
+                        "event_type": "payment.captured"
+                    }
+                }
+            ],
+            "edges": []
+        }))
+        .expect_err("unsupported wait_for_event step kind should fail to deserialize");
+
+        assert!(error.to_string().contains("wait_for_event"));
+    }
+
+    #[test]
+    fn definition_rejects_emit_event_step_kind() {
+        let error = serde_json::from_value::<FlowDefinition>(json!({
+            "workflow_id": "unsupported-emit",
+            "workflow_version": 1,
+            "defaults": {},
+            "trigger": {
+                "type": "event",
+                "event_type": "order.created"
+            },
+            "steps": [
+                {
+                    "id": "emit_ready",
+                    "kind": "emit_event",
+                    "emit_event": {
+                        "event_type": "order.ready"
+                    }
+                }
+            ],
+            "edges": []
+        }))
+        .expect_err("unsupported emit_event step kind should fail to deserialize");
+
+        assert!(error.to_string().contains("emit_event"));
+    }
+
+    #[test]
+    fn definition_accepts_maximum_task_timeout() {
+        let definition = definition_with_task_timeout(MAX_TASK_TIMEOUT_SECONDS);
+
+        validate_definition(&definition).expect("maximum task timeout should be supported");
+    }
+
+    #[test]
+    fn definition_rejects_task_timeout_above_maximum() {
+        let timeout_seconds = MAX_TASK_TIMEOUT_SECONDS + 1;
+        let definition = definition_with_task_timeout(timeout_seconds);
+
+        let error =
+            validate_definition(&definition).expect_err("oversized task timeout should fail");
+
+        assert_eq!(
+            error,
+            ValidationError::TaskTimeoutOutOfRange {
+                step_id: "run_task".to_owned(),
+                timeout_seconds,
+                max_timeout_seconds: MAX_TASK_TIMEOUT_SECONDS,
+            }
+        );
+    }
+
+    fn definition_with_task_timeout(timeout_seconds: u64) -> FlowDefinition {
+        FlowDefinition {
+            workflow_id: "task-timeout-boundary".to_owned(),
+            workflow_version: 1,
+            defaults: WorkflowDefaults::default(),
+            trigger: Some(Trigger::Event(EventTrigger {
+                event_type: "task.requested".to_owned(),
+            })),
+            steps: vec![StepDefinition {
+                id: "run_task".to_owned(),
+                kind: StepKind::Task,
+                metadata: StepMetadata {
+                    task: Some(TaskMetadata {
+                        handler: "task.run".to_owned(),
+                        capability: None,
+                        queue: None,
+                        timeout_seconds: Some(timeout_seconds),
+                    }),
+                    ..StepMetadata::default()
+                },
+            }],
+            edges: Vec::new(),
         }
     }
 }

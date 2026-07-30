@@ -79,6 +79,14 @@ impl WorkerRegistry {
             .get(handler_id)
             .cloned()
     }
+
+    /// Captures all registrations under one read lock for publication-time resolution.
+    pub fn manifest_snapshot(&self) -> BTreeMap<String, HandlerRegistration> {
+        self.registrations
+            .read()
+            .expect("worker registry lock should not be poisoned")
+            .clone()
+    }
 }
 
 pub struct HandlerRegistrationBuilder<'a> {
@@ -112,5 +120,50 @@ impl<'a> HandlerRegistrationBuilder<'a> {
         }
 
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_snapshot_is_stable_after_registry_mutation() {
+        let registry = WorkerRegistry::new();
+        registry
+            .define_handler("orders.fetch")
+            .capability(Capability::Task)
+            .default_queue("orders-v1")
+            .timeout_seconds(30);
+
+        let snapshot = registry.manifest_snapshot();
+
+        registry
+            .define_handler("orders.fetch")
+            .capability(Capability::Task)
+            .default_queue("orders-v2")
+            .timeout_seconds(60);
+        registry.define_handler("orders.notify");
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot
+                .get("orders.fetch")
+                .expect("captured registration should remain available"),
+            &HandlerRegistration {
+                handler_id: "orders.fetch".to_owned(),
+                capability: Capability::Task,
+                default_queue: "orders-v1".to_owned(),
+                timeout_seconds: Some(30),
+            }
+        );
+        assert_eq!(
+            registry
+                .registration("orders.fetch")
+                .expect("live registration should exist")
+                .default_queue,
+            "orders-v2"
+        );
+        assert!(!snapshot.contains_key("orders.notify"));
     }
 }
