@@ -8,7 +8,7 @@ use workflow_sdk::WorkflowBuilder;
 use workflow_worker::{Capability, InProcessWorker, RunOnceOutcome, WorkerRegistry};
 
 #[tokio::test]
-async fn http_order_sync_flow_runs_end_to_end_and_deduplicates_resume_events() {
+async fn http_order_sync_flow_runs_end_to_end_with_sleep_between_tasks() {
     let harness = TestHarness::start().await;
     harness.register_metadata("orders.fetch", "default");
     harness.register_metadata("orders.notify", "default");
@@ -16,10 +16,10 @@ async fn http_order_sync_flow_runs_end_to_end_and_deduplicates_resume_events() {
     let definition = WorkflowBuilder::new("order-sync")
         .event_trigger("order.created")
         .task_step("fetch_order", "orders.fetch")
-        .wait_for_event_step("wait_payment", "payment.captured")
+        .sleep_step("cooldown", 1)
         .task_step("notify_customer", "orders.notify")
-        .edge("fetch_order", "wait_payment")
-        .edge("wait_payment", "notify_customer")
+        .edge("fetch_order", "cooldown")
+        .edge("cooldown", "notify_customer")
         .compile();
 
     let router = harness.app.router();
@@ -134,122 +134,11 @@ async fn http_order_sync_flow_runs_end_to_end_and_deduplicates_resume_events() {
         .expect("fetch worker should run");
     assert!(matches!(fetch_outcome, RunOnceOutcome::Completed { .. }));
 
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/v1/runs/{run_id}/waits"))
-                .body(Body::empty())
-                .expect("request should build"),
-        )
+    harness
+        .app
+        .recovery_scan_at(now_unix_seconds() + 2)
         .await
-        .expect("waits request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
-    let waits: Vec<workflow_engine::WaiterRecord> = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read"),
-    )
-    .expect("waits should deserialize");
-    assert_eq!(waits.len(), 1);
-    assert_eq!(waits[0].step_id, "wait_payment");
-    assert_eq!(waits[0].status, "waiting");
-
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/events")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "events": [
-                            {
-                                "id": "evt-payment-captured-1",
-                                "name": "payment.captured",
-                                "data": {
-                                    "order_id": "ord-123",
-                                    "payment_id": "pay-1"
-                                }
-                            }
-                        ]
-                    }))
-                    .expect("resume event should serialize"),
-                ))
-                .expect("request should build"),
-        )
-        .await
-        .expect("resume event should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
-    let resume_results: Vec<workflow_engine::EventIngestResult> = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read"),
-    )
-    .expect("resume response should deserialize");
-    assert!(!resume_results[0].deduplicated);
-
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/v1/runs/{run_id}/waits"))
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await
-        .expect("waits request should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
-    let waits: Vec<workflow_engine::WaiterRecord> = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read"),
-    )
-    .expect("waits should deserialize");
-    assert_eq!(waits.len(), 1);
-    assert_eq!(waits[0].status, "resumed");
-    assert_eq!(
-        waits[0].resume_event_id.as_deref(),
-        Some("evt-payment-captured-1")
-    );
-
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/events")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "events": [
-                            {
-                                "id": "evt-payment-captured-1",
-                                "name": "payment.captured",
-                                "data": {
-                                    "order_id": "ord-123",
-                                    "payment_id": "pay-1"
-                                }
-                            }
-                        ]
-                    }))
-                    .expect("duplicate event should serialize"),
-                ))
-                .expect("request should build"),
-        )
-        .await
-        .expect("duplicate resume event should succeed");
-    assert_eq!(response.status(), StatusCode::OK);
-    let duplicate_results: Vec<workflow_engine::EventIngestResult> = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read"),
-    )
-    .expect("duplicate response should deserialize");
-    assert!(duplicate_results[0].deduplicated);
+        .expect("recovery should fire sleep timer");
 
     let notify_worker = InProcessWorker::new(
         harness.app.clone(),
@@ -261,7 +150,6 @@ async fn http_order_sync_flow_runs_end_to_end_and_deduplicates_resume_events() {
     .register_handler("orders.notify", |input| {
         Ok(json!({
             "order_id": input["order_id"].clone(),
-            "payment_id": input["payment_id"].clone(),
             "notification": "sent",
         }))
     });
@@ -310,22 +198,30 @@ async fn http_order_sync_flow_runs_end_to_end_and_deduplicates_resume_events() {
     )
     .expect("steps should deserialize");
     assert_eq!(steps.len(), 3);
-    assert_eq!(steps[0].step_id, "fetch_order");
+    let fetch_order = steps
+        .iter()
+        .find(|step| step.step_id == "fetch_order")
+        .expect("fetch_order step should exist");
     assert_eq!(
-        steps[0].output,
+        fetch_order.output,
         Some(json!({ "order_id": "ord-123", "status": "fetched" }))
     );
-    assert_eq!(steps[1].step_id, "wait_payment");
+    let cooldown = steps
+        .iter()
+        .find(|step| step.step_id == "cooldown")
+        .expect("cooldown step should exist");
     assert_eq!(
-        steps[1].output,
-        Some(json!({ "order_id": "ord-123", "payment_id": "pay-1" }))
+        cooldown.output,
+        Some(json!({ "order_id": "ord-123", "status": "fetched" }))
     );
-    assert_eq!(steps[2].step_id, "notify_customer");
+    let notify_customer = steps
+        .iter()
+        .find(|step| step.step_id == "notify_customer")
+        .expect("notify_customer step should exist");
     assert_eq!(
-        steps[2].output,
+        notify_customer.output,
         Some(json!({
             "order_id": "ord-123",
-            "payment_id": "pay-1",
             "notification": "sent",
         }))
     );
@@ -348,21 +244,63 @@ async fn http_order_sync_flow_runs_end_to_end_and_deduplicates_resume_events() {
             .expect("body should read"),
     )
     .expect("transitions should deserialize");
-    let transition_types = transitions
+    let by_type = |transition_type: &str| {
+        transitions
+            .iter()
+            .filter(|record| record.transition_type == transition_type)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(by_type("run_started").len(), 1);
+    assert_eq!(by_type("run_completed").len(), 1);
+
+    let scheduled = by_type("timer_scheduled");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(
+        scheduled[0].payload,
+        Some(json!({
+            "step_id": "cooldown",
+            "timer_kind": "sleep",
+        }))
+    );
+
+    let fired = by_type("timer_fired");
+    assert_eq!(fired.len(), 1);
+    let fired_payload = fired[0]
+        .payload
+        .as_ref()
+        .expect("timer_fired should retain its payload");
+    assert_eq!(fired_payload["timer_kind"], "sleep");
+    assert!(fired_payload["timer_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+
+    let mut completed_step_ids = by_type("task_completed")
         .iter()
-        .map(|record| record.transition_type.as_str())
+        .map(|record| {
+            record
+                .payload
+                .as_ref()
+                .and_then(|payload| payload["step_id"].as_str())
+                .expect("task_completed should identify its step")
+        })
         .collect::<Vec<_>>();
-    assert!(transition_types.contains(&"run_started"));
-    assert!(transition_types.contains(&"task_completed"));
-    assert!(transition_types.contains(&"waiter_registered"));
-    assert!(transition_types.contains(&"waiter_resumed"));
-    assert!(transition_types.contains(&"run_completed"));
+    completed_step_ids.sort_unstable();
+    assert_eq!(completed_step_ids, ["fetch_order", "notify_customer"]);
 }
 
 struct TestHarness {
     _tempdir: TempDir,
     app: WorkflowEngineApp,
     registry: WorkerRegistry,
+}
+
+fn now_unix_seconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current time should be after unix epoch")
+        .as_secs() as i64
 }
 
 impl TestHarness {

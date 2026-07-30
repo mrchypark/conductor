@@ -1,14 +1,17 @@
+use std::collections::BTreeMap;
+
 use axum::body::Body;
 use http::{Request, StatusCode};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use workflow_definition::{
-    validate::ValidationError, BranchMetadata, Edge, EmitEventMetadata, EventTrigger,
-    FlowDefinition, SleepMetadata, StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger,
-    WaitForEventMetadata, WorkflowDefaults,
+    validate::ValidationError, BranchMetadata, Edge, EventTrigger, FlowDefinition, SleepMetadata,
+    StepDefinition, StepKind, StepMetadata, TaskMetadata, Trigger, WorkflowDefaults,
+    MAX_TASK_TIMEOUT_SECONDS,
 };
-use workflow_engine::{PublishDraftError, ValidationIssue, WorkflowEngineApp};
+use workflow_engine::{PublishDraftError, ValidationIssue, WorkflowEngineApp, WorkflowEngineError};
 use workflow_sdk::WorkflowBuilder;
 use workflow_worker::{Capability, HandlerRegistration, WorkerRegistry};
 
@@ -50,8 +53,14 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
     );
     assert_eq!(
         published_v1.content_hash,
-        definition_hash(&published_v1.definition),
-        "published content hash should match the immutable published payload"
+        publication_hash(
+            &published_v1.definition,
+            [(
+                "reserve_inventory",
+                expected_route("inventory.reserve", "task", "default", None),
+            )],
+        ),
+        "published content hash should cover the immutable definition and resolved route"
     );
 
     harness
@@ -112,8 +121,14 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
     );
     assert_eq!(
         published_v2.content_hash,
-        definition_hash(&published_v2.definition),
-        "published content hash should match the immutable published payload"
+        publication_hash(
+            &published_v2.definition,
+            [(
+                "reserve_inventory",
+                expected_route("inventory.reserve.v2", "task", "default", None),
+            )],
+        ),
+        "published content hash should cover the immutable definition and resolved route"
     );
 
     let published_versions = harness
@@ -124,9 +139,11 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
     let published_handlers = published_versions
         .iter()
         .map(|record| {
+            let definition: FlowDefinition = serde_json::from_str(&record.definition_json)
+                .expect("published definition JSON should decode");
             (
                 record.workflow_version,
-                record.definition.steps[0]
+                definition.steps[0]
                     .metadata
                     .task
                     .as_ref()
@@ -146,6 +163,242 @@ async fn definition_publish_creates_new_immutable_workflow_version() {
 }
 
 #[tokio::test]
+async fn definition_publish_preserves_explicit_task_routing_metadata() {
+    let harness = TestHarness::start().await;
+    harness.register_task_handler("inventory.reserve");
+
+    harness
+        .app
+        .replace_draft(valid_definition_with_task_metadata(
+            "orders",
+            TaskMetadata {
+                handler: "inventory.reserve".to_owned(),
+                capability: Some(Capability::Task.as_str().to_owned()),
+                queue: Some("priority".to_owned()),
+                timeout_seconds: Some(45),
+            },
+        ))
+        .await
+        .expect("draft should replace");
+
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("validation should complete");
+    assert!(validation.ok, "valid draft should validate successfully");
+
+    let published = harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect("publish should succeed");
+
+    assert_eq!(
+        published.definition.steps[0].metadata.task,
+        Some(TaskMetadata {
+            handler: "inventory.reserve".to_owned(),
+            capability: Some(Capability::Task.as_str().to_owned()),
+            queue: Some("priority".to_owned()),
+            timeout_seconds: Some(45),
+        })
+    );
+    assert_eq!(
+        published.content_hash,
+        publication_hash(
+            &published.definition,
+            [(
+                "reserve_inventory",
+                expected_route("inventory.reserve", "task", "priority", Some(45)),
+            )],
+        )
+    );
+}
+
+#[tokio::test]
+async fn definition_publish_snapshots_registry_defaults_per_version() {
+    let harness = TestHarness::start().await;
+    harness
+        .registry
+        .define_handler("inventory.reserve")
+        .capability(Capability::Task)
+        .default_queue("orders-v1")
+        .timeout_seconds(30);
+
+    harness
+        .app
+        .replace_draft(valid_definition("orders", "inventory.reserve"))
+        .await
+        .expect("draft should replace");
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("draft should validate");
+    assert!(validation.ok);
+
+    let published_v1 = harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect("v1 should publish");
+    let expected_v1_hash = publication_hash(
+        &published_v1.definition,
+        [(
+            "reserve_inventory",
+            expected_route("inventory.reserve", "task", "orders-v1", Some(30)),
+        )],
+    );
+    assert_eq!(published_v1.content_hash, expected_v1_hash);
+
+    harness
+        .registry
+        .define_handler("inventory.reserve")
+        .capability(Capability::Task)
+        .default_queue("orders-v2")
+        .timeout_seconds(60);
+
+    let reloaded_v1 = harness
+        .app
+        .published_definition("orders", 1)
+        .await
+        .expect("v1 lookup should succeed")
+        .expect("v1 should remain retained");
+    assert_eq!(reloaded_v1.content_hash, expected_v1_hash);
+
+    let published_v2 = harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect("v2 should publish against the new snapshot");
+    assert_eq!(published_v2.workflow_version, 2);
+    assert_eq!(
+        published_v2.content_hash,
+        publication_hash(
+            &published_v2.definition,
+            [(
+                "reserve_inventory",
+                expected_route("inventory.reserve", "task", "orders-v2", Some(60)),
+            )],
+        )
+    );
+    assert_ne!(published_v2.content_hash, published_v1.content_hash);
+}
+
+#[tokio::test]
+async fn definition_publish_rejects_task_capability_mismatch() {
+    let harness = TestHarness::start().await;
+    harness.register_task_handler("inventory.reserve");
+
+    harness
+        .app
+        .replace_draft(valid_definition_with_task_metadata(
+            "orders",
+            TaskMetadata {
+                handler: "inventory.reserve".to_owned(),
+                capability: Some("sync-http".to_owned()),
+                queue: None,
+                timeout_seconds: None,
+            },
+        ))
+        .await
+        .expect("draft should replace");
+
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("validation should complete");
+    assert!(validation.ok, "shape validation should still pass");
+
+    let error = harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect_err("publish should reject conflicting capability metadata");
+
+    assert!(matches!(
+        error,
+        PublishDraftError::HandlerManifestMismatch { ref handler_id, ref capability }
+            if handler_id == "inventory.reserve" && capability == "sync-http"
+    ));
+}
+
+#[tokio::test]
+async fn definition_draft_replacement_rejects_task_timeout_outside_supported_range() {
+    let harness = TestHarness::start().await;
+    let timeout_seconds = MAX_TASK_TIMEOUT_SECONDS + 1;
+
+    let error = harness
+        .app
+        .replace_draft(valid_definition_with_task_metadata(
+            "orders",
+            TaskMetadata {
+                handler: "inventory.reserve".to_owned(),
+                capability: None,
+                queue: None,
+                timeout_seconds: Some(timeout_seconds),
+            },
+        ))
+        .await
+        .expect_err("draft replacement should reject an oversized task timeout");
+
+    assert!(matches!(
+        error,
+        WorkflowEngineError::InvalidDefinition {
+            error: ValidationError::TaskTimeoutOutOfRange {
+                ref step_id,
+                timeout_seconds: actual_timeout,
+                max_timeout_seconds,
+            }
+        } if step_id == "reserve_inventory"
+            && actual_timeout == timeout_seconds
+            && max_timeout_seconds == MAX_TASK_TIMEOUT_SECONDS
+    ));
+}
+
+#[tokio::test]
+async fn definition_publish_rejects_registry_default_task_timeout_outside_supported_range() {
+    let harness = TestHarness::start().await;
+    let timeout_seconds = MAX_TASK_TIMEOUT_SECONDS + 1;
+    harness
+        .registry
+        .define_handler("inventory.reserve")
+        .capability(Capability::Task)
+        .timeout_seconds(timeout_seconds);
+
+    harness
+        .app
+        .replace_draft(valid_definition("orders", "inventory.reserve"))
+        .await
+        .expect("draft should replace");
+
+    let validation = harness
+        .app
+        .validate_draft("orders")
+        .await
+        .expect("validation should complete");
+    assert!(validation.ok, "definition should be semantically valid");
+
+    let error = harness
+        .app
+        .publish_draft("orders", &validation.content_hash)
+        .await
+        .expect_err("publish should reject an oversized registry default timeout");
+
+    assert!(matches!(
+        error,
+        PublishDraftError::TaskTimeoutOutOfRange {
+            ref handler_id,
+            timeout_seconds: actual_timeout,
+            max_timeout_seconds,
+        } if handler_id == "inventory.reserve"
+            && actual_timeout == timeout_seconds
+            && max_timeout_seconds == MAX_TASK_TIMEOUT_SECONDS
+    ));
+}
+
+#[tokio::test]
 async fn definition_publish_uses_latest_published_version_for_default_lookup() {
     let harness = TestHarness::start().await;
 
@@ -160,8 +413,10 @@ async fn definition_publish_uses_latest_published_version_for_default_lookup() {
         .expect("published definition should exist");
 
     assert_eq!(latest.workflow_version, 2);
+    let latest_definition: FlowDefinition = serde_json::from_str(&latest.definition_json)
+        .expect("latest published definition JSON should decode");
     assert_eq!(
-        latest.definition.steps[0]
+        latest_definition.steps[0]
             .metadata
             .task
             .as_ref()
@@ -303,13 +558,11 @@ async fn rust_builder_compiles_and_validates_before_publish() {
         .event_trigger("order.created")
         .task_step("fetch_order", "orders.fetch")
         .sleep_step("wait_retry", 30)
-        .wait_for_event_step("wait_payment", "payment.captured")
         .branch_step("check_priority", "event.data.priority == true")
-        .emit_event_step("emit_ready", "order.ready")
+        .task_step("notify_ready", "orders.notify")
         .edge("fetch_order", "wait_retry")
-        .edge("wait_retry", "wait_payment")
-        .edge("wait_payment", "check_priority")
-        .edge("check_priority", "emit_ready")
+        .edge("wait_retry", "check_priority")
+        .edge("check_priority", "notify_ready")
         .compile();
 
     assert_eq!(
@@ -328,6 +581,9 @@ async fn rust_builder_compiles_and_validates_before_publish() {
                     metadata: StepMetadata {
                         task: Some(TaskMetadata {
                             handler: "orders.fetch".to_owned(),
+                            capability: None,
+                            queue: None,
+                            timeout_seconds: None,
                         }),
                         ..StepMetadata::default()
                     },
@@ -337,17 +593,6 @@ async fn rust_builder_compiles_and_validates_before_publish() {
                     kind: StepKind::Sleep,
                     metadata: StepMetadata {
                         sleep: Some(SleepMetadata { seconds: 30 }),
-                        ..StepMetadata::default()
-                    },
-                },
-                StepDefinition {
-                    id: "wait_payment".to_owned(),
-                    kind: StepKind::WaitForEvent,
-                    metadata: StepMetadata {
-                        wait_for_event: Some(WaitForEventMetadata {
-                            event_type: "payment.captured".to_owned(),
-                            timeout_seconds: None,
-                        }),
                         ..StepMetadata::default()
                     },
                 },
@@ -362,11 +607,14 @@ async fn rust_builder_compiles_and_validates_before_publish() {
                     },
                 },
                 StepDefinition {
-                    id: "emit_ready".to_owned(),
-                    kind: StepKind::EmitEvent,
+                    id: "notify_ready".to_owned(),
+                    kind: StepKind::Task,
                     metadata: StepMetadata {
-                        emit_event: Some(EmitEventMetadata {
-                            event_type: "order.ready".to_owned(),
+                        task: Some(TaskMetadata {
+                            handler: "orders.notify".to_owned(),
+                            capability: None,
+                            queue: None,
+                            timeout_seconds: None,
                         }),
                         ..StepMetadata::default()
                     },
@@ -379,15 +627,11 @@ async fn rust_builder_compiles_and_validates_before_publish() {
                 },
                 Edge {
                     from: "wait_retry".to_owned(),
-                    to: "wait_payment".to_owned(),
-                },
-                Edge {
-                    from: "wait_payment".to_owned(),
                     to: "check_priority".to_owned(),
                 },
                 Edge {
                     from: "check_priority".to_owned(),
-                    to: "emit_ready".to_owned(),
+                    to: "notify_ready".to_owned(),
                 },
             ],
         }
@@ -423,9 +667,14 @@ async fn rust_builder_compiles_and_validates_before_publish() {
         .capability(Capability::Task)
         .default_queue("orders")
         .timeout_seconds(45);
+    harness
+        .registry
+        .define_handler("orders.notify")
+        .capability(Capability::Task)
+        .default_queue("orders");
 
     let manifest = harness.registry.manifest();
-    assert_eq!(manifest.len(), 1);
+    assert_eq!(manifest.len(), 2);
     assert_eq!(
         manifest[0],
         HandlerRegistration {
@@ -433,6 +682,15 @@ async fn rust_builder_compiles_and_validates_before_publish() {
             capability: Capability::Task,
             default_queue: "orders".to_owned(),
             timeout_seconds: Some(45),
+        }
+    );
+    assert_eq!(
+        manifest[1],
+        HandlerRegistration {
+            handler_id: "orders.notify".to_owned(),
+            capability: Capability::Task,
+            default_queue: "orders".to_owned(),
+            timeout_seconds: None,
         }
     );
 
@@ -452,6 +710,23 @@ async fn rust_builder_compiles_and_validates_before_publish() {
             .expect("task metadata")
             .handler,
         "orders.fetch"
+    );
+    assert_eq!(
+        published.content_hash,
+        publication_hash(
+            &published.definition,
+            [
+                (
+                    "fetch_order",
+                    expected_route("orders.fetch", "task", "orders", Some(45)),
+                ),
+                (
+                    "notify_ready",
+                    expected_route("orders.notify", "task", "orders", None),
+                ),
+            ],
+        ),
+        "every task step should contribute one resolved route to the publication envelope"
     );
 }
 
@@ -567,7 +842,7 @@ async fn http_definition_endpoints_manage_draft_validate_publish() {
         .await
         .expect("versions request should succeed");
     assert_eq!(response.status(), StatusCode::OK);
-    let versions: Vec<workflow_engine::StoredWorkflowDefinition> = serde_json::from_slice(
+    let versions: Vec<workflow_engine::StoredDefinitionInspection> = serde_json::from_slice(
         &axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body should read"),
@@ -588,7 +863,7 @@ async fn http_definition_endpoints_manage_draft_validate_publish() {
         .await
         .expect("version request should succeed");
     assert_eq!(response.status(), StatusCode::OK);
-    let version: workflow_engine::StoredWorkflowDefinition = serde_json::from_slice(
+    let version: workflow_engine::StoredDefinitionInspection = serde_json::from_slice(
         &axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body should read"),
@@ -712,6 +987,92 @@ async fn http_definition_endpoints_return_expected_error_statuses() {
         .await
         .expect("publish request should succeed");
     assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    harness.register_task_handler("inventory.reserve");
+    let timeout_seconds = MAX_TASK_TIMEOUT_SECONDS + 1;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/workflows/orders/draft")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&valid_definition_with_task_metadata(
+                        "orders",
+                        TaskMetadata {
+                            handler: "inventory.reserve".to_owned(),
+                            capability: None,
+                            queue: None,
+                            timeout_seconds: Some(timeout_seconds),
+                        },
+                    ))
+                    .expect("draft should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("draft request should succeed");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    harness
+        .registry
+        .define_handler("inventory.slow")
+        .capability(Capability::Task)
+        .timeout_seconds(timeout_seconds);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/workflows/slow-orders/draft")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&valid_definition("slow-orders", "inventory.slow"))
+                        .expect("draft should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("draft request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let draft: workflow_engine::StoredWorkflowDefinition = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("draft should deserialize");
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/slow-orders/draft:validate")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("validate request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/workflows/slow-orders/draft:publish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "content_hash": draft.content_hash,
+                    }))
+                    .expect("publish request should serialize"),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("publish request should succeed");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 struct TestHarness {
@@ -761,6 +1122,18 @@ impl TestHarness {
 }
 
 fn valid_definition(workflow_id: &str, handler: &str) -> FlowDefinition {
+    valid_definition_with_task_metadata(
+        workflow_id,
+        TaskMetadata {
+            handler: handler.to_owned(),
+            capability: None,
+            queue: None,
+            timeout_seconds: None,
+        },
+    )
+}
+
+fn valid_definition_with_task_metadata(workflow_id: &str, task: TaskMetadata) -> FlowDefinition {
     FlowDefinition {
         workflow_id: workflow_id.to_owned(),
         workflow_version: 0,
@@ -772,9 +1145,7 @@ fn valid_definition(workflow_id: &str, handler: &str) -> FlowDefinition {
             id: "reserve_inventory".to_owned(),
             kind: StepKind::Task,
             metadata: StepMetadata {
-                task: Some(TaskMetadata {
-                    handler: handler.to_owned(),
-                }),
+                task: Some(task),
                 ..StepMetadata::default()
             },
         }],
@@ -792,9 +1163,52 @@ fn invalid_definition_missing_trigger(workflow_id: &str) -> FlowDefinition {
     }
 }
 
-fn definition_hash(definition: &FlowDefinition) -> String {
-    let json = serde_json::to_vec(definition).expect("definition should serialize");
+#[derive(Serialize)]
+struct ExpectedPublicationExecutionMetadata {
+    semantics_version: &'static str,
+    task_routes: BTreeMap<String, ExpectedResolvedTaskRoute>,
+}
+
+#[derive(Serialize)]
+struct ExpectedResolvedTaskRoute {
+    handler: String,
+    capability: String,
+    queue: String,
+    timeout_seconds: Option<u64>,
+}
+
+fn expected_route(
+    handler: &str,
+    capability: &str,
+    queue: &str,
+    timeout_seconds: Option<u64>,
+) -> ExpectedResolvedTaskRoute {
+    ExpectedResolvedTaskRoute {
+        handler: handler.to_owned(),
+        capability: capability.to_owned(),
+        queue: queue.to_owned(),
+        timeout_seconds,
+    }
+}
+
+fn publication_hash<const N: usize>(
+    definition: &FlowDefinition,
+    routes: [(&str, ExpectedResolvedTaskRoute); N],
+) -> String {
+    let definition_json = serde_json::to_vec(definition).expect("definition should serialize");
+    let execution_metadata_json = serde_json::to_vec(&ExpectedPublicationExecutionMetadata {
+        semantics_version: "v1",
+        task_routes: routes
+            .into_iter()
+            .map(|(step_id, route)| (step_id.to_owned(), route))
+            .collect(),
+    })
+    .expect("execution metadata should serialize");
     let mut hasher = Sha256::new();
-    hasher.update(json);
+    hasher.update(b"conductor.workflow-publication.v1\0");
+    hasher.update((definition_json.len() as u64).to_be_bytes());
+    hasher.update(definition_json);
+    hasher.update((execution_metadata_json.len() as u64).to_be_bytes());
+    hasher.update(execution_metadata_json);
     format!("{:x}", hasher.finalize())
 }

@@ -9,6 +9,21 @@ use axum::{
 
 use crate::WorkflowEngineApp;
 
+const LIST_PAGE_DEFAULT: u32 = 100;
+const LIST_PAGE_MAX: u32 = 100;
+
+fn validated_list_limit(limit: Option<u32>) -> Result<u32, (axum::http::StatusCode, String)> {
+    let limit = limit.unwrap_or(LIST_PAGE_DEFAULT);
+    if (1..=LIST_PAGE_MAX).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {LIST_PAGE_MAX}"),
+        ))
+    }
+}
+
 pub fn router(app: WorkflowEngineApp) -> Router {
     Router::new()
         .route(
@@ -36,7 +51,6 @@ pub fn router(app: WorkflowEngineApp) -> Router {
         .route("/v1/runs/{run_id}", get(runs::get_run))
         .route("/v1/runs/{run_id}/steps", get(runs::get_steps))
         .route("/v1/runs/{run_id}/transitions", get(runs::get_transitions))
-        .route("/v1/runs/{run_id}/waits", get(runs::get_waits))
         .route("/v1/runs/{run_id}/cancel", post(runs::cancel_run))
         .with_state(app)
 }

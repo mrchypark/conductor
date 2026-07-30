@@ -149,6 +149,9 @@ fn sleep_definition() -> FlowDefinition {
                 metadata: StepMetadata {
                     task: Some(TaskMetadata {
                         handler: "notifications.send".to_owned(),
+                        capability: None,
+                        queue: None,
+                        timeout_seconds: None,
                     }),
                     ..StepMetadata::default()
                 },

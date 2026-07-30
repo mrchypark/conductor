@@ -9,8 +9,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        AssignedTask, CompleteTask, EmitEvent, FailTask, FailurePayload, GetRunResponse,
-        HeartbeatLease, PollTask, PollTaskResponse, TaskMutationContext, TaskOutput,
+        AssignedTask, CompleteTask, FailTask, FailurePayload, GetRunResponse, HeartbeatLease,
+        PollTask, PollTaskResponse, TaskMutationContext, TaskOutput,
     };
 
     #[test]
@@ -53,7 +53,7 @@ mod tests {
             worker_id: "worker-a".into(),
             worker_name: "payments-worker".into(),
             queues: vec!["payments".into(), "priority".into()],
-            capabilities: vec!["emit_event".into(), "sleep".into()],
+            capabilities: vec!["task".into(), "sleep".into()],
             max_inflight: 32,
         };
 
@@ -65,7 +65,7 @@ mod tests {
                 "worker_id": "worker-a",
                 "worker_name": "payments-worker",
                 "queues": ["payments", "priority"],
-                "capabilities": ["emit_event", "sleep"],
+                "capabilities": ["task", "sleep"],
                 "max_inflight": 32
             })
         );
@@ -211,21 +211,7 @@ mod tests {
         })
         .expect("fail task serializes");
 
-        let emit = serde_json::to_value(EmitEvent {
-            lease: TaskMutationContext {
-                task_id: "task-123".into(),
-                attempt_id: "attempt-9".into(),
-                worker_id: "worker-a".into(),
-                fencing_token: 42,
-            },
-            event_type: "payment.captured".into(),
-            payload: json!({
-                "order_id": "order-1"
-            }),
-        })
-        .expect("emit event serializes");
-
-        for value in [heartbeat, fail, emit] {
+        for value in [heartbeat, fail] {
             assert_eq!(value["task_id"], "task-123");
             assert_eq!(value["attempt_id"], "attempt-9");
             assert_eq!(value["worker_id"], "worker-a");

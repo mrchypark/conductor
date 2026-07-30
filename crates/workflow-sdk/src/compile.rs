@@ -1,6 +1,6 @@
 use workflow_definition::{
-    BranchMetadata, EmitEventMetadata, EventTrigger, FlowDefinition, SleepMetadata, StepDefinition,
-    StepKind, StepMetadata, TaskMetadata, Trigger, WaitForEventMetadata, WorkflowDefaults,
+    BranchMetadata, EventTrigger, FlowDefinition, SleepMetadata, StepDefinition, StepKind,
+    StepMetadata, TaskMetadata, Trigger, WorkflowDefaults,
 };
 
 use crate::builder::{BuilderStep, WorkflowBuilder};
@@ -20,11 +20,22 @@ pub fn compile_workflow(builder: WorkflowBuilder) -> FlowDefinition {
 
 fn compile_step(step: BuilderStep) -> StepDefinition {
     match step {
-        BuilderStep::Task { id, handler } => StepDefinition {
+        BuilderStep::Task {
+            id,
+            handler,
+            capability,
+            queue,
+            timeout_seconds,
+        } => StepDefinition {
             id,
             kind: StepKind::Task,
             metadata: StepMetadata {
-                task: Some(TaskMetadata { handler }),
+                task: Some(TaskMetadata {
+                    handler,
+                    capability,
+                    queue,
+                    timeout_seconds,
+                }),
                 ..StepMetadata::default()
             },
         },
@@ -36,30 +47,11 @@ fn compile_step(step: BuilderStep) -> StepDefinition {
                 ..StepMetadata::default()
             },
         },
-        BuilderStep::WaitForEvent { id, event_type } => StepDefinition {
-            id,
-            kind: StepKind::WaitForEvent,
-            metadata: StepMetadata {
-                wait_for_event: Some(WaitForEventMetadata {
-                    event_type,
-                    timeout_seconds: None,
-                }),
-                ..StepMetadata::default()
-            },
-        },
         BuilderStep::Branch { id, expression } => StepDefinition {
             id,
             kind: StepKind::Branch,
             metadata: StepMetadata {
                 branch: Some(BranchMetadata { expression }),
-                ..StepMetadata::default()
-            },
-        },
-        BuilderStep::EmitEvent { id, event_type } => StepDefinition {
-            id,
-            kind: StepKind::EmitEvent,
-            metadata: StepMetadata {
-                emit_event: Some(EmitEventMetadata { event_type }),
                 ..StepMetadata::default()
             },
         },

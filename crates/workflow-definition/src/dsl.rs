@@ -1,5 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+/// Inclusive lower bound for engine timestamps used in deadline calculations.
+pub const MIN_ENGINE_TIMESTAMP_SECONDS: i64 = 0;
+
+/// Inclusive upper bound for engine timestamps used in deadline calculations.
+///
+/// Limiting the supported clock domain to the lower half of non-negative `i64`
+/// leaves enough headroom to add the maximum supported task timeout.
+pub const MAX_ENGINE_TIMESTAMP_SECONDS: i64 = i64::MAX / 2;
+
+/// Maximum supported task timeout. Any supported engine timestamp plus this
+/// timeout is representable as an `i64`.
+pub const MAX_TASK_TIMEOUT_SECONDS: u64 = MAX_ENGINE_TIMESTAMP_SECONDS as u64;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowDefinition {
     #[serde(alias = "flow_id")]
@@ -55,9 +68,7 @@ pub struct RetryPolicy {
 pub enum StepKind {
     Task,
     Sleep,
-    WaitForEvent,
     Branch,
-    EmitEvent,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,16 +78,18 @@ pub struct StepMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sleep: Option<SleepMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wait_for_event: Option<WaitForEventMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<BranchMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub emit_event: Option<EmitEventMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskMetadata {
     pub handler: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,20 +98,8 @@ pub struct SleepMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WaitForEventMetadata {
-    pub event_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchMetadata {
     pub expression: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmitEventMetadata {
-    pub event_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

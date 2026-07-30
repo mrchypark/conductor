@@ -34,6 +34,27 @@ impl WorkflowBuilder {
         self.steps.push(BuilderStep::Task {
             id: step_id.into(),
             handler: handler.into(),
+            capability: None,
+            queue: None,
+            timeout_seconds: None,
+        });
+        self
+    }
+
+    pub fn task_step_with_options(
+        mut self,
+        step_id: impl Into<String>,
+        handler: impl Into<String>,
+        capability: Option<String>,
+        queue: Option<String>,
+        timeout_seconds: Option<u64>,
+    ) -> Self {
+        self.steps.push(BuilderStep::Task {
+            id: step_id.into(),
+            handler: handler.into(),
+            capability,
+            queue,
+            timeout_seconds,
         });
         self
     }
@@ -46,18 +67,6 @@ impl WorkflowBuilder {
         self
     }
 
-    pub fn wait_for_event_step(
-        mut self,
-        step_id: impl Into<String>,
-        event_type: impl Into<String>,
-    ) -> Self {
-        self.steps.push(BuilderStep::WaitForEvent {
-            id: step_id.into(),
-            event_type: event_type.into(),
-        });
-        self
-    }
-
     pub fn branch_step(
         mut self,
         step_id: impl Into<String>,
@@ -66,18 +75,6 @@ impl WorkflowBuilder {
         self.steps.push(BuilderStep::Branch {
             id: step_id.into(),
             expression: expression.into(),
-        });
-        self
-    }
-
-    pub fn emit_event_step(
-        mut self,
-        step_id: impl Into<String>,
-        event_type: impl Into<String>,
-    ) -> Self {
-        self.steps.push(BuilderStep::EmitEvent {
-            id: step_id.into(),
-            event_type: event_type.into(),
         });
         self
     }
@@ -97,9 +94,19 @@ impl WorkflowBuilder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuilderStep {
-    Task { id: String, handler: String },
-    Sleep { id: String, seconds: u64 },
-    WaitForEvent { id: String, event_type: String },
-    Branch { id: String, expression: String },
-    EmitEvent { id: String, event_type: String },
+    Task {
+        id: String,
+        handler: String,
+        capability: Option<String>,
+        queue: Option<String>,
+        timeout_seconds: Option<u64>,
+    },
+    Sleep {
+        id: String,
+        seconds: u64,
+    },
+    Branch {
+        id: String,
+        expression: String,
+    },
 }

@@ -9,7 +9,7 @@ Design a new event-driven durable workflow engine with these constraints:
 - The runtime executes a stable intermediate `FlowDefinition DSL`, not arbitrary user code directly.
 - The execution model is built around a future `pull worker protocol`.
 - The first local worker uses the same protocol surface through an in-process adapter.
-- Long-lived waits are first-class, including very long timers and waiting for external events/signals.
+- Durable timers are first-class, including very long `sleep` delays between synchronous execution steps.
 
 This design explicitly does **not** attempt to clone all of Temporal or Inngest semantics in the first release.
 
@@ -21,13 +21,20 @@ This document is a living design record for the engine.
 - `MVP` and `V1` boundaries must stay explicit as decisions evolve.
 - Implementation planning should follow the latest version of this document, not stale chat context.
 
+Companion specs for the narrowed sync-only boundary:
+
+- [`conductor-user-scenarios.md`](conductor-user-scenarios.md)
+- [`conductor-interface-contract.md`](conductor-interface-contract.md)
+- [`conductor-api-shape-draft.md`](conductor-api-shape-draft.md)
+- [`conductor-api-gap-analysis.md`](conductor-api-gap-analysis.md)
+
 ## Design Status
 
 This design is now the agreed baseline for implementation planning.
 
 - the core MVP architecture is fixed
 - the V1 expansion boundary is fixed
-- the `Tasks` integration boundary is fixed as event-triggered plus command/API callback based
+- the `Tasks` integration boundary is fixed as event-triggered synchronous execution under a higher-level task manager
 
 Further discussion may refine defaults and operations, but should not reopen the core architecture unless a new product constraint appears.
 
@@ -39,23 +46,44 @@ Implemented and covered by integration/E2E tests:
 
 - definition draft, validate, publish, version listing, and run inspection APIs
 - in-process pull-worker execution over the protocol DTOs
-- `task`, `sleep`, `wait_for_event`, `branch`, and `emit_event` step execution
+- `task`, `sleep`, and `branch` step execution
 - batch event ingest with dedupe responses
-- cancellation, wait resume, wait timeout, retry timer, sleep timer, and lease recovery paths
+- retry timer, sleep timer, and lease recovery paths
 
 Implemented with an intentionally narrower MVP surface than the long-term design target:
 
 - `branch` evaluation currently supports `true`, `false`, and `event.data.* ==/!= <json literal>` rather than a general CEL evaluator
-- `wait_for_event` matching is currently by event type, with timeout support, rather than the full `match.expr` binding model described later in this spec
 - the HTTP cancellation endpoint currently uses `POST /v1/runs/{run_id}/cancel`; the colon-verb form remains a documented target shape rather than the current transport contract
+
+Scope change on 2026-04-04:
+
+- conductor now owns only self-contained synchronous execution tasks plus durable `sleep`
+- asynchronous external waits, callback resumes, and `emit_event` orchestration moved out of conductor scope and up to the higher-level task manager
+- older sections below that discuss `wait_for_event`, `emit_event`, or waiter tables are historical, unshipped design provenance only; those APIs were removed before release and have no authoring, execution, recovery, or compatibility surface
+
+### Confirmed `0.2.0` Compatibility And Publication Policy
+
+The proposed `wait_for_event` and `emit_event` APIs were removed before release. They must not be reintroduced through stored-definition decoding or silently reinterpreted as sync-only definitions. The broader pre-1.0 wire and publication contract changes use the `0.2.0` boundary.
+
+The confirmed lifecycle policy is:
+
+- every retained published version remains immutable and inspectable, whether or not it is eligible for new runs
+- stored JSON outside the current authoring schema remains visible as a lossless diagnostic record but is not executable
+- new publications reject unsupported step kinds, and new runs never select an unsupported definition
+- capability, queue, timeout, and all other registry-derived routing inputs are resolved and snapshotted into the immutable published version
+- changing live registry defaults affects only a later publication; it never changes an existing published version or any run pinned to it
+- versions published before routing snapshots exist remain inspectable but non-executable and ineligible for new runs until an author explicitly republishes them as a new version
+- destructive definition removal is blocked while active runs reference the version
+
+This section is policy and remediation target, not a claim that every guard is implemented. The verification matrix must carry the matching storage, API, concurrency, recovery, and migration evidence before the lifecycle can be described as complete.
 
 Still intended by the design, but not yet proven by the current branch:
 
 - publish-time CEL binding/type validation
 - payload-aware event matching over `event`, `steps`, `workflow`, and `run` bindings
-- crash-closed atomic apply semantics for every event/timer/waiter side effect
+- crash-closed atomic apply semantics for every current event/timer side effect
 
-The verification matrix for the current branch lives in [`docs/spec/mvp-verification-matrix.md`](/Users/cypark/.codex/worktrees/0637/conductor/docs/spec/mvp-verification-matrix.md).
+The verification matrix for the current branch lives in [`docs/spec/mvp-verification-matrix.md`](mvp-verification-matrix.md).
 
 ## Product Direction
 
@@ -121,8 +149,6 @@ The engine never relies on in-memory progress to preserve correctness. Every mea
 - task failed
 - timer scheduled
 - timer fired
-- waiter registered
-- waiter resumed
 - run completed or failed
 
 ### Worker Model
@@ -139,15 +165,14 @@ The first worker runs in-process but uses the same protocol types and state rule
 
 ### Wait Model
 
-Long-lived waiting is a first-class feature.
+Durable waiting in the current scope is limited to timers.
 
 The engine supports:
 
 - `sleep until` for very long timers
-- `wait for event/signal`
-- `wait with timeout`
+- retry backoff through durable timers
 
-In MVP, external waiting resumes only through incoming events/signals, not connector polling.
+External event waits and callback resumes are intentionally out of scope for the current conductor boundary.
 
 ## FlowDefinition DSL
 
@@ -180,13 +205,11 @@ The minimum durable definition format is:
       }
     },
     {
-      "id": "wait_for_callback",
-      "kind": "wait_for_event",
-      "match": {
-        "event": "payment.confirmed",
-        "expr": "$.data.order_id == $steps.fetch_order.output.id"
-      },
-      "timeout": "24h"
+      "id": "cooldown",
+      "kind": "sleep",
+      "sleep": {
+        "seconds": 30
+      }
     },
     {
       "id": "notify",
@@ -199,8 +222,8 @@ The minimum durable definition format is:
     }
   ],
   "edges": [
-    { "from": "fetch_order", "to": "wait_for_callback" },
-    { "from": "wait_for_callback", "to": "notify" }
+    { "from": "fetch_order", "to": "cooldown" },
+    { "from": "cooldown", "to": "notify" }
   ]
 }
 ```
@@ -209,9 +232,7 @@ The minimum durable definition format is:
 
 - `task`
 - `sleep`
-- `wait_for_event`
 - `branch`
-- `emit_event`
 
 ### V1 Step Kinds
 
@@ -229,7 +250,6 @@ It is used for:
 
 - step input mapping
 - branch conditions
-- `wait_for_event` matching
 - event payload filtering
 - reading prior step outputs and workflow input values
 
@@ -310,7 +330,7 @@ MVP exposes these top-level binding roots:
 ### Root Semantics
 
 `event`
-- the triggering or resuming event payload for the current evaluation point
+- the triggering event payload
 
 `steps`
 - prior step outputs for the current run, indexed by stable `step_id`
@@ -341,18 +361,6 @@ Not every root needs to be available everywhere.
 - `steps`
 - `workflow`
 - `run`
-
-`wait_for_event.match`
-- `event` means the candidate incoming event being matched
-- `steps` means the already-completed prior step outputs for the waiting run
-- `workflow`
-- `run`
-
-`emit_event.payload`
-- `steps`
-- `workflow`
-- `run`
-- optionally the original trigger `event` if the engine keeps it available in the run context
 
 ### Binding Stability Rules
 
@@ -451,7 +459,6 @@ The runtime state is separate from the static definition.
 - `step_instances`
 - `task_queue`
 - `timers`
-- `waiters`
 - `leases`
 - `event_inbox`
 - `transition_log`
@@ -472,9 +479,6 @@ The runtime state is separate from the static definition.
 
 `timers`
 - durable source of wake-ups for sleep and retry timeouts
-
-`waiters`
-- stores event wait registrations and their timeout metadata
 
 `leases`
 - stores active execution claims with fencing tokens and expiry
@@ -517,9 +521,11 @@ V1 may add:
    - CEL bindings and allowed profile
    - handler references
    - step graph integrity
-3. If valid, publish creates a new immutable `workflow_version`.
-4. The prior published version remains available for pinned running executions.
-5. New runs use the latest published version unless explicitly overridden by an administrative replay or test flow.
+3. The authoring schema admits only supported step kinds; unsupported stored definitions cannot be published.
+4. If valid, publish resolves explicit routing plus registry defaults and snapshots the effective capability, queue, timeout, and routing inputs into a new immutable `workflow_version`.
+5. Prior published versions remain immutable and inspectable, and active runs remain pinned to them.
+6. New runs use the latest eligible published version. Administrative replay or test flows may choose another eligible version, but cannot bypass deprecation or pre-snapshot eligibility gates.
+7. A version published before routing snapshots exist becomes eligible for new runs only through explicit republish as a new version.
 
 ### Run Pinning
 
@@ -528,7 +534,7 @@ When a run starts, it stores:
 - `workflow_id`
 - `workflow_version`
 
-All later step scheduling, waits, retries, and resumes use that same pinned version.
+All later step scheduling, sleeps, and retries use that same pinned version.
 
 The engine must never silently migrate an in-flight run to a newer definition version.
 
@@ -541,7 +547,11 @@ For MVP, the engine should treat these as effectively breaking from the point of
 - changing binding names relied on by CEL expressions
 - removing or renaming handlers
 
+At the package and public API boundary, the narrowed pre-1.0 authoring surface and changed inspection contract are released at the `0.2.0` boundary.
+
 Because published definitions are immutable, the engine avoids this problem by pinning each run to the version it started with instead of trying to patch old runs forward.
+
+Retention is not execution eligibility. The engine preserves old versions for inspection while refusing to start new runs from unsupported or pre-routing-snapshot versions. Unsupported definitions have no execution path. Destructive removal remains blocked while any active run references a supported published version.
 
 ### Administrative Simplicity
 
@@ -571,8 +581,10 @@ Not required in MVP:
 - `definition_json`
 - `created_at`
 - `published_at`
+- snapshotted effective routing metadata or an equivalent immutable publication payload
+- explicit new-run eligibility/compatibility metadata
 
-There should be at most one active latest `published` version per `workflow_id` for default routing.
+There should be at most one latest eligible `published` version per `workflow_id` for default routing. Ineligible retained versions remain addressable for inspection and pinned active-run recovery.
 
 ## API Surface for Definition Publish and Run Inspection
 
@@ -605,11 +617,11 @@ Recommended MVP endpoints:
 - `POST /v1/workflows/{workflow_id}/draft:validate`
   - run DSL, CEL, graph, and handler validation
 - `POST /v1/workflows/{workflow_id}/draft:publish`
-  - create a new immutable published version from the current valid draft
+  - create a new immutable published version from the current valid draft with resolved routing defaults snapshotted
 - `GET /v1/workflows/{workflow_id}`
   - return summary metadata including current draft and latest published version info
 - `GET /v1/workflows/{workflow_id}/versions`
-  - list immutable published versions
+  - list immutable published versions, including retained versions that are not eligible for new runs
 - `GET /v1/workflows/{workflow_id}/versions/{workflow_version}`
   - return the concrete published definition and metadata
 
@@ -654,8 +666,6 @@ Recommended MVP endpoints:
   - return step instances, attempts, outputs or errors, and current status
 - `GET /v1/runs/{run_id}/transitions`
   - return the transition log for debugging and auditability
-- `GET /v1/runs/{run_id}/waits`
-  - return active or historical waits and their timeout status
 
 ### Optional MVP Endpoint
 
@@ -669,7 +679,7 @@ This should remain optional because it tends to pull the API toward a generic ad
 
 Not required in MVP:
 
-- delete endpoints for published versions
+- delete endpoints for published versions; any future destructive removal must first prove there are no active references and satisfy the retention policy
 - partial draft patch APIs
 - mass search and filtering over all runs
 - mutation endpoints for manual run surgery
@@ -820,16 +830,12 @@ MVP should distinguish at least:
 
 - `task_start_timeout`
 - `task_run_timeout`
-- `wait_timeout`
 
 `task_start_timeout`
 - task sat too long without successful execution progress after leasing logic or queueing conditions
 
 `task_run_timeout`
 - handler exceeded its allowed execution window
-
-`wait_timeout`
-- `wait_for_event` did not receive a matching event before its deadline
 
 These timeout sources should be recorded explicitly because they imply different operator actions and retry behavior.
 
@@ -912,7 +918,7 @@ This is the smallest split that keeps the runtime, SDK, and worker protocol deco
 - event ingest
 - run creation
 - scheduling
-- timers, waiters, leases, retries, inspection
+- timers, leases, retries, inspection
 - control-plane API implementation
 
 ### Why Not One Big Crate
@@ -996,6 +1002,8 @@ Instead, it needs enough metadata to validate:
 - capability requirement is known
 - queue is valid if specified
 - optional input/output schema hints are structurally valid
+
+Publication must also materialize the effective values after explicit definition metadata is combined with manifest defaults. Those resolved values belong to the immutable published version; runtime execution must not look them up again from a mutable live registry.
 
 ### Handler Metadata Manifest
 
@@ -1143,7 +1151,7 @@ The engine should:
 1. validate the envelope
 2. check dedupe state
 3. persist the event in `event_inbox`
-4. create matching runs or resume matching waits
+4. create matching eligible new runs
 5. record transitions
 
 These steps must be crash-closed.
@@ -1167,16 +1175,15 @@ Rules:
 - if an event exists in `received` state after a crash, recovery must retry applying it
 - ingest acknowledgement may return success only after the event is durably stored and either applied or explicitly recognized as an already-applied duplicate
 
-This prevents the failure mode where dedupe state is written but run creation or wait resume is lost.
+This prevents the failure mode where dedupe state is written but run creation is lost.
 
 ### Single-Fire Invariants
 
-Timers, waits, and retry triggers must have one-way durable state transitions.
+Timers and event ingest must have one-way durable state transitions.
 
 Recommended examples:
 
 - timer: `pending -> fired | cancelled`
-- waiter: `waiting -> resumed | timed_out | cancelled`
 - event ingest: `received -> applied | failed`
 
 These transitions must be atomic with the side effects they authorize.
@@ -1184,27 +1191,14 @@ These transitions must be atomic with the side effects they authorize.
 Examples:
 
 - a timer may move to `fired` only in the same transaction that creates the next runnable task
-- a waiter may move to `resumed` only in the same transaction that creates the resumed task path
-- a waiter may move to `timed_out` only in the same transaction that records the timeout result
 
-Recovery must respect these one-way state transitions and never create downstream work from a timer or waiter already in a terminal state.
+Recovery must respect these one-way state transitions and never create downstream work from a timer already in a terminal state.
 
 ### Matching Behavior
 
-An ingested event may do one or both of these:
+In the current conductor scope, an ingested event only triggers new workflow runs.
 
-- trigger new workflow runs
-- resume existing waits whose `wait_for_event` match expression succeeds
-
-This means event ingest is both a start signal and a resume signal.
-
-When multiple waits could match the same event, the DSL and runtime must make the consumption rule explicit.
-
-MVP rule:
-
-- a single waiter may be resumed at most once
-- an event may resume multiple waits only if those waits belong to different runs or different explicitly allowed matching scopes
-- the default runtime behavior should be deterministic and auditably recorded in `transition_log`
+Event ingest is not a resume signal for in-flight workflows. If an external async system must later advance orchestration, that decision belongs to the higher-level task manager, which can emit a fresh start event or invoke conductor again.
 
 ### Deferred For V1
 
@@ -1232,16 +1226,12 @@ MVP should model at least:
 
 - `task_schedule_timeout`
 - `task_run_timeout`
-- `wait_timeout`
 
 `task_schedule_timeout`
 - maximum allowed delay from task becoming runnable to actual execution progress
 
 `task_run_timeout`
 - maximum allowed execution window once a worker begins the task
-
-`wait_timeout`
-- maximum allowed wait for a `wait_for_event`
 
 ### Ownership Rule
 
@@ -1428,6 +1418,8 @@ Examples:
 
 A task is eligible only when both its queue and capability requirements match the worker request.
 
+The task's queue, capability, timeout, and related routing requirements come from the routing snapshot stored in its published workflow version. Live registry changes influence only a subsequent publication and never retroactively change queued work or a run already in progress.
+
 ### Polling
 
 `PollTask` should support long polling.
@@ -1524,7 +1516,7 @@ Run and task inspection should expose:
 3. Engine stores output and marks the step completed.
 4. Engine checks whether the run is already `cancel_requested`.
 5. If not cancelled, the engine evaluates outgoing edges.
-6. If not cancelled, the engine creates next tasks, timers, or waiters.
+6. If not cancelled, the engine creates next tasks or timers.
 7. Engine completes the run only if the terminal predicate is satisfied.
 
 ### Task Failure
@@ -1534,13 +1526,13 @@ Run and task inspection should expose:
 3. Engine stores the error and attempt metadata.
 4. Engine either schedules a retry timer or fails the run.
 
-### Event-Based Resume
+### Event-Based Start
 
 1. External event arrives.
 2. Engine persists the event with `processing_state = received`.
-3. Engine matches pending `waiters`.
-4. Matching waits are resumed atomically by moving each waiter from `waiting` to `resumed`.
-5. New runnable tasks are inserted in the same atomic transition.
+3. Engine matches published workflow triggers.
+4. New workflow runs are created from matching definitions.
+5. First runnable tasks are inserted in the same atomic transition.
 6. The event is marked `applied`.
 
 ### Recovery
@@ -1550,7 +1542,6 @@ A recovery scanner periodically:
 - requeues tasks whose leases expired
 - fires overdue timers
 - resumes runs left in intermediate states
-- reconciles waiting tasks whose timeout already elapsed
 
 Recovery must respect the same one-way state transitions as the live path.
 
@@ -1558,7 +1549,6 @@ It may only:
 
 - requeue a leased task if the active lease expired and no newer attempt has been accepted
 - fire a timer still in `pending`
-- time out a waiter still in `waiting`
 - re-apply an event still in `received`
 
 ### Terminal Run Predicate
@@ -1568,7 +1558,6 @@ A run may enter a terminal state only when all of these are true:
 - there are no ready tasks
 - there are no leased tasks with a still-active attempt
 - there are no pending timers
-- there are no waiting waits
 - there is no retry timer still pending
 - there is no cancellation drain work remaining
 
@@ -1656,7 +1645,7 @@ That increases flexibility for modelers, but also makes debugging and compatibil
 
 ### Wait and Event Semantics
 
-The current design models waiting through `sleep`, `wait_for_event`, timers, and waiters.
+The current design models waiting through `sleep` and durable timers.
 
 A BPMN-first design would want to represent waits using BPMN concepts such as:
 
@@ -1698,7 +1687,7 @@ If the goal is business-readable process modeling, shared language with analysts
 
 ## Integration Boundary with the Tasks Platform
 
-This engine can integrate with `/Users/cypark/Documents/work/Tasks`, but it should not absorb the Tasks domain model or become the direct source of truth for Tasks records.
+This engine can integrate with a separate `Tasks` repository, but it should not absorb the Tasks domain model or become the direct source of truth for Tasks records.
 
 ### Recommendation
 
@@ -1707,13 +1696,13 @@ Integrate as a loosely coupled orchestration capability.
 That means:
 
 - `Tasks` remains the system of record for business records, workflow templates, permissions, and user-facing operational state
-- the durable workflow engine owns long-running orchestration state, timers, waits, retries, and execution history
+- the durable workflow engine owns synchronous execution state, durable sleep/retry timers, and execution history
 - integration happens through domain events and command-style API calls, not shared direct table mutation
 
 The preferred product boundary is:
 
 - build the durable workflow engine as a separate product or separately deployable service
-- integrate it with `Tasks` through event triggers and command/API callbacks
+- integrate it with `Tasks` through ready-to-start event triggers and synchronous task handlers that invoke command APIs
 
 ### Why This Fits Tasks
 
@@ -1741,6 +1730,8 @@ Examples:
 - issue moved to `waiting_customer` -> arm a timeout and reminder flow
 - approval request created -> wait for external approval event and then call back into Tasks to transition the record
 
+The third example is a higher-level task-manager flow: the task manager owns the approval wait and starts a new eligible conductor run when the approval is ready. Conductor has no wait/callback compatibility execution.
+
 ### What Should Not Be Shared
 
 Do not share these as a single merged runtime:
@@ -1757,14 +1748,14 @@ Those belong to the Tasks domain services and API layer.
 Preferred first integration:
 
 1. `Tasks` emits domain events when records are created, moved, assigned, or commented
-2. the durable engine ingests those events and runs long-lived orchestration
-3. when action is needed, the engine calls back into Tasks through a command/API boundary
+2. the upper task manager converts ready work into an eligible conductor start event
+3. conductor runs self-contained synchronous tasks and durable timers; task handlers may call Tasks through its command/API boundary
 4. Tasks records activities and resulting state changes in its own persistence model
 
 This keeps both systems honest:
 
 - the engine never bypasses Tasks validation and auth
-- Tasks never has to implement durable waits, retries, and long-lived execution semantics itself
+- Tasks never has to implement conductor's durable sleep, retry, and execution semantics itself
 
 ### Suitable First Use Cases
 
@@ -1775,6 +1766,8 @@ Good candidates for integration:
 - approval flows with long external waits
 - connector-driven side effects such as Slack, email, or external callbacks
 - multi-step operational playbooks that touch Tasks records over time
+
+Long external waits and callbacks in this list are higher-level task-manager use cases, not conductor workflow steps. Conductor participates only in ready, self-contained execution slices.
 
 ### Poor First Use Cases
 
@@ -1806,7 +1799,7 @@ MVP exists to prove the durable execution model, not to maximize feature surface
 - compilation to `FlowDefinition DSL`
 - definition publishing and versioning
 - event-triggered workflows
-- `task`, `sleep`, `wait_for_event`, `branch`, and `emit_event`
+- `task`, `sleep`, and `branch`
 - `hiqlite` as the only backend
 - durable task queue in `hiqlite`
 - pull worker protocol
@@ -1815,7 +1808,6 @@ MVP exists to prove the durable execution model, not to maximize feature surface
 - idempotent event ingest
 - retry with backoff timers
 - very long timer support
-- waiting for external signals/events with timeout
 - run and step inspection API
 
 ### MVP Excludes
@@ -1834,7 +1826,7 @@ MVP exists to prove the durable execution model, not to maximize feature surface
 - a crashed worker does not lose workflow progress
 - duplicate event delivery is absorbed safely
 - in-process execution and future remote execution share the same protocol semantics
-- a waiting workflow resumes correctly when a matching event arrives
+- current definitions execute only from immutable, routing-snapshotted published versions eligible for new runs
 
 ## V1 Scope
 
@@ -1844,7 +1836,7 @@ V1 adds the first expansion layer once MVP semantics are stable.
 
 - remote workers over HTTP using the existing pull protocol
 - worker capability routing and named queues
-- polling connectors as a second wait/resume model
+- polling connectors as a second wait/resume model (historical extension idea requiring a later explicit scope decision)
 - connector registry and packaged built-in connectors
 - visual editor that emits the same `FlowDefinition DSL`
 - more expressive branching and data mapping
@@ -1883,15 +1875,15 @@ The SDK must compile to the same published DSL schema the editor will emit. The 
 
 ### Risk: Long wait complexity
 
-Very long waits are easy to model incorrectly if they are treated like sleeping threads. The design avoids this by storing waits durably in `timers` and `waiters`.
+Very long delays are easy to model incorrectly if they are treated like sleeping threads. The current scope avoids this by storing `sleep` and retry wake-ups durably in `timers`.
 
 ### Risk: CEL surface area growing too quickly
 
 Adopting `CEL` does not justify exposing the whole language in MVP. The language choice is fixed early, but the supported profile must remain intentionally small until the runtime, validation, and debugging model are proven.
 
-### Risk: weak callback and binding contracts with external systems
+### Historical Risk: weak callback and binding contracts with external systems
 
-The engine can only integrate safely with systems like `Tasks` if bindings, emitted events, and callback commands are versioned, idempotent, and precondition-aware. Otherwise the durable runtime will be correct internally but still duplicate or stale-write business mutations at the boundary.
+The unshipped async proposal would have required versioned, idempotent, and precondition-aware bindings, emitted events, and callback commands. Current definitions instead keep external async orchestration in the higher-level task manager.
 
 ## Recommended Build Order
 
@@ -1900,7 +1892,7 @@ The engine can only integrate safely with systems like `Tasks` if bindings, emit
 3. Define runtime tables and state transition rules.
 4. Define the pull worker protocol types.
 5. Build the in-process worker adapter against that protocol.
-6. Implement event ingest, task leasing, timer firing, and event-based resume.
+6. Implement event ingest, task leasing, and timer firing.
 7. Add recovery scanning and inspection APIs.
 8. Add remote workers and connectors in V1.
 
@@ -1911,7 +1903,7 @@ The core MVP and V1 design boundaries are now defined.
 The remaining questions are product and operations choices rather than missing architecture:
 
 1. multi-tenant model and namespace strategy
-2. default retention windows for events, dedupe records, transitions, and waits
+2. default retention windows for events, dedupe records, and transitions
 3. initial transport choice for remote workers in V1 (`HTTP` or `gRPC`)
 4. whether batch event ingest is first-class in MVP or deferred
 
@@ -1933,7 +1925,7 @@ If product requirements differ here, the architecture can absorb it, but the def
 
 Proceed with:
 
-- `MVP`: hiqlite-only, code-first, DSL-backed, pull-protocol-based, event/signal-driven durable waits
-- `V1`: remote workers, polling connectors, editor-ready authoring surface, expanded execution features
+- `MVP`: hiqlite-only, code-first, DSL-backed, pull-protocol-based synchronous execution with durable timers
+- `V1`: remote workers, editor-ready authoring surface, and expanded synchronous execution features; any new external wait/resume model requires a later explicit scope decision
 
 This keeps the engine small enough to build while preserving the most important future boundary: the worker protocol and DSL-backed runtime.
