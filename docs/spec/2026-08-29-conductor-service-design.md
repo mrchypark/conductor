@@ -95,6 +95,14 @@ Conductor가 workflow 식별자를 받는 이유는 관측과 감사 문맥을 �
 - timeout, retry backoff, stale completion 거부와 crash recovery를 내구성 있게 처리한다.
 - terminal result를 at-least-once callback으로 전달한다.
 
+Compos의 durable-engine outbox가 사용하는 `POST /v1/events`는 실행 전용 어댑터로
+지원한다. 요청은 `{"events":[{"name","idempotency_key","data"}]}` envelope이고,
+`data._compos.workspace_id`와 `data._compos.execution_request_id`가 없으면 거부한다.
+event 이름은 기본 handler/operation key가 되며, 선택적으로 `_compos.handler_key`,
+`_compos.handler_version`, `connection_id`, actor와 실행 정책을 제공할 수 있다.
+`_compos`와 `subject_ref`는 handler input에서 제거하고 각각 실행 문맥과 reference로
+보존한다. 이 경로는 workflow event를 해석하지 않고 하나의 실행 요청만 enqueue한다.
+
 ## Handler 모델
 
 ```go

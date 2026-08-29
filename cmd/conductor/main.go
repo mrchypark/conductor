@@ -51,6 +51,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.workerComplete(w, r)
 	case r.Method == http.MethodPost && (r.URL.Path == "/v1/worker/fail" || r.URL.Path == "/v1/worker/tasks:fail"):
 		s.workerFail(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/events":
+		s.ingestEvents(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/executions":
 		s.submitExecution(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/connections":
@@ -105,6 +107,198 @@ type kavunRegisterRequest struct {
 	AllowedModules []string          `json:"allowed_modules,omitempty"`
 	MaxFrames      int               `json:"max_frames,omitempty"`
 	MaxStack       int               `json:"max_stack,omitempty"`
+}
+
+// eventBatch is the wire envelope emitted by Compos' durable-engine outbox.
+// It is intentionally an execution-only adapter: events without the Compos
+// execution linkage are rejected instead of being interpreted as workflows.
+type eventBatch struct {
+	Events []eventRequest `json:"events"`
+}
+
+type eventRequest struct {
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	Data           json.RawMessage `json:"data"`
+}
+
+type eventComposContext struct {
+	WorkspaceID        string
+	ExecutionRequestID string
+	HandlerKey         string
+	HandlerVersion     string
+	OperationKey       string
+	ConnectionID       string
+	WorkflowKey        string
+	WorkflowVersion    uint64
+	WorkflowInstanceID string
+	TaskID             string
+	NodeKey            string
+	Actor              executions.Actor
+	DeadlineAt         string
+	TimeoutSeconds     float64
+	RetryPolicy        executions.RetryPolicy
+}
+
+type eventResult struct {
+	EventID            string `json:"event_id,omitempty"`
+	ExecutionID        string `json:"execution_id"`
+	ExecutionRequestID string `json:"execution_request_id"`
+	Status             string `json:"status"`
+}
+
+func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request) {
+	var batch eventBatch
+	if err := decodeBody(w, r, &batch); err != nil || len(batch.Events) == 0 {
+		writeError(w, http.StatusBadRequest, "events must contain at least one event")
+		return
+	}
+
+	requests := make([]struct {
+		event   eventRequest
+		request executions.ExecutionRequest
+	}, len(batch.Events))
+	for i, event := range batch.Events {
+		request, err := executionRequestFromEvent(event)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("event %q: %v", event.Name, err))
+			return
+		}
+		requests[i].event = event
+		requests[i].request = request
+	}
+
+	results := make([]eventResult, 0, len(requests))
+	for _, item := range requests {
+		execution, err := s.executions.Submit(r.Context(), item.request)
+		if err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		results = append(results, eventResult{
+			EventID: item.event.ID, ExecutionID: execution.ID,
+			ExecutionRequestID: execution.ExecutionRequestID, Status: execution.Status,
+		})
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "events": results})
+}
+
+func executionRequestFromEvent(event eventRequest) (executions.ExecutionRequest, error) {
+	if strings.TrimSpace(event.Name) == "" {
+		return executions.ExecutionRequest{}, errors.New("name is required")
+	}
+	if len(event.Data) == 0 || !json.Valid(event.Data) {
+		return executions.ExecutionRequest{}, errors.New("data must be valid JSON")
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(event.Data, &payload); err != nil {
+		return executions.ExecutionRequest{}, errors.New("data must be a JSON object")
+	}
+	var compos map[string]json.RawMessage
+	if raw := payload["_compos"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &compos); err != nil {
+			return executions.ExecutionRequest{}, errors.New("data._compos must be a JSON object")
+		}
+	}
+	ctx := eventComposContext{}
+	if err := unmarshalEventContext(compos, &ctx); err != nil {
+		return executions.ExecutionRequest{}, err
+	}
+	if ctx.ExecutionRequestID == "" || ctx.WorkspaceID == "" {
+		return executions.ExecutionRequest{}, errors.New("data._compos.workspace_id and execution_request_id are required")
+	}
+	if ctx.HandlerKey == "" {
+		ctx.HandlerKey = event.Name
+	}
+	if ctx.HandlerVersion == "" {
+		ctx.HandlerVersion = "1"
+	}
+	if ctx.OperationKey == "" {
+		ctx.OperationKey = event.Name
+	}
+	if event.IdempotencyKey == "" {
+		event.IdempotencyKey = "execution-dispatch:" + ctx.ExecutionRequestID
+	}
+	input := make(map[string]json.RawMessage, len(payload))
+	for key, value := range payload {
+		if key != "_compos" && key != "subject_ref" {
+			input[key] = value
+		}
+	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return executions.ExecutionRequest{}, fmt.Errorf("marshal input: %w", err)
+	}
+	var subjectRef json.RawMessage
+	if raw := payload["subject_ref"]; len(raw) > 0 {
+		subjectRef = append(json.RawMessage(nil), raw...)
+	}
+	request := executions.ExecutionRequest{
+		ExecutionRequestID: ctx.ExecutionRequestID, WorkspaceID: ctx.WorkspaceID,
+		WorkflowKey: ctx.WorkflowKey, WorkflowVersion: ctx.WorkflowVersion,
+		WorkflowInstanceID: ctx.WorkflowInstanceID, TaskID: ctx.TaskID, NodeKey: ctx.NodeKey,
+		HandlerKey: ctx.HandlerKey, HandlerVersion: ctx.HandlerVersion, OperationKey: ctx.OperationKey,
+		ConnectionID: ctx.ConnectionID, SubjectRef: subjectRef, Input: inputJSON,
+		Actor: ctx.Actor, IdempotencyKey: event.IdempotencyKey,
+		Timeout: time.Duration(ctx.TimeoutSeconds * float64(time.Second)), Retry: ctx.RetryPolicy,
+	}
+	if ctx.DeadlineAt != "" {
+		deadline, err := time.Parse(time.RFC3339Nano, ctx.DeadlineAt)
+		if err != nil {
+			return executions.ExecutionRequest{}, errors.New("data._compos.deadline_at must be RFC3339")
+		}
+		request.DeadlineAt = deadline
+	}
+	return request, nil
+}
+
+func unmarshalEventContext(values map[string]json.RawMessage, target *eventComposContext) error {
+	if len(values) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	var wire struct {
+		WorkspaceID        string                 `json:"workspace_id"`
+		ExecutionRequestID string                 `json:"execution_request_id"`
+		Handler            string                 `json:"handler"`
+		HandlerKey         string                 `json:"handler_key"`
+		HandlerVersion     string                 `json:"handler_version"`
+		Operation          string                 `json:"operation"`
+		OperationKey       string                 `json:"operation_key"`
+		ConnectionID       string                 `json:"connection_id"`
+		WorkflowKey        string                 `json:"workflow_key"`
+		WorkflowVersion    uint64                 `json:"workflow_version"`
+		WorkflowInstanceID string                 `json:"workflow_instance_id"`
+		TaskID             string                 `json:"task_id"`
+		NodeKey            string                 `json:"node_key"`
+		Actor              executions.Actor       `json:"actor"`
+		DeadlineAt         string                 `json:"deadline_at"`
+		TimeoutSeconds     float64                `json:"timeout_seconds"`
+		RetryPolicy        executions.RetryPolicy `json:"retry_policy"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return fmt.Errorf("invalid data._compos: %w", err)
+	}
+	target.WorkspaceID, target.ExecutionRequestID = wire.WorkspaceID, wire.ExecutionRequestID
+	target.HandlerKey, target.HandlerVersion = wire.HandlerKey, wire.HandlerVersion
+	if target.HandlerKey == "" {
+		target.HandlerKey = wire.Handler
+	}
+	target.OperationKey = wire.OperationKey
+	if target.OperationKey == "" {
+		target.OperationKey = wire.Operation
+	}
+	target.ConnectionID, target.WorkflowKey, target.WorkflowVersion = wire.ConnectionID, wire.WorkflowKey, wire.WorkflowVersion
+	target.WorkflowInstanceID, target.TaskID, target.NodeKey = wire.WorkflowInstanceID, wire.TaskID, wire.NodeKey
+	target.Actor, target.DeadlineAt, target.TimeoutSeconds, target.RetryPolicy = wire.Actor, wire.DeadlineAt, wire.TimeoutSeconds, wire.RetryPolicy
+	if target.TimeoutSeconds < 0 || target.TimeoutSeconds > 86400 {
+		return errors.New("data._compos.timeout_seconds is out of range")
+	}
+	return nil
 }
 
 func (s *server) registerHandler(w http.ResponseWriter, r *http.Request) {

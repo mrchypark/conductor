@@ -87,6 +87,76 @@ func TestExecutionHTTPRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestComposEventEnvelopeQueuesLinkedExecution(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registry := handlers.NewRegistry()
+	handler, err := handlers.NewFuncHandler(handlers.Manifest{Key: "demo.run", Version: "1"}, func(_ context.Context, req handlers.Request) (handlers.Result, error) {
+		return handlers.Result{Output: req.Input}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(handler); err != nil {
+		t.Fatal(err)
+	}
+	service, err := executions.NewService(store, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newServer(service, registry, nil)
+	body := `{"events":[{"id":"evt-1","name":"demo.run","idempotency_key":"execution-dispatch:er-event","data":{"hello":"world","subject_ref":{"type":"task","id":"task-1"},"_compos":{"workspace_id":"ws-1","execution_request_id":"er-event","task_id":"task-1"}}}]}`
+	post := func() map[string]any {
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(body)))
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("unexpected event status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var response map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	first, second := post(), post()
+	firstEvents := first["events"].([]any)
+	secondEvents := second["events"].([]any)
+	if firstEvents[0].(map[string]any)["execution_id"] != "exec_er-event" || secondEvents[0].(map[string]any)["execution_id"] != "exec_er-event" {
+		t.Fatalf("event was not idempotently linked: first=%#v second=%#v", first, second)
+	}
+	execution, err := service.Get(context.Background(), "exec_er-event")
+	if err != nil || execution.Status != "queued" {
+		t.Fatalf("unexpected queued execution=%+v err=%v", execution, err)
+	}
+	request, err := store.GetExecutionRequest(context.Background(), "er-event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(request.Input) != `{"hello":"world"}` || string(request.SubjectRef) != `{"type":"task","id":"task-1"}` {
+		t.Fatalf("reserved Compos context leaked into request: input=%s subject=%s", request.Input, request.SubjectRef)
+	}
+}
+
+func TestComposEventEnvelopeRequiresExecutionLinkage(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := executions.NewService(store, handlers.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	newServer(service, handlers.NewRegistry(), nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(`{"events":[{"name":"business.ready","data":{}}]}`)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected unlinked event rejection, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestWorkerHTTPProtocol(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {

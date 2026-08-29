@@ -28,6 +28,9 @@ attempt from the returned state. Non-OAuth credentials are stored encrypted thro
 service-authenticated `POST /v1/connections` (API key, Basic, or custom metadata).
 실행 취소는 `POST /v1/executions/{execution_id}/cancel`입니다.
 runtime event 조회는 `GET /v1/executions/{execution_id}/events`입니다.
+Compos durable-engine outbox는 `POST /v1/events`의 `{"events":[...]}` envelope를
+사용할 수 있습니다. 각 event의 `data._compos`에는 `workspace_id`와
+`execution_request_id`가 있어야 하며, 해당 event는 연결된 실행 요청으로만 변환됩니다.
 
 동적 함수는 Kavun 소스로 `POST /v1/handlers`에 등록할 수 있습니다. 요청은
 `{"manifest":{"handler_key":"...","version":"..."},"source":"output = input"}`
