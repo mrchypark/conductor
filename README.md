@@ -1,6 +1,49 @@
 # conductor
 
-Rust durable workflow engine MVP workspace.
+Go 실행 런타임이 함수 실행 경계를 담당합니다. 요청은 SQLite에 한 번 저장된 뒤
+등록된 `handler@version`을 실행하고, retryable 실패를 재시도하며, terminal runtime
+callback을 기록합니다. AMP connectors 카탈로그와 OAuth/PKCE 저장소도 같은 경계에서
+사용할 수 있습니다.
+
+```bash
+go test ./...
+go run ./cmd/conductor -db conductor.db
+```
+
+`Prefer: respond-async` stores a queued request; set `CONDUCTOR_WORKER_ID` to
+run the local lease worker. `CONDUCTOR_CALLBACK_URL` enables durable callback
+delivery (optional `CONDUCTOR_CALLBACK_TOKEN`). `CONDUCTOR_MASTER_KEY` (16/24/32
+bytes) enables encrypted connector connections; `COMPOS_BASE_URL` enables the
+built-in Compos connector boundary.
+
+External workers use the same lease protocol through
+`POST /v1/worker/tasks:poll`, `POST /v1/worker/tasks:heartbeat`,
+`POST /v1/worker/tasks:complete`, and `POST /v1/worker/tasks:fail` (the shorter
+`/v1/worker/{poll,heartbeat,complete,fail}` aliases are also accepted).
+
+OAuth endpoints are `POST /v1/oauth/{provider}/begin` and
+`POST` or `GET /v1/oauth/callback`; callback responses never return provider tokens.
+Provider redirects may use `GET`/`POST /v1/oauth/{provider}/callback` and resolve the
+attempt from the returned state. Non-OAuth credentials are stored encrypted through
+service-authenticated `POST /v1/connections` (API key, Basic, or custom metadata).
+실행 취소는 `POST /v1/executions/{execution_id}/cancel`입니다.
+runtime event 조회는 `GET /v1/executions/{execution_id}/events`입니다.
+
+동적 함수는 Kavun 소스로 `POST /v1/handlers`에 등록할 수 있습니다. 요청은
+`{"manifest":{"handler_key":"...","version":"..."},"source":"output = input"}`
+형식이며 `CONDUCTOR_SERVICE_TOKEN`이 설정된 서비스 인증 요청만 허용됩니다. 소스는
+`input`을 읽고 `output`을 설정하는 버전 핸들러로 컴파일되고, 파일 import와 기본 모듈은
+비활성화됩니다(허용 모듈: `base64`, `hex`, `json`, `math`, `text`). 정의와 소스는
+SQLite `dynamic_handlers`에 원본과 SHA-256을 저장하고, 컴파일 결과는
+`dynamic_handler_bytecode`에 별도 캐시로 저장합니다. 재시작 시 캐시의 소스 해시,
+바이트코드 해시, Kavun 런타임 ABI가 맞으면 즉시 복원하고, 아니면 원본을 다시
+컴파일해 캐시를 갱신합니다.
+
+현재 이 전환 범위는 Compos가 위임한 함수/커넥터 실행입니다. workflow graph, task
+completion, submission 같은 업무 상태는 Compos가 계속 소유합니다.
+
+기존 Rust workflow-engine 코드는 업무 graph 전환 참고용으로 남아 있으며, 위 실행
+경계의 런타임 경로에는 사용되지 않습니다.
 
 ## Version and compatibility policy
 
@@ -17,7 +60,14 @@ The lifecycle target is:
 
 This is the compatibility contract for the `0.2.0` remediation. The [MVP verification matrix](docs/spec/mvp-verification-matrix.md) remains the source of truth for which safeguards have landed and been verified; this policy is not itself a claim of implementation completeness.
 
-## Workspace checks
+## Go checks
+
+```bash
+go test ./...
+go vet ./...
+```
+
+## Legacy Rust checks
 
 ```bash
 cargo fmt --all --check
