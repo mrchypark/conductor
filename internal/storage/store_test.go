@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -11,34 +10,15 @@ import (
 	"time"
 )
 
-func TestOpenRejectsLegacyDatabase(t *testing.T) {
-	dsn := "file:" + t.TempDir() + "/legacy.db"
-	db, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`CREATE TABLE old_state (id TEXT PRIMARY KEY)`); err != nil {
-		t.Fatal(err)
-	}
-	_ = db.Close()
-	if _, err := Open(context.Background(), dsn); err == nil {
-		t.Fatal("legacy database was accepted")
-	}
-}
-
-func TestOpenMigratesExecutionTables(t *testing.T) {
+func TestOpenInitializesAuthoritativeSchema(t *testing.T) {
 	store, err := Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 
-	for _, table := range []string{"schema_metadata", "execution_requests", "executions", "attempts", "callbacks", "leases", "retry_timers", "callback_deliveries", "handler_manifests", "connector_manifests", "execution_events", "dynamic_handlers", "dynamic_handler_bytecode"} {
-		var name string
-		err := store.DB().QueryRowContext(context.Background(), "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name)
-		if err != nil || name != table {
-			t.Fatalf("migration did not create %s: %v", table, err)
-		}
+	if err := store.Persistence().Ready(context.Background()); err != nil {
+		t.Fatalf("schema is not authoritative: %v", err)
 	}
 }
 
@@ -76,13 +56,14 @@ func TestDynamicHandlerDefinitionIsImmutableAndReloadable(t *testing.T) {
 	}
 }
 
-func TestOpenAddsDynamicHandlerTableToExistingConductorSchema(t *testing.T) {
+func TestOpenReloadsDynamicHandlerFromRhiza(t *testing.T) {
 	dsn := "file:" + t.TempDir() + "/db"
 	store, err := Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().ExecContext(context.Background(), "DROP TABLE dynamic_handlers"); err != nil {
+	record := DynamicHandlerRecord{HandlerKey: "reload.kavun", Version: "1", ManifestJSON: []byte(`{"handler_key":"reload.kavun","version":"1"}`), Source: []byte("output = input"), SourceHash: "hash", MaxFrames: 1, MaxStack: 1}
+	if _, err := store.SaveDynamicHandler(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -93,9 +74,9 @@ func TestOpenAddsDynamicHandlerTableToExistingConductorSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	var name string
-	if err := reopened.DB().QueryRowContext(context.Background(), "SELECT name FROM sqlite_master WHERE type='table' AND name='dynamic_handlers'").Scan(&name); err != nil || name != "dynamic_handlers" {
-		t.Fatalf("dynamic handler table was not restored: %v", err)
+	records, err := reopened.ListDynamicHandlers(context.Background())
+	if err != nil || len(records) != 1 || records[0].HandlerKey != record.HandlerKey {
+		t.Fatalf("dynamic handler was not restored: %#v %v", records, err)
 	}
 }
 
@@ -119,11 +100,11 @@ func TestLeaseExpiryRecoversQueuedExecution(t *testing.T) {
 	if err := store.RecoverExpiredLeases(context.Background(), time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	var status string
-	if err := store.DB().QueryRowContext(context.Background(), "SELECT status FROM executions WHERE id='exec_r'").Scan(&status); err != nil {
+	execution, err := store.GetExecution(context.Background(), "exec_r")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if status != "queued" {
-		t.Fatalf("status=%s", status)
+	if execution.Status != "queued" {
+		t.Fatalf("status=%s", execution.Status)
 	}
 }

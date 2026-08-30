@@ -16,6 +16,7 @@ type Delivery struct {
 	Store  *storage.Store
 	Client *http.Client
 	Token  string
+	Now    func() time.Time
 }
 
 func (d *Delivery) RunOnce(ctx context.Context) error {
@@ -26,10 +27,14 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	if err := d.Store.RecoverCallbackDeliveries(ctx, time.Now().UTC(), 30*time.Second); err != nil {
+	now := time.Now
+	if d.Now != nil {
+		now = d.Now
+	}
+	if err := d.Store.RecoverCallbackDeliveries(ctx, now().UTC(), 30*time.Second); err != nil {
 		return err
 	}
-	items, err := d.Store.DueCallbackDeliveries(ctx, time.Now().UTC(), 20)
+	items, err := d.Store.DueCallbackDeliveries(ctx, now().UTC(), 20)
 	if err != nil {
 		return err
 	}
@@ -38,7 +43,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 		req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, item.TargetURL, bytes.NewReader(item.Payload))
 		if err != nil {
 			cancel()
-			_ = d.Store.MarkCallbackDelivery(ctx, item.ID, "failed", err.Error(), time.Now())
+			_ = d.Store.MarkCallbackDelivery(ctx, item.ID, "failed", err.Error(), now())
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -52,7 +57,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 			resp.Body.Close()
 		}
 		if callErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			if err := d.Store.MarkCallbackDelivery(ctx, item.ID, "delivered", "", time.Now()); err != nil {
+			if err := d.Store.MarkCallbackDelivery(ctx, item.ID, "delivered", "", now()); err != nil {
 				return err
 			}
 			continue
@@ -69,7 +74,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 		if callErr == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
 			status = "failed"
 		}
-		if err := d.Store.MarkCallbackDelivery(ctx, item.ID, status, message, time.Now().UTC().Add(delay)); err != nil {
+		if err := d.Store.MarkCallbackDelivery(ctx, item.ID, status, message, now().UTC().Add(delay)); err != nil {
 			return err
 		}
 	}

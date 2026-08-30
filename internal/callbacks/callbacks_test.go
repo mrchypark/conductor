@@ -45,24 +45,23 @@ func TestDeliveryRetriesAndUsesStableCallbackID(t *testing.T) {
 	if err := store.EnqueueCallbackDelivery(context.Background(), "cb_exec_r1", server.URL); err != nil {
 		t.Fatal(err)
 	}
-	d := &Delivery{Store: store, Client: server.Client()}
+	now := time.Now().UTC()
+	d := &Delivery{Store: store, Client: server.Client(), Now: func() time.Time { return now }}
 	if err := d.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().ExecContext(context.Background(), "UPDATE callback_deliveries SET next_attempt_at=CURRENT_TIMESTAMP"); err != nil {
-		t.Fatal(err)
-	}
+	now = now.Add(3 * time.Second)
 	if err := d.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if count != 2 || callbackID != "cb_exec_r1" {
 		t.Fatalf("delivery count/id=%d/%s", count, callbackID)
 	}
-	var status string
-	if err := store.DB().QueryRowContext(context.Background(), "SELECT status FROM callback_deliveries WHERE callback_id=?", callbackID).Scan(&status); err != nil {
+	delivery, err := store.CallbackDelivery(context.Background(), callbackID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if status != "delivered" {
-		t.Fatal(status)
+	if delivery.Status != "delivered" {
+		t.Fatal(delivery.Status)
 	}
 }

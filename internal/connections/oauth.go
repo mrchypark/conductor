@@ -8,8 +8,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/conductor/internal/persistence"
 	"golang.org/x/oauth2"
 )
 
@@ -28,7 +29,7 @@ var (
 )
 
 type Store struct {
-	db        *sql.DB
+	db        *persistence.DB
 	encryptor *Encryptor
 }
 
@@ -41,7 +42,7 @@ type Connection struct {
 	Metadata    map[string]string
 }
 
-func NewStore(db *sql.DB, masterKey []byte) (*Store, error) {
+func NewStore(ctx context.Context, db *persistence.DB, masterKey []byte) (*Store, error) {
 	if db == nil {
 		return nil, errors.New("database is required")
 	}
@@ -50,15 +51,15 @@ func NewStore(db *sql.DB, masterKey []byte) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{db: db, encryptor: encryptor}
-	if err := s.ensureSchema(context.Background()); err != nil {
+	if err := s.ensureSchema(ctx); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS oauth_attempts (
+	_, err := s.db.Mutate(ctx, "initialize oauth schema",
+		persistence.Statement{SQL: `CREATE TABLE IF NOT EXISTS oauth_attempts (
     attempt_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     connection_id TEXT NOT NULL,
@@ -70,9 +71,15 @@ CREATE TABLE IF NOT EXISTS oauth_attempts (
     expires_at INTEGER NOT NULL,
     scopes_json TEXT NOT NULL,
     created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_oauth_attempts_expiry ON oauth_attempts(expires_at);
-CREATE TABLE IF NOT EXISTS connections (
+)`},
+		persistence.Statement{SQL: `CREATE INDEX IF NOT EXISTS idx_oauth_attempts_expiry ON oauth_attempts(expires_at)`},
+		persistence.Statement{SQL: `CREATE TABLE IF NOT EXISTS oauth_consumptions (
+    attempt_id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL,
+    state_hash BLOB NOT NULL,
+    consumed_at INTEGER NOT NULL
+)`},
+		persistence.Statement{SQL: `CREATE TABLE IF NOT EXISTS connections (
     connection_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
     provider TEXT NOT NULL,
@@ -82,7 +89,7 @@ CREATE TABLE IF NOT EXISTS connections (
     expires_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
-);`)
+)`})
 	return err
 }
 
@@ -134,10 +141,10 @@ func (s *Store) Begin(ctx context.Context, input BeginInput, endpoint oauth2.End
 	if err != nil {
 		return BeginResult{}, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO oauth_attempts
+	_, err = s.db.Mutate(ctx, "begin oauth "+input.AttemptID, persistence.Statement{SQL: `INSERT INTO oauth_attempts
         (attempt_id, provider, connection_id, workspace_id, state_hash, pkce_verifier, redirect_uri, client_id, expires_at, scopes_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, input.AttemptID, input.Provider, input.ConnectionID, input.WorkspaceID,
-		stateHash[:], verifier, input.RedirectURL, input.ClientID, expiresAt.Unix(), scopes, input.Now.Unix())
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, Args: []any{input.AttemptID, input.Provider, input.ConnectionID, input.WorkspaceID,
+		base64.StdEncoding.EncodeToString(stateHash[:]), verifier, input.RedirectURL, input.ClientID, expiresAt.Unix(), string(scopes), input.Now.Unix()}})
 	if err != nil {
 		return BeginResult{}, fmt.Errorf("save oauth attempt: %w", err)
 	}
@@ -186,27 +193,30 @@ func (s *Store) Complete(ctx context.Context, cfg oauth2.Config, input CompleteI
 	}
 	want := hashState(input.State)
 	if input.AttemptID == "" {
-		if err := s.db.QueryRowContext(ctx, `SELECT attempt_id FROM oauth_attempts WHERE state_hash = ?`, want[:]).Scan(&input.AttemptID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, ErrInvalidState
-			}
+		rows, err := s.db.Query(ctx, `SELECT attempt_id FROM oauth_attempts WHERE state_hash = ?`, base64.StdEncoding.EncodeToString(want[:]))
+		if err != nil {
 			return nil, fmt.Errorf("load oauth attempt by state: %w", err)
 		}
+		if len(rows) == 0 {
+			return nil, ErrInvalidState
+		}
+		input.AttemptID = oauthString(rows[0][0])
 	}
-	var provider, connectionID, workspaceID, verifier, redirectURL, clientID, scopesJSON string
-	var stateHash []byte
-	var expiresAt int64
-	err := s.db.QueryRowContext(ctx, `SELECT provider, connection_id, workspace_id, state_hash, pkce_verifier, redirect_uri, client_id, expires_at, scopes_json
-        FROM oauth_attempts WHERE attempt_id = ?`, input.AttemptID).
-		Scan(&provider, &connectionID, &workspaceID, &stateHash, &verifier, &redirectURL, &clientID, &expiresAt, &scopesJSON)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrInvalidState
-	}
+	rows, err := s.db.Query(ctx, `SELECT provider, connection_id, workspace_id, state_hash, pkce_verifier, redirect_uri, client_id, expires_at, scopes_json FROM oauth_attempts WHERE attempt_id = ?`, input.AttemptID)
 	if err != nil {
 		return nil, fmt.Errorf("load oauth attempt: %w", err)
 	}
+	if len(rows) == 0 {
+		return nil, ErrInvalidState
+	}
+	row := rows[0]
+	provider, connectionID, workspaceID := oauthString(row[0]), oauthString(row[1]), oauthString(row[2])
+	storedStateHash := oauthString(row[3])
+	stateHash := oauthBytes(storedStateHash)
+	verifier, redirectURL, clientID := oauthString(row[4]), oauthString(row[5]), oauthString(row[6])
+	expiresAt, scopesJSON := oauthInt64(row[7]), oauthString(row[8])
 	if input.Now.Unix() >= expiresAt {
-		_, _ = s.db.ExecContext(ctx, `DELETE FROM oauth_attempts WHERE attempt_id = ?`, input.AttemptID)
+		_, _ = s.db.Mutate(ctx, "expire oauth "+input.AttemptID, persistence.Statement{SQL: `DELETE FROM oauth_attempts WHERE attempt_id = ? AND expires_at <= ?`, Args: []any{input.AttemptID, input.Now.Unix()}})
 		return nil, ErrExpiredState
 	}
 	if input.WorkspaceID != "" && input.WorkspaceID != workspaceID {
@@ -231,11 +241,21 @@ func (s *Store) Complete(ctx context.Context, cfg oauth2.Config, input CompleteI
 	}
 	// Consume state before exchanging the code: callbacks are one-time even if
 	// the provider or network fails after validation.
-	result, err := s.db.ExecContext(ctx, `DELETE FROM oauth_attempts WHERE attempt_id = ? AND state_hash = ?`, input.AttemptID, stateHash)
+	claimID, err := oauthClaimID()
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.Mutate(ctx, "consume oauth "+input.AttemptID+" "+claimID,
+		persistence.Statement{SQL: `INSERT OR IGNORE INTO oauth_consumptions(attempt_id,claim_id,state_hash,consumed_at) SELECT attempt_id,?,?,? FROM oauth_attempts WHERE attempt_id=? AND state_hash=? AND expires_at>?`, Args: []any{claimID, storedStateHash, input.Now.Unix(), input.AttemptID, storedStateHash, input.Now.Unix()}},
+		persistence.Statement{SQL: `DELETE FROM oauth_attempts WHERE attempt_id=? AND state_hash=? AND EXISTS(SELECT 1 FROM oauth_consumptions WHERE attempt_id=? AND claim_id=?)`, Args: []any{input.AttemptID, storedStateHash, input.AttemptID, claimID}})
 	if err != nil {
 		return nil, fmt.Errorf("consume oauth attempt: %w", err)
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	consumed, err := s.db.Query(ctx, `SELECT claim_id FROM oauth_consumptions WHERE attempt_id=?`, input.AttemptID)
+	if err != nil {
+		return nil, fmt.Errorf("verify oauth consumption: %w", err)
+	}
+	if len(consumed) != 1 || oauthString(consumed[0][0]) != claimID {
 		return nil, ErrInvalidState
 	}
 	token, err := cfg.Exchange(ctx, input.Code, oauth2.VerifierOption(verifier))
@@ -295,21 +315,35 @@ func (s *Store) SaveConnection(ctx context.Context, connectionID, workspaceID, p
 	if token != nil && !token.Expiry.IsZero() {
 		expiry = token.Expiry.Unix()
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO connections
+	_, err = s.db.Mutate(ctx, "save connection "+connectionID+" at "+fmt.Sprint(now.UnixNano()), persistence.Statement{SQL: `INSERT INTO connections
         (connection_id, workspace_id, provider, token_ciphertext, scopes_json, metadata_json, expires_at, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(connection_id) DO UPDATE SET workspace_id=excluded.workspace_id,
         provider=excluded.provider, token_ciphertext=excluded.token_ciphertext, scopes_json=excluded.scopes_json,
-        metadata_json=excluded.metadata_json, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
-		connectionID, workspaceID, provider, ciphertext, scopesJSON, base64.RawStdEncoding.EncodeToString(metadataCiphertext), expiry, now.Unix(), now.Unix())
-	return err
+        metadata_json=excluded.metadata_json, expires_at=excluded.expires_at, updated_at=excluded.updated_at`, Args: []any{
+		connectionID, workspaceID, provider, base64.StdEncoding.EncodeToString(ciphertext), string(scopesJSON), base64.RawStdEncoding.EncodeToString(metadataCiphertext), expiry, now.Unix(), now.Unix()}})
+	if err != nil {
+		return err
+	}
+	rows, err := s.db.Query(ctx, `SELECT workspace_id,provider,updated_at FROM connections WHERE connection_id=?`, connectionID)
+	if err != nil {
+		return err
+	}
+	if len(rows) != 1 || oauthString(rows[0][0]) != workspaceID || oauthString(rows[0][1]) != provider || oauthInt64(rows[0][2]) != now.Unix() {
+		return errors.New("connection mutation was not authoritative")
+	}
+	return nil
 }
 
 func (s *Store) LoadToken(ctx context.Context, connectionID string) (*oauth2.Token, error) {
-	var ciphertext []byte
-	if err := s.db.QueryRowContext(ctx, `SELECT token_ciphertext FROM connections WHERE connection_id = ?`, connectionID).Scan(&ciphertext); err != nil {
+	rows, err := s.db.Query(ctx, `SELECT token_ciphertext FROM connections WHERE connection_id = ?`, connectionID)
+	if err != nil {
 		return nil, err
 	}
+	if len(rows) == 0 {
+		return nil, errors.New("connection not found")
+	}
+	ciphertext := oauthBytes(rows[0][0])
 	plaintext, err := s.encryptor.Open(ciphertext)
 	if err != nil {
 		return nil, err
@@ -318,12 +352,16 @@ func (s *Store) LoadToken(ctx context.Context, connectionID string) (*oauth2.Tok
 }
 
 func (s *Store) LoadConnection(ctx context.Context, connectionID string) (Connection, error) {
-	var c Connection
-	var scopesJSON, metadataJSON string
-	var ciphertext []byte
-	if err := s.db.QueryRowContext(ctx, `SELECT connection_id, workspace_id, provider, token_ciphertext, scopes_json, metadata_json FROM connections WHERE connection_id=?`, connectionID).Scan(&c.ID, &c.WorkspaceID, &c.Provider, &ciphertext, &scopesJSON, &metadataJSON); err != nil {
+	rows, err := s.db.Query(ctx, `SELECT connection_id,workspace_id,provider,token_ciphertext,scopes_json,metadata_json FROM connections WHERE connection_id=?`, connectionID)
+	if err != nil {
 		return Connection{}, err
 	}
+	if len(rows) == 0 {
+		return Connection{}, errors.New("connection not found")
+	}
+	row := rows[0]
+	c := Connection{ID: oauthString(row[0]), WorkspaceID: oauthString(row[1]), Provider: oauthString(row[2])}
+	ciphertext, scopesJSON, metadataJSON := oauthBytes(row[3]), oauthString(row[4]), oauthString(row[5])
 	plain, err := s.encryptor.Open(ciphertext)
 	if err != nil {
 		return Connection{}, err
@@ -408,8 +446,19 @@ func (s *Store) updateToken(ctx context.Context, connectionID string, token *oau
 	if !token.Expiry.IsZero() {
 		expiry = token.Expiry.Unix()
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE connections SET token_ciphertext = ?, expires_at = ?, updated_at = ? WHERE connection_id = ?`, ciphertext, expiry, time.Now().UTC().Unix(), connectionID)
-	return err
+	updated := time.Now().UTC().Unix()
+	_, err = s.db.Mutate(ctx, "update connection token "+connectionID+" at "+fmt.Sprint(updated), persistence.Statement{SQL: `UPDATE connections SET token_ciphertext=?,expires_at=?,updated_at=? WHERE connection_id=?`, Args: []any{base64.StdEncoding.EncodeToString(ciphertext), expiry, updated, connectionID}})
+	if err != nil {
+		return err
+	}
+	rows, err := s.db.Query(ctx, `SELECT updated_at FROM connections WHERE connection_id=?`, connectionID)
+	if err != nil {
+		return err
+	}
+	if len(rows) != 1 || oauthInt64(rows[0][0]) != updated {
+		return errors.New("connection token update was not authoritative")
+	}
+	return nil
 }
 
 type Encryptor struct{ aead cipher.AEAD }
@@ -451,6 +500,58 @@ func randomOpaque(size int) (string, error) {
 }
 
 func hashState(state string) [sha256.Size]byte { return sha256.Sum256([]byte(state)) }
+
+func oauthClaimID() (string, error) {
+	var value [16]byte
+	if _, err := io.ReadFull(rand.Reader, value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func oauthString(value any) string {
+	switch value := value.(type) {
+	case string:
+		return value
+	case []byte:
+		return string(value)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(value)
+	}
+}
+
+func oauthBytes(value any) []byte {
+	switch value := value.(type) {
+	case []byte:
+		return append([]byte(nil), value...)
+	case string:
+		decoded, err := base64.StdEncoding.DecodeString(value)
+		if err == nil {
+			return decoded
+		}
+		return []byte(value)
+	default:
+		return nil
+	}
+}
+
+func oauthInt64(value any) int64 {
+	switch value := value.(type) {
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	case json.Number:
+		result, _ := value.Int64()
+		return result
+	default:
+		return 0
+	}
+}
 
 func oauthSecurityParam(key string) bool {
 	switch strings.ToLower(key) {
