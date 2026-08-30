@@ -211,6 +211,79 @@ func TestSubmitAndExecuteDoesNotRetryNonRetryableError(t *testing.T) {
 	}
 }
 
+func TestConnectorMutationUsesOneAttemptWithoutANewPolicyModel(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registry := handlers.NewRegistry()
+	var calls int
+	handler, err := handlers.NewFuncHandler(handlers.Manifest{Key: "connector.invoke", Version: "1"}, func(context.Context, handlers.Request) (handlers.Result, error) {
+		calls++
+		return handlers.Result{}, &handlers.Error{Class: "provider_5xx", Message: "ambiguous write", Retryable: true}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(handler); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(store, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := service.SubmitAndExecute(context.Background(), ExecutionRequest{
+		ExecutionRequestID: "mutation-budget", HandlerKey: "connector.invoke", HandlerVersion: "1", OperationKey: "records.update",
+		Retry: RetryPolicy{MaxAttempts: 3, Backoff: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || execution.Status != "failed" {
+		t.Fatalf("mutation was replayed: calls=%d execution=%+v", calls, execution)
+	}
+	request, err := store.GetExecutionRequest(context.Background(), "mutation-budget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.MaxAttempts != 1 {
+		t.Fatalf("mutation retry budget was not pinned to one: %+v", request)
+	}
+}
+
+func TestSubmitAndExecuteUnknownHandlerVersionFailsTerminally(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := NewService(store, handlers.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := service.SubmitAndExecute(context.Background(), ExecutionRequest{
+		ExecutionRequestID: "unknown-handler",
+		WorkspaceID:        "ws-unknown",
+		HandlerKey:         "missing.handler",
+		HandlerVersion:     "9",
+		OperationKey:       "run",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Status != "failed" || execution.Error == nil || execution.Error.Class != "handler_not_found" {
+		t.Fatalf("unknown pinned handler did not fail terminally: %+v", execution)
+	}
+	var callbackWorkspace string
+	if err := store.DB().QueryRowContext(context.Background(), "SELECT json_extract(payload, '$.workspace_id') FROM callbacks WHERE execution_id=?", execution.ID).Scan(&callbackWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	if callbackWorkspace != "ws-unknown" {
+		t.Fatalf("callback lost execution workspace: %q", callbackWorkspace)
+	}
+}
+
 func TestSubmitAndExecuteHonorsDeadline(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
@@ -357,6 +430,90 @@ func TestExternalWorkerProtocolIsFencedAndIdempotent(t *testing.T) {
 	second, err := service.Complete(context.Background(), "worker-1", claim.Lease.ID, claim.Lease.FencingToken, claim.Lease.ExecutionID, json.RawMessage(`{"different":true}`), 1)
 	if err != nil || second.Status != "succeeded" {
 		t.Fatalf("duplicate completion was not idempotent: %+v %v", second, err)
+	}
+}
+
+func TestExternalWorkerRejectsStaleFencingTokenAfterLeaseRecovery(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := NewService(store, handlers.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Submit(context.Background(), ExecutionRequest{ExecutionRequestID: "stale-fence", WorkspaceID: "ws-1", HandlerKey: "remote.handler", HandlerVersion: "1", OperationKey: "run", Retry: RetryPolicy{MaxAttempts: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.Poll(context.Background(), "worker-1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverExpiredLeases(context.Background(), time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Poll(context.Background(), "worker-2", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Lease.FencingToken <= first.Lease.FencingToken {
+		t.Fatalf("fencing token did not advance after recovery: first=%+v second=%+v", first.Lease, second.Lease)
+	}
+	if second.Lease.AttemptNumber != first.Lease.AttemptNumber+1 {
+		t.Fatalf("lease recovery did not advance attempt number: first=%+v second=%+v", first.Lease, second.Lease)
+	}
+	if _, err := service.Complete(context.Background(), "worker-1", first.Lease.ID, first.Lease.FencingToken, first.Lease.ExecutionID, json.RawMessage(`{"stale":true}`), first.Lease.AttemptNumber); err == nil {
+		t.Fatalf("stale worker completion was accepted: %v", err)
+	}
+	terminal, err := service.Complete(context.Background(), "worker-2", second.Lease.ID, second.Lease.FencingToken, second.Lease.ExecutionID, json.RawMessage(`{"ok":true}`), second.Lease.AttemptNumber)
+	if err != nil || terminal.Status != "succeeded" {
+		t.Fatalf("current worker could not complete recovered execution: %+v %v", terminal, err)
+	}
+}
+
+func TestExpiredLeaseExhaustsBudgetAsOutcomeUnknown(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := NewService(store, handlers.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Submit(context.Background(), ExecutionRequest{
+		ExecutionRequestID: "expired-budget", WorkspaceID: "ws-1", HandlerKey: "connector.invoke", HandlerVersion: "1", OperationKey: "records.update",
+		Retry: RetryPolicy{MaxAttempts: 3},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := service.Poll(context.Background(), "worker-1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Lease.AttemptNumber != 1 {
+		t.Fatalf("unexpected first attempt: %+v", claim.Lease)
+	}
+	if err := store.RecoverExpiredLeases(context.Background(), time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	execution, err := service.Get(context.Background(), claim.Lease.ExecutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Status != "failed" || execution.Error == nil || execution.Error.Class != "outcome_unknown" {
+		t.Fatalf("expired mutation was not terminalized safely: %+v", execution)
+	}
+	var callbackStatus, callbackClass, callbackWorkspace string
+	if err := store.DB().QueryRowContext(context.Background(), `SELECT json_extract(payload, '$.runtime_status'), json_extract(payload, '$.error_class'), json_extract(payload, '$.workspace_id') FROM callbacks WHERE execution_id=?`, claim.Lease.ExecutionID).Scan(&callbackStatus, &callbackClass, &callbackWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	if callbackStatus != "failed" || callbackClass != "outcome_unknown" || callbackWorkspace != "ws-1" {
+		t.Fatalf("unexpected outcome callback: status=%q class=%q workspace=%q", callbackStatus, callbackClass, callbackWorkspace)
+	}
+	if _, err := service.Poll(context.Background(), "worker-2", time.Minute); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expired mutation was requeued: %v", err)
 	}
 }
 

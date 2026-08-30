@@ -551,7 +551,7 @@ ON CONFLICT(execution_id) DO UPDATE SET lease_id=excluded.lease_id, attempt_numb
 func (s *Store) ClaimNext(ctx context.Context, workerID string, ttl time.Duration) (ExecutionRequestRecord, LeaseRecord, error) {
 	var id string
 	var attempt int
-	if err := s.db.QueryRowContext(ctx, `SELECT execution_request_id, COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),1) FROM executions e WHERE status='queued' OR (status='retry_wait' AND EXISTS (SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND datetime(t.run_at) <= datetime('now'))) ORDER BY created_at, id LIMIT 1`).Scan(&id, &attempt); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRowContext(ctx, `SELECT execution_request_id, COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'), (SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'), 1) FROM executions e WHERE status='queued' OR (status='retry_wait' AND EXISTS (SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND datetime(t.run_at) <= datetime('now'))) ORDER BY created_at, id LIMIT 1`).Scan(&id, &attempt); errors.Is(err, sql.ErrNoRows) {
 		return ExecutionRequestRecord{}, LeaseRecord{}, ErrNotFound
 	} else if err != nil {
 		return ExecutionRequestRecord{}, LeaseRecord{}, err
@@ -699,7 +699,9 @@ func (s *Store) Lease(ctx context.Context, leaseID string) (LeaseRecord, error) 
 	return l, nil
 }
 
-// RecoverExpiredLeases puts abandoned work back in the queue.
+// RecoverExpiredLeases retries abandoned work only while its persisted budget
+// permits it. Exhausted work is terminal because the worker may have completed
+// an external side effect before losing its lease.
 func (s *Store) RecoverExpiredLeases(ctx context.Context, now time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -709,8 +711,46 @@ func (s *Store) RecoverExpiredLeases(ctx context.Context, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE leases SET status='expired', updated_at=CURRENT_TIMESTAMP WHERE status='active' AND expires_at <= ?`, now.UTC()); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE executions SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE status='running' AND id IN (SELECT execution_id FROM leases WHERE status='expired')`); err != nil {
+	rows, err := tx.QueryContext(ctx, `SELECT e.id, l.attempt_number, r.max_attempts
+		FROM executions e
+		JOIN leases l ON l.execution_id=e.id
+		JOIN execution_requests r ON r.id=e.execution_request_id
+		WHERE e.status='running' AND l.status='expired'`)
+	if err != nil {
 		return err
+	}
+	type expiredExecution struct {
+		id                   string
+		attempt, maxAttempts int
+	}
+	var expired []expiredExecution
+	for rows.Next() {
+		var item expiredExecution
+		if err := rows.Scan(&item.id, &item.attempt, &item.maxAttempts); err != nil {
+			rows.Close()
+			return err
+		}
+		expired = append(expired, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, item := range expired {
+		attempt, maxAttempts := item.attempt, item.maxAttempts
+		if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+		if attempt >= maxAttempts {
+			if err := s.completeExecutionTx(ctx, tx, item.id, "failed", nil, "outcome_unknown", "worker lease expired after execution may have produced side effects", false, attempt); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE executions SET status='queued', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='running'`, item.id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -859,11 +899,11 @@ func (s *Store) completeExecutionTx(ctx context.Context, tx *sql.Tx, executionID
 	if updated != 1 {
 		return fmt.Errorf("execution %s is not running", executionID)
 	}
-	var requestID, taskID, workflowID, correlationID, causationID string
-	if err := tx.QueryRowContext(ctx, `SELECT e.execution_request_id, r.task_id, r.workflow_instance_id, r.correlation_id, r.causation_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, executionID).Scan(&requestID, &taskID, &workflowID, &correlationID, &causationID); err != nil {
+	var requestID, workspaceID, taskID, workflowID, correlationID, causationID string
+	if err := tx.QueryRowContext(ctx, `SELECT e.execution_request_id, r.workspace_id, r.task_id, r.workflow_instance_id, r.correlation_id, r.causation_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, executionID).Scan(&requestID, &workspaceID, &taskID, &workflowID, &correlationID, &causationID); err != nil {
 		return err
 	}
-	callback := map[string]any{"callback_id": "cb_" + executionID, "execution_request_id": requestID, "execution_id": executionID, "provider_key": "conductor", "provider_run_ref": executionID, "runtime_status": status, "attempt_count": attemptNumber, "result": json.RawMessage(output), "error_class": nil, "error_detail": nil, "occurred_at": now.Format(time.RFC3339Nano)}
+	callback := map[string]any{"callback_id": "cb_" + executionID, "execution_request_id": requestID, "execution_id": executionID, "workspace_id": workspaceID, "provider_key": "conductor", "provider_run_ref": executionID, "runtime_status": status, "attempt_count": attemptNumber, "result": json.RawMessage(output), "error_class": nil, "error_detail": nil, "occurred_at": now.Format(time.RFC3339Nano)}
 	if taskID != "" {
 		callback["task_id"] = taskID
 	}

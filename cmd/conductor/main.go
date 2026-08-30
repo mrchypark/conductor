@@ -820,6 +820,35 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+func connectorCredentialsResolver(connectionStore *connections.Store, catalog *ampconnectors.Catalog) ampconnectors.ScopedCredentialsResolver {
+	return func(ctx context.Context, connectionID, provider, workspace string) (ampconnectors.Credentials, error) {
+		if connectionID == "" {
+			return ampconnectors.Credentials{}, nil
+		}
+		if connectionStore == nil {
+			return ampconnectors.Credentials{}, errors.New("connection store is not configured")
+		}
+		connection, err := connectionStore.LoadConnection(ctx, connectionID)
+		if err != nil {
+			return ampconnectors.Credentials{}, err
+		}
+		if connection.Provider != provider || connection.WorkspaceID != workspace {
+			return ampconnectors.Credentials{}, errors.New("connection scope mismatch")
+		}
+		creds := ampconnectors.Credentials{OAuthToken: connection.Token, Metadata: connection.Metadata, Custom: connection.Metadata}
+		if info, err := catalog.Info(provider); err == nil && info.Oauth2Opts != nil {
+			creds.OAuthConfig = &oauth2.Config{ClientID: connection.Metadata["client_id"], ClientSecret: oauthClientSecret(provider), Endpoint: oauth2.Endpoint{AuthURL: info.Oauth2Opts.AuthURL, TokenURL: info.Oauth2Opts.TokenURL}, Scopes: connection.Scopes}
+		}
+		creds.APIKey = connection.Metadata["api_key"]
+		creds.BasicUser = connection.Metadata["basic_user"]
+		creds.BasicPass = connection.Metadata["basic_pass"]
+		creds.TokenUpdated = func(_, token *oauth2.Token) error {
+			return connectionStore.SaveToken(context.Background(), connection.ID, connection.WorkspaceID, connection.Provider, token, connection.Scopes, connection.Metadata, time.Now().UTC())
+		}
+		return creds, nil
+	}
+}
+
 func main() {
 	addr := flag.String("addr", envOr("CONDUCTOR_ADDR", ":8080"), "HTTP listen address")
 	dsn := flag.String("db", envOr("CONDUCTOR_DB", "conductor.db"), "SQLite database path")
@@ -887,32 +916,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	resolver := func(ctx context.Context, connectionID, provider, workspace string) (ampconnectors.Credentials, error) {
-		if connectionID == "" {
-			return ampconnectors.Credentials{}, nil
-		}
-		if connectionStore == nil {
-			return ampconnectors.Credentials{}, errors.New("connection store is not configured")
-		}
-		connection, err := connectionStore.LoadConnection(ctx, connectionID)
-		if err != nil {
-			return ampconnectors.Credentials{}, err
-		}
-		if connection.Provider != provider || connection.WorkspaceID != workspace {
-			return ampconnectors.Credentials{}, errors.New("connection scope mismatch")
-		}
-		creds := ampconnectors.Credentials{OAuthToken: connection.Token, Metadata: connection.Metadata, Custom: connection.Metadata}
-		if info, err := catalog.Info(provider); err == nil && info.Oauth2Opts != nil {
-			creds.OAuthConfig = &oauth2.Config{ClientID: connection.Metadata["client_id"], ClientSecret: oauthClientSecret(provider), Endpoint: oauth2.Endpoint{AuthURL: info.Oauth2Opts.AuthURL, TokenURL: info.Oauth2Opts.TokenURL}, Scopes: connection.Scopes}
-		}
-		creds.APIKey = connection.Metadata["api_key"]
-		creds.BasicUser = connection.Metadata["basic_user"]
-		creds.BasicPass = connection.Metadata["basic_pass"]
-		creds.TokenUpdated = func(_, token *oauth2.Token) error {
-			return connectionStore.SaveToken(context.Background(), connection.ID, connection.WorkspaceID, connection.Provider, token, connection.Scopes, connection.Metadata, time.Now().UTC())
-		}
-		return creds, nil
-	}
+	resolver := connectorCredentialsResolver(connectionStore, catalog)
 	connectorHandler, err := catalog.NewInvokeHandlerScoped("1", nil, resolver)
 	if err != nil {
 		log.Fatal(err)

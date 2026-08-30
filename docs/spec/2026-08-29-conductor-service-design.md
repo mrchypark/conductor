@@ -114,6 +114,26 @@ type Handler interface {
 
 Handler는 workflow DB나 attempt 상태를 직접 수정하지 않는다. 결과 또는 구조화된 오류만 반환하고 execution/taskmanager가 상태 전이를 수행한다.
 
+### Compos FunctionBinding 대응
+
+`FunctionDefinition`과 immutable revision의 binding은 Compos가 소유한다. Conductor는
+binding을 저장하거나 해석하는 두 번째 control plane이 아니라, Compos가 binding을
+해결해 만든 leaf `ExecutionRequest`만 실행한다.
+
+| Compos binding | Conductor 실행 계약 |
+| --- | --- |
+| `kernel_command` | Conductor로 보내지 않고 Compos Kernel이 직접 실행 |
+| `connector` | `handler=connector.invoke`, 고정된 handler version, operation, connection과 input으로 실행 |
+| `native` | 등록된 local/external `handler_key@version`으로 실행 |
+| `composite` | Compos가 leaf Function/Task 실행으로 전개한다. 한 프로세스 안에서 원자적으로 끝나는 구현이면 하나의 versioned native handler로 패키징 |
+| `workflow` | Compos workflow orchestrator가 소유하며 Conductor는 ready leaf만 실행 |
+
+따라서 Conductor에는 별도 `FunctionBinding` 테이블이나 `composite` graph runtime을
+추가하지 않는다. connector와 native handler는 같은 attempt/lease/retry/fencing 계약을
+공유하고, composite의 부분 실행·다음 단계·업무 완료 진실은 Compos에 남는다. 어느
+handler도 Compos SQLite를 직접 수정하지 않으며, 상태 변경은 built-in Compos connector를
+통해 Compos API와 Kernel 검증을 거친다.
+
 ### Local Handler
 
 같은 Conductor 서버에서 실행하는 일반 Go 코드다.

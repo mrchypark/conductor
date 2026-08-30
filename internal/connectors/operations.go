@@ -70,9 +70,13 @@ func (c *Catalog) invokeScoped(ctx context.Context, request handlers.Request, cl
 	if input.Provider == "" {
 		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "provider is required"}
 	}
-	if input.Operation == "" {
-		input.Operation = request.OperationKey
+	if request.OperationKey == "" {
+		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "pinned operation is required"}
 	}
+	if input.Operation != "" && input.Operation != request.OperationKey {
+		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "input operation does not match pinned operation"}
+	}
+	input.Operation = request.OperationKey
 	if input.ObjectName == "" {
 		input.ObjectName = input.ObjectKey
 	}

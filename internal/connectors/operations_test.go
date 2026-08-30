@@ -1,10 +1,18 @@
 package connectors
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/amp-labs/connectors/common"
+	"github.com/mrchypark/conductor/internal/executions"
+	"github.com/mrchypark/conductor/internal/handlers"
+	"github.com/mrchypark/conductor/internal/storage"
 )
 
 func TestConnectorErrorPreservesAmpClassification(t *testing.T) {
@@ -29,5 +37,102 @@ func TestConnectorErrorPreservesAmpClassification(t *testing.T) {
 	wrapped := connectorError(errors.New("provider failure"))
 	if wrapped.Class != "connector_error" || wrapped.Retryable {
 		t.Fatalf("unexpected unknown error classification: %+v", wrapped)
+	}
+}
+
+func TestConnectorRejectsInputOperationThatDiffersFromPinnedOperation(t *testing.T) {
+	catalog, err := LoadCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := catalog.NewInvokeHandlerScoped("1", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = handler.Execute(context.Background(), handlers.Request{
+		OperationKey: "records.get",
+		Input:        json.RawMessage(`{"provider":"compos","operation":"records.delete","object_name":"orders","record_id":"o1"}`),
+	})
+	var failure *handlers.Error
+	if !errors.As(err, &failure) || failure.Class != "invalid_input" {
+		t.Fatalf("operation mismatch was not rejected: %v", err)
+	}
+}
+
+func TestComposConnectorProviderErrorsUseExecutionRetryPolicy(t *testing.T) {
+	tests := []struct {
+		name           string
+		operation      string
+		firstStatus    int
+		secondStatus   int
+		wantCalls      int32
+		wantStatus     string
+		wantErrorClass string
+	}{
+		{name: "server error retries", firstStatus: http.StatusInternalServerError, secondStatus: http.StatusOK, wantCalls: 2, wantStatus: "succeeded"},
+		{name: "client error does not retry", firstStatus: http.StatusBadRequest, secondStatus: http.StatusOK, wantCalls: 1, wantStatus: "failed", wantErrorClass: "compos_connector_error"},
+		{name: "unknown operation is terminal", operation: "not_registered", firstStatus: http.StatusNotFound, secondStatus: http.StatusOK, wantCalls: 1, wantStatus: "failed", wantErrorClass: "compos_connector_error"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				status := tc.firstStatus
+				if calls.Add(1) > 1 {
+					status = tc.secondStatus
+				}
+				w.WriteHeader(status)
+				if status == http.StatusOK {
+					_, _ = w.Write([]byte(`{"ok":true}`))
+				}
+			}))
+			defer provider.Close()
+
+			catalog, err := LoadCatalog()
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog.SetComposClient(&ComposClient{BaseURL: provider.URL, Client: provider.Client()})
+			handler, err := catalog.NewInvokeHandlerScoped("1", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := handlers.NewRegistry()
+			if err := registry.Register(handler); err != nil {
+				t.Fatal(err)
+			}
+			store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			service, err := executions.NewService(store, registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			operation := tc.operation
+			if operation == "" {
+				operation = "records.get"
+			}
+			input, err := json.Marshal(map[string]any{"provider": "compos", "operation": operation, "object_name": "orders", "record_id": "o1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{
+				ExecutionRequestID: "provider-" + tc.name, WorkspaceID: "ws-provider",
+				HandlerKey: "connector.invoke", HandlerVersion: "1", OperationKey: operation,
+				Input: input,
+				Retry: executions.RetryPolicy{MaxAttempts: 2, Backoff: 1},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if execution.Status != tc.wantStatus || calls.Load() != tc.wantCalls {
+				t.Fatalf("unexpected provider execution: calls=%d execution=%+v", calls.Load(), execution)
+			}
+			if tc.wantErrorClass != "" && (execution.Error == nil || execution.Error.Class != tc.wantErrorClass) {
+				t.Fatalf("unexpected provider error: %+v", execution.Error)
+			}
+		})
 	}
 }

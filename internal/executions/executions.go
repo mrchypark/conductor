@@ -283,6 +283,7 @@ func NewService(store *storage.Store, registry *handlers.Registry) (*Service, er
 func (s *Service) SetCallbackTarget(url string) { s.store.SetCallbackTarget(url) }
 
 func (s *Service) Submit(ctx context.Context, request ExecutionRequest) (Execution, error) {
+	request = normalizeRetryBudget(request)
 	if err := validate(request); err != nil {
 		return Execution{}, err
 	}
@@ -424,6 +425,7 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 // SubmitAndExecute stores a request once, leases it, executes its pinned handler
 // with the requested retry policy, and returns the existing execution for duplicates.
 func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest) (Execution, error) {
+	request = normalizeRetryBudget(request)
 	if err := validate(request); err != nil {
 		return Execution{}, err
 	}
@@ -646,6 +648,29 @@ func validate(request ExecutionRequest) error {
 		return errors.New("timeout and retry values must not be negative")
 	}
 	return nil
+}
+
+// Connector mutations remain executable, but Conductor does not replay them
+// until a provider adapter can prove idempotency. Reads retain the caller's
+// retry budget. This uses the already-pinned operation instead of adding a
+// second effect or capability model.
+func normalizeRetryBudget(request ExecutionRequest) ExecutionRequest {
+	if request.HandlerKey != "connector.invoke" || connectorReadOperation(request.OperationKey) || request.Retry.MaxAttempts <= 1 {
+		return request
+	}
+	request.Retry.MaxAttempts = 1
+	return request
+}
+
+func connectorReadOperation(operation string) bool {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(operation)), ".")
+	leaf := parts[len(parts)-1]
+	switch leaf {
+	case "get", "read", "list", "search", "schema":
+		return true
+	default:
+		return false
+	}
 }
 
 func classify(err error) *handlers.Error {

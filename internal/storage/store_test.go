@@ -105,7 +105,7 @@ func TestLeaseExpiryRecoversQueuedExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if _, err := store.CreateExecution(context.Background(), ExecutionRequestRecord{ID: "r", HandlerKey: "h", HandlerVersion: "1", Input: []byte(`{}`)}, "exec_r"); err != nil {
+	if _, err := store.CreateExecution(context.Background(), ExecutionRequestRecord{ID: "r", HandlerKey: "h", HandlerVersion: "1", Input: []byte(`{}`), MaxAttempts: 2}, "exec_r"); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := store.AcquireLease(context.Background(), "exec_r", "w", time.Millisecond, 1)
