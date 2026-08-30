@@ -98,7 +98,11 @@ func TestDuplicateSubmitWaitsForTerminalResult(t *testing.T) {
 	req := ExecutionRequest{ExecutionRequestID: "wait-1", HandlerKey: "wait.test", HandlerVersion: "1"}
 	first := make(chan error, 1)
 	go func() { _, err := s.SubmitAndExecute(context.Background(), req); first <- err }()
-	<-started
+	select {
+	case <-started:
+	case err := <-first:
+		t.Fatalf("first submit failed before handler start: %v", err)
+	}
 	second := make(chan Execution, 1)
 	go func() { e, _ := s.SubmitAndExecute(context.Background(), req); second <- e }()
 	select {
@@ -161,23 +165,23 @@ func TestSubmitAndExecuteRetriesRetryableHandlerAndPersistsCallback(t *testing.T
 	if execution.Status != "succeeded" || calls.Load() != 2 {
 		t.Fatalf("retry did not succeed: calls=%d execution=%+v", calls.Load(), execution)
 	}
-	var callback []byte
-	if err := store.DB().QueryRowContext(context.Background(), "SELECT payload FROM callbacks WHERE execution_id = ?", execution.ID).Scan(&callback); err != nil {
+	callback, err := store.Callback(context.Background(), execution.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	var payload map[string]any
-	if err := json.Unmarshal(callback, &payload); err != nil {
+	if err := json.Unmarshal(callback.Payload, &payload); err != nil {
 		t.Fatal(err)
 	}
 	if payload["runtime_status"] != "succeeded" || payload["attempt_count"] != float64(2) {
-		t.Fatalf("unexpected callback payload: %s", callback)
+		t.Fatalf("unexpected callback payload: %s", callback.Payload)
 	}
-	var events int
-	if err := store.DB().QueryRowContext(context.Background(), "SELECT COUNT(*) FROM execution_events WHERE execution_id = ?", execution.ID).Scan(&events); err != nil {
+	events, err := store.ListExecutionEvents(context.Background(), execution.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if events < 3 {
-		t.Fatalf("expected requested, started, and terminal events, got %d", events)
+	if len(events) < 3 {
+		t.Fatalf("expected requested, started, and terminal events, got %d", len(events))
 	}
 }
 
@@ -275,10 +279,15 @@ func TestSubmitAndExecuteUnknownHandlerVersionFailsTerminally(t *testing.T) {
 	if execution.Status != "failed" || execution.Error == nil || execution.Error.Class != "handler_not_found" {
 		t.Fatalf("unknown pinned handler did not fail terminally: %+v", execution)
 	}
-	var callbackWorkspace string
-	if err := store.DB().QueryRowContext(context.Background(), "SELECT json_extract(payload, '$.workspace_id') FROM callbacks WHERE execution_id=?", execution.ID).Scan(&callbackWorkspace); err != nil {
+	callback, err := store.Callback(context.Background(), execution.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	var callbackPayload map[string]any
+	if err := json.Unmarshal(callback.Payload, &callbackPayload); err != nil {
+		t.Fatal(err)
+	}
+	callbackWorkspace, _ := callbackPayload["workspace_id"].(string)
 	if callbackWorkspace != "ws-unknown" {
 		t.Fatalf("callback lost execution workspace: %q", callbackWorkspace)
 	}
@@ -505,10 +514,17 @@ func TestExpiredLeaseExhaustsBudgetAsOutcomeUnknown(t *testing.T) {
 	if execution.Status != "failed" || execution.Error == nil || execution.Error.Class != "outcome_unknown" {
 		t.Fatalf("expired mutation was not terminalized safely: %+v", execution)
 	}
-	var callbackStatus, callbackClass, callbackWorkspace string
-	if err := store.DB().QueryRowContext(context.Background(), `SELECT json_extract(payload, '$.runtime_status'), json_extract(payload, '$.error_class'), json_extract(payload, '$.workspace_id') FROM callbacks WHERE execution_id=?`, claim.Lease.ExecutionID).Scan(&callbackStatus, &callbackClass, &callbackWorkspace); err != nil {
+	callback, err := store.Callback(context.Background(), claim.Lease.ExecutionID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	var callbackPayload map[string]any
+	if err := json.Unmarshal(callback.Payload, &callbackPayload); err != nil {
+		t.Fatal(err)
+	}
+	callbackStatus, _ := callbackPayload["runtime_status"].(string)
+	callbackClass, _ := callbackPayload["error_class"].(string)
+	callbackWorkspace, _ := callbackPayload["workspace_id"].(string)
 	if callbackStatus != "failed" || callbackClass != "outcome_unknown" || callbackWorkspace != "ws-1" {
 		t.Fatalf("unexpected outcome callback: status=%q class=%q workspace=%q", callbackStatus, callbackClass, callbackWorkspace)
 	}
@@ -536,9 +552,7 @@ func TestExternalWorkerFailureSchedulesRetry(t *testing.T) {
 	if err != nil || e.Status != "retry_wait" {
 		t.Fatalf("retry was not scheduled: %+v %v", e, err)
 	}
-	if _, err := store.DB().ExecContext(context.Background(), "UPDATE retry_timers SET run_at=CURRENT_TIMESTAMP WHERE execution_id=?", claim.Lease.ExecutionID); err != nil {
-		t.Fatal(err)
-	}
+	time.Sleep(5 * time.Millisecond)
 	claim, err = service.Poll(context.Background(), "worker-1", time.Minute)
 	if err != nil || claim.Lease.AttemptNumber != 2 {
 		t.Fatalf("second attempt was not claimable: %+v %v", claim, err)
@@ -571,11 +585,11 @@ func TestCancelQueuedExecutionPersistsTerminalCallback(t *testing.T) {
 	if e.Status != "cancelled" {
 		t.Fatalf("status=%s", e.Status)
 	}
-	var status string
-	if err := store.DB().QueryRowContext(context.Background(), "SELECT status FROM callbacks WHERE execution_id=?", e.ID).Scan(&status); err != nil {
+	callback, err := store.Callback(context.Background(), e.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if status != "cancelled" {
-		t.Fatal(status)
+	if callback.Status != "cancelled" {
+		t.Fatal(callback.Status)
 	}
 }

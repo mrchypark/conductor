@@ -431,7 +431,7 @@ func TestConnectionHTTPStoresEncryptedCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	oauthStore, err := connections.NewStore(store.DB(), []byte("01234567890123456789012345678901"))
+	oauthStore, err := connections.NewStore(context.Background(), store.Persistence(), []byte("01234567890123456789012345678901"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,7 +461,7 @@ func TestConnectorCredentialsResolverEnforcesConnectionScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	connectionStore, err := connections.NewStore(store.DB(), []byte("01234567890123456789012345678901"))
+	connectionStore, err := connections.NewStore(context.Background(), store.Persistence(), []byte("01234567890123456789012345678901"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,5 +482,22 @@ func TestConnectorCredentialsResolverEnforcesConnectionScope(t *testing.T) {
 	credentials, err := resolver(context.Background(), "conn-scope", "slack", "ws-owner")
 	if err != nil || credentials.APIKey != "secret" {
 		t.Fatalf("valid scoped connection was not resolved: %+v %v", credentials, err)
+	}
+}
+
+func TestRhizaConfigLoadsHAAndS3Environment(t *testing.T) {
+	t.Setenv("CONDUCTOR_RHIZA_CLUSTER_ID", "cluster-ha")
+	t.Setenv("CONDUCTOR_RHIZA_NODE_ID", "n2")
+	t.Setenv("CONDUCTOR_RHIZA_PEER_ADDR", "127.0.0.1:9002")
+	t.Setenv("CONDUCTOR_RHIZA_MEMBERS", `[{"node_id":"n1","peer_url":"quic://127.0.0.1:9001","token":"secret"},{"node_id":"n2","peer_url":"quic://127.0.0.1:9002","token":"secret"},{"node_id":"n3","peer_url":"quic://127.0.0.1:9003","token":"secret"}]`)
+	t.Setenv("CONDUCTOR_RHIZA_S3_ENDPOINT", "127.0.0.1:9000")
+	t.Setenv("CONDUCTOR_RHIZA_S3_BUCKET", "rhiza")
+	t.Setenv("CONDUCTOR_RHIZA_S3_INSECURE", "true")
+	config, err := rhizaConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ClusterID != "cluster-ha" || config.NodeID != "n2" || len(config.Members) != 3 || config.ObjStoreProvider != "s3" || config.ObjStoreBucket != "rhiza" || !config.ObjStoreInsecure {
+		t.Fatalf("unexpected Rhiza config: %+v", config)
 	}
 }

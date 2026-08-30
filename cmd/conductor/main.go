@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	ampconnectors "github.com/mrchypark/conductor/internal/connectors"
 	"github.com/mrchypark/conductor/internal/executions"
 	"github.com/mrchypark/conductor/internal/handlers"
+	"github.com/mrchypark/conductor/internal/persistence"
 	"github.com/mrchypark/conductor/internal/storage"
 	"golang.org/x/oauth2"
 )
@@ -851,11 +853,15 @@ func connectorCredentialsResolver(connectionStore *connections.Store, catalog *a
 
 func main() {
 	addr := flag.String("addr", envOr("CONDUCTOR_ADDR", ":8080"), "HTTP listen address")
-	dsn := flag.String("db", envOr("CONDUCTOR_DB", "conductor.db"), "SQLite database path")
+	dsn := flag.String("db", envOr("CONDUCTOR_DB", "conductor.db"), "Rhiza data directory")
 	flag.Parse()
 
 	ctx := context.Background()
-	store, err := storage.Open(ctx, *dsn)
+	config, err := rhizaConfig(*dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	store, err := storage.Open(ctx, config)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -911,7 +917,7 @@ func main() {
 	}
 	var connectionStore *connections.Store
 	if key := os.Getenv("CONDUCTOR_MASTER_KEY"); key != "" {
-		connectionStore, err = connections.NewStore(store.DB(), []byte(key))
+		connectionStore, err = connections.NewStore(ctx, store.Persistence(), []byte(key))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -943,6 +949,41 @@ func main() {
 	if err := http.ListenAndServe(*addr, srv); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func rhizaConfig(dataDir string) (persistence.Config, error) {
+	config := persistence.Config{
+		ClusterID:            envOr("CONDUCTOR_RHIZA_CLUSTER_ID", "conductor"),
+		NodeID:               envOr("CONDUCTOR_RHIZA_NODE_ID", "n1"),
+		DataDir:              dataDir,
+		BindAddr:             envOr("CONDUCTOR_RHIZA_BIND_ADDR", "127.0.0.1:0"),
+		PeerAddr:             envOr("CONDUCTOR_RHIZA_PEER_ADDR", "127.0.0.1:0"),
+		AdminToken:           os.Getenv("CONDUCTOR_RHIZA_ADMIN_TOKEN"),
+		ObjStoreProvider:     os.Getenv("CONDUCTOR_RHIZA_S3_PROVIDER"),
+		ObjStoreEndpoint:     os.Getenv("CONDUCTOR_RHIZA_S3_ENDPOINT"),
+		ObjStoreBucket:       os.Getenv("CONDUCTOR_RHIZA_S3_BUCKET"),
+		ObjStorePrefix:       os.Getenv("CONDUCTOR_RHIZA_S3_PREFIX"),
+		ObjStoreRegion:       os.Getenv("CONDUCTOR_RHIZA_S3_REGION"),
+		ObjStoreAccessKey:    os.Getenv("CONDUCTOR_RHIZA_S3_ACCESS_KEY"),
+		ObjStoreSecretKey:    os.Getenv("CONDUCTOR_RHIZA_S3_SECRET_KEY"),
+		ObjStoreSessionToken: os.Getenv("CONDUCTOR_RHIZA_S3_SESSION_TOKEN"),
+	}
+	if value := os.Getenv("CONDUCTOR_RHIZA_S3_INSECURE"); value != "" {
+		insecure, err := strconv.ParseBool(value)
+		if err != nil {
+			return persistence.Config{}, fmt.Errorf("parse CONDUCTOR_RHIZA_S3_INSECURE: %w", err)
+		}
+		config.ObjStoreInsecure = insecure
+	}
+	if config.ObjStoreEndpoint != "" && config.ObjStoreProvider == "" {
+		config.ObjStoreProvider = "s3"
+	}
+	if raw := os.Getenv("CONDUCTOR_RHIZA_MEMBERS"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &config.Members); err != nil {
+			return persistence.Config{}, fmt.Errorf("parse CONDUCTOR_RHIZA_MEMBERS: %w", err)
+		}
+	}
+	return config, nil
 }
 
 func envOr(key, fallback string) string {

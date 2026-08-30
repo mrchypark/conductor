@@ -2,7 +2,6 @@ package connections
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,21 +10,27 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
+	"github.com/mrchypark/conductor/internal/persistence"
+	"github.com/mrchypark/rhiza"
 	"golang.org/x/oauth2"
 )
 
+func newOAuthStore(t *testing.T) (*Store, *persistence.DB) {
+	t.Helper()
+	db, err := persistence.Open(context.Background(), persistence.Config{ClusterID: "oauth-test", NodeID: "n1", DataDir: t.TempDir(), Members: []rhiza.Member{{ID: "n1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store, err := NewStore(context.Background(), db, []byte("01234567890123456789012345678901"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, db
+}
+
 func TestOAuthCallbackUsesPKCEConsumesStateAndPersistsEncryptedToken(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	store, err := NewStore(db, []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store, db := newOAuthStore(t)
 
 	var gotVerifier string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -77,10 +82,11 @@ func TestOAuthCallbackUsesPKCEConsumesStateAndPersistsEncryptedToken(t *testing.
 	if err != nil || connection.Metadata["api_base_url"] != "https://api.example.test" || connection.Metadata["client_id"] != "client" {
 		t.Fatalf("metadata load failed: %+v err=%v", connection, err)
 	}
-	var storedMetadata string
-	if err := db.QueryRowContext(context.Background(), "SELECT metadata_json FROM connections WHERE connection_id='conn-1'").Scan(&storedMetadata); err != nil {
-		t.Fatal(err)
+	rows, err := db.Query(context.Background(), "SELECT metadata_json FROM connections WHERE connection_id='conn-1'")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("metadata query: %v", err)
 	}
+	storedMetadata := oauthString(rows[0][0])
 	if strings.Contains(storedMetadata, "api.example.test") {
 		t.Fatal("credential metadata stored in plaintext")
 	}
@@ -90,16 +96,7 @@ func TestOAuthCallbackUsesPKCEConsumesStateAndPersistsEncryptedToken(t *testing.
 }
 
 func TestOAuthCallbackCanResolveAttemptFromState(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	store, err := NewStore(db, []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store, _ := newOAuthStore(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"access"}`))
@@ -120,16 +117,7 @@ func TestOAuthCallbackCanResolveAttemptFromState(t *testing.T) {
 }
 
 func TestOAuthStateRejectsMismatchWithoutConsumingAttempt(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	store, err := NewStore(db, []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store, _ := newOAuthStore(t)
 	cfg := oauth2.Config{ClientID: "client", Endpoint: oauth2.Endpoint{AuthURL: "https://auth.example.test", TokenURL: "https://token.example.test"}, RedirectURL: "https://conductor.example.test/callback"}
 	begin, err := store.Begin(context.Background(), BeginInput{AttemptID: "attempt-2", Provider: "example", ConnectionID: "conn-2", WorkspaceID: "ws", RedirectURL: cfg.RedirectURL, ClientID: cfg.ClientID, Now: time.Unix(1_700_000_000, 0)}, cfg.Endpoint)
 	if err != nil {
@@ -141,16 +129,7 @@ func TestOAuthStateRejectsMismatchWithoutConsumingAttempt(t *testing.T) {
 }
 
 func TestOAuthProviderMismatchRejectsWithoutExchange(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	store, err := NewStore(db, []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store, _ := newOAuthStore(t)
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -173,16 +152,7 @@ func TestOAuthProviderMismatchRejectsWithoutExchange(t *testing.T) {
 }
 
 func TestSaveConnectionEncryptsNonOAuthCredentials(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	store, err := NewStore(db, []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	store, db := newOAuthStore(t)
 	if err := store.SaveConnection(context.Background(), "conn-api", "ws-api", "slack", nil, nil, map[string]string{"api_key": "secret-api-key", "module": "web"}, time.Unix(1_700_000_000, 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -190,10 +160,11 @@ func TestSaveConnectionEncryptsNonOAuthCredentials(t *testing.T) {
 	if err != nil || connection.Token != nil || connection.Metadata["api_key"] != "secret-api-key" {
 		t.Fatalf("unexpected connection=%+v err=%v", connection, err)
 	}
-	var storedMetadata string
-	if err := db.QueryRowContext(context.Background(), "SELECT metadata_json FROM connections WHERE connection_id='conn-api'").Scan(&storedMetadata); err != nil {
-		t.Fatal(err)
+	rows, err := db.Query(context.Background(), "SELECT metadata_json FROM connections WHERE connection_id='conn-api'")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("metadata query: %v", err)
 	}
+	storedMetadata := oauthString(rows[0][0])
 	if strings.Contains(storedMetadata, "secret-api-key") {
 		t.Fatal("API key stored in plaintext")
 	}
