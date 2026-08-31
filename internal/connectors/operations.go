@@ -181,6 +181,13 @@ func rawRequest(ctx context.Context, conn amp.Connector, input invokeInput) (han
 		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "path must be an origin-form relative URL"}
 	}
 	client := conn.JSONHTTPClient()
+	target, joinErr := url.JoinPath(client.HTTPClient.Base, u.EscapedPath())
+	if joinErr != nil {
+		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "invalid connector path"}
+	}
+	if u.RawQuery != "" {
+		target += "?" + u.RawQuery
+	}
 	method := strings.ToUpper(input.Method)
 	if method == "" {
 		method = http.MethodGet
@@ -189,15 +196,15 @@ func rawRequest(ctx context.Context, conn amp.Connector, input invokeInput) (han
 	var err error
 	switch method {
 	case http.MethodGet:
-		response, err = client.Get(ctx, input.Path)
+		response, err = client.Get(ctx, target)
 	case http.MethodPost:
-		response, err = client.Post(ctx, input.Path, input.Body)
+		response, err = client.Post(ctx, target, input.Body)
 	case http.MethodPut:
-		response, err = client.Put(ctx, input.Path, input.Body)
+		response, err = client.Put(ctx, target, input.Body)
 	case http.MethodPatch:
-		response, err = client.Patch(ctx, input.Path, input.Body)
+		response, err = client.Patch(ctx, target, input.Body)
 	case http.MethodDelete:
-		response, err = client.Delete(ctx, input.Path)
+		response, err = client.Delete(ctx, target)
 	default:
 		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "method must be GET, POST, PUT, PATCH, or DELETE"}
 	}

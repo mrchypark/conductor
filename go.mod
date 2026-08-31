@@ -7,7 +7,10 @@ require (
 	github.com/jokruger/kavun v0.6.4
 	github.com/mrchypark/rhiza v0.8.3
 	golang.org/x/oauth2 v0.36.0
+	gowid-api-go v0.0.0
 )
+
+replace gowid-api-go => github.com/mrchypark/gowid-go-sdk v0.1.0
 
 require (
 	cloud.google.com/go v0.123.0 // indirect

@@ -16,11 +16,20 @@ import (
 	"github.com/amp-labs/connectors/providers"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
+	gowid "gowid-api-go/client"
 )
 
 type Catalog struct {
 	infos  map[string]providers.ProviderInfo
 	compos *ComposClient
+}
+
+func init() {
+	providers.SetInfo("gowid", providers.ProviderInfo{
+		DisplayName: "Gowid", AuthType: providers.ApiKey, BaseURL: gowid.BaseURL,
+		ApiKeyOpts: &providers.ApiKeyOpts{AttachmentType: providers.Header, Header: &providers.ApiKeyOptsHeader{Name: "Authorization"}},
+		Support:    providers.Support{Proxy: true},
+	})
 }
 
 func LoadCatalog() (*Catalog, error) {

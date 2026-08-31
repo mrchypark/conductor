@@ -30,6 +30,8 @@ github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.1 h1:lhZdRq7TIx0GJQvSy
 github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.1/go.mod h1:8cl44BDmi+effbARHMQjgOKA2AYvcohNm7KEt42mSV8=
 github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2 h1:oygO0locgZJe7PpYPXT5A29ZkwJaPqcva7BVeemZOZs=
 github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
+github.com/mrchypark/gowid-go-sdk v0.1.0 h1:UdOogim73ZxA31OX8jTelq/9lkdj4rNC1ZkeoJCXcOw=
+github.com/mrchypark/gowid-go-sdk v0.1.0/go.mod h1:qTsN/lsgNiqT8bMlmEmaL7hpKwjZSbd8FOkK6AHcqck=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.33.0 h1:l7+6kwRMJNwdCvYdDl7Eax+wzEYHSnNY7zrrfbhDdTA=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.33.0/go.mod h1:pJTkW8hEUIIi3Pf65lPZOnn4Y81yCllX6IWk2jNXdkM=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 h1:UnDZ/zFfG1JhH/DqxIZYU/1CUAlTUScoXD/LcM2Ykk8=

@@ -1,9 +1,11 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -14,6 +16,10 @@ import (
 	"github.com/mrchypark/conductor/internal/handlers"
 	"github.com/mrchypark/conductor/internal/storage"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func TestConnectorErrorPreservesAmpClassification(t *testing.T) {
 	checks := []struct {
@@ -56,6 +62,35 @@ func TestConnectorRejectsInputOperationThatDiffersFromPinnedOperation(t *testing
 	var failure *handlers.Error
 	if !errors.As(err, &failure) || failure.Class != "invalid_input" {
 		t.Fatalf("operation mismatch was not rejected: %v", err)
+	}
+}
+
+func TestGowidConnectorCallsV2API(t *testing.T) {
+	catalog, err := LoadCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != "https://openapi.gowid.com/v2/expense-statements?startDate=20260101&endDate=20260131" {
+			t.Fatalf("unexpected URL %s", request.URL)
+		}
+		if request.Header.Get("Authorization") != "secret" {
+			t.Fatalf("unexpected authorization header %q", request.Header.Get("Authorization"))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(`{"data":[]}`))}, nil
+	})}
+	handler, err := catalog.NewInvokeHandlerScoped("1", client, func(context.Context, string, string, string) (Credentials, error) {
+		return Credentials{APIKey: "secret"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handler.Execute(context.Background(), handlers.Request{
+		OperationKey: "http",
+		Input:        json.RawMessage(`{"provider":"gowid","operation":"http","path":"/v2/expense-statements?startDate=20260101&endDate=20260131"}`),
+	})
+	if err != nil || string(result.Output) != `{"data":[]}` {
+		t.Fatalf("unexpected result=%s err=%v", result.Output, err)
 	}
 }
 
