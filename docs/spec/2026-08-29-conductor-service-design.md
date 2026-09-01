@@ -6,8 +6,6 @@ Conductor를 전체 업무 workflow 소유자가 아니라, Compos에서 준비�
 
 전체 경계는 [Compos–Conductor 전체 설계 개요](./2026-08-29-compos-conductor-system-overview.md)를 따른다.
 
-기존 Rust 구현은 durable execution 개념의 참고 자료로 남기고 목표 런타임은 Go로 다시 작성한다.
-
 ## 최상위 결정
 
 Conductor의 중심 추상화는 workflow가 아니라 `Execution Request → Executable Handler`다.
@@ -38,22 +36,21 @@ idempotency claim
 
 Conductor는 Compos workflow definition, workflow instance, business Task graph와 record를 저장하지 않는다.
 
-## 목표 Go 패키지 경계
+## 현재 Go 패키지 경계
 
 ```text
 cmd/conductor
 internal/
   executions/    request, execution, attempt, terminal result
-  taskmanager/   queue, lease, heartbeat, complete/fail, recovery
   handlers/      executable handler interface와 registry
   connectors/    connector SDK, manifests, provider adapters
-  connections/   OAuth, encrypted token, cursor, subscription
-  ingress/       polling/webhook 결과를 Compos로 전달
+  connections/   OAuth와 encrypted credential
   callbacks/     execution 결과를 Compos로 전달
-  storage/       Conductor 전용 SQLite와 migrations
+  persistence/   embedded Rhiza adapter
+  storage/       replicated execution state와 schema
 ```
 
-초기에는 Go binary 하나와 SQLite 하나다. connector microservice, 동적 plugin loader, broker와 외부 worker transport는 실제 격리·확장 요구가 생길 때 추가한다.
+현재는 Go binary 하나와 embedded Rhiza를 사용한다. 별도 connector microservice와 broker는 실제 격리·확장 요구가 생길 때 추가한다.
 
 ## Execution 계약
 
@@ -131,7 +128,7 @@ binding을 저장하거나 해석하는 두 번째 control plane이 아니라, C
 따라서 Conductor에는 별도 `FunctionBinding` 테이블이나 `composite` graph runtime을
 추가하지 않는다. connector와 native handler는 같은 attempt/lease/retry/fencing 계약을
 공유하고, composite의 부분 실행·다음 단계·업무 완료 진실은 Compos에 남는다. 어느
-handler도 Compos SQLite를 직접 수정하지 않으며, 상태 변경은 built-in Compos connector를
+handler도 Compos 저장소를 직접 수정하지 않으며, 상태 변경은 built-in Compos connector를
 통해 Compos API와 Kernel 검증을 거친다.
 
 ### Local Handler
@@ -169,7 +166,7 @@ Local handler에도 다음 규칙이 적용된다.
 소스 크기·프레임·스택 상한과 context 취소를 적용한다.
 
 등록 API는 서비스 토큰이 설정된 서버의 `POST /v1/handlers`로 제한한다. 정의와 소스는
-SQLite에 해시와 함께 저장하고, 컴파일 결과는 별도 bytecode 캐시로 저장한다. 재시작 시
+Rhiza에 해시와 함께 저장하고, 컴파일 결과는 별도 bytecode 캐시로 저장한다. 재시작 시
 캐시의 소스 해시·바이트코드 해시·runtime/compiler ABI가 맞으면 즉시 복원하고, 아니면
 원본을 다시 컴파일해 캐시를 갱신한다. 메모리·CPU 격리가 필요한
 비신뢰 tenant 코드는 이 경로에 직접 노출하지 않고 별도 worker sandbox로 분리한다.
@@ -391,7 +388,7 @@ Conductor는 ingress event를 받아 어떤 business workflow를 시작할지 �
 
 ## 저장소
 
-초기 SQLite 최소 범위:
+현재 Rhiza schema 범위:
 
 ```text
 execution_requests
@@ -449,28 +446,13 @@ correlation_id + causation_id
 
 민감 payload 전체를 기본 로그에 남기지 않고 redacted summary와 별도 result reference를 사용한다.
 
-## 기존 Conductor 문서와의 관계
-
-기존 문서의 durable attempt, lease, heartbeat, retry와 immutable execution metadata 원칙은 유지한다.
-
-다음 범위는 변경한다.
+## 범위 원칙
 
 - 전체 workflow definition/version의 원본은 Conductor가 아니라 Compos다.
 - task/sleep/branch를 포함한 업무 graph를 Conductor가 진행하지 않는다.
 - Conductor는 ready code Task 한 건의 execution request를 처리한다.
 - connector와 local handler가 동일한 실행 계약을 사용한다.
 
-기존 “Conductor는 business state를 직접 변경하지 않는다”는 원칙은 유지된다. 명시적인 `compos` connector operation 요청은 허용하지만 실제 권한, 검증과 mutation은 Compos API가 수행한다.
-
-## 구현 순서
-
-1. Go + SQLite로 execution request/execution/attempt/lease 상태 전이를 구현한다.
-2. in-process local handler registry를 같은 실행 protocol에 연결한다.
-3. handler manifest versioning, timeout, cancellation과 idempotency를 구현한다.
-4. built-in Compos connector의 schema/get/update operation을 구현한다.
-5. callback 재전송과 Compos dedupe 계약을 검증한다.
-6. connections에 OAuth token 암호화 저장과 refresh를 구현한다.
-7. Gmail read와 기본 5분 polling을 Compos ingress에 연결한다.
-8. human 완료 → local handler → external connector → Compos connector → callback 시나리오를 검증한다.
+Conductor는 business state를 직접 변경하지 않는다. 명시적인 `compos` connector operation 요청은 허용하지만 실제 권한, 검증과 mutation은 Compos API가 수행한다.
 
 전체 business workflow engine, connector microservice, message broker와 dynamic plugin loading은 구현하지 않는다.
