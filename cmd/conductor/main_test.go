@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -400,6 +401,73 @@ func TestDynamicKavunHandlerRegistrationRequiresServiceToken(t *testing.T) {
 	restoredExecution, err := restoredService.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "kavun-restored", HandlerKey: "transform.kavun", HandlerVersion: "1", Input: json.RawMessage(`{"restored":true}`)})
 	if err != nil || restoredExecution.Status != "succeeded" || string(restoredExecution.Output) != `{"restored":true}` {
 		t.Fatalf("unexpected restored dynamic execution: %#v err=%v", restoredExecution, err)
+	}
+}
+
+func TestWASMHandlerRegistrationPersistsMetadataAndReloadsLazily(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wasm, err := base64.StdEncoding.DecodeString("AGFzbQEAAAABEQNgAX8Bf2ACf38AYAJ/fwF+AwQDAAECBQMBABEGGQN/AUGAgMAAC38AQYSAwAALfwBBkIDAAAsHQAYGbWVtb3J5AgAFYWxsb2MAAAdkZWFsbG9jAAEGaW52b2tlAAIKX19kYXRhX2VuZAMBC19faGVhcF9iYXNlAwIKNQMjAQF/QQAgAEEAKAKAgMCAACIBakEHakF4cTYCgIDAgAAgAQsCAAsMACAArUIghiABrYQLCw0BAEGAgMAACwQABAAAAFQEbmFtZQAUE2NvbmR1Y3Rvcl9lY2hvLndhc20BGQMABWFsbG9jAQdkZWFsbG9jAgZpbnZva2UHEgEAD19fc3RhY2tfcG9pbnRlcgkIAQAFLmRhdGEARQlwcm9kdWNlcnMBDHByb2Nlc3NlZC1ieQEFcnVzdGMlMS45NS4wLW5pZ2h0bHkgKGQyMjJkZGM0ZCAyMDI2LTAxLTIzKQCUAQ90YXJnZXRfZmVhdHVyZXMIKwtidWxrLW1lbW9yeSsPYnVsay1tZW1vcnktb3B0KxZjYWxsLWluZGlyZWN0LW92ZXJsb25nKwptdWx0aXZhbHVlKw9tdXRhYmxlLWdsb2JhbHMrE25vbnRyYXBwaW5nLWZwdG9pbnQrD3JlZmVyZW5jZS10eXBlcysIc2lnbi1leHQ=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetched := 0
+	fetch := func(context.Context, string) (wasmArtifact, error) {
+		fetched++
+		return wasmArtifact{Bytes: wasm, ManifestDigest: "sha256:manifest", BlobDigest: "sha256:blob", Size: int64(len(wasm))}, nil
+	}
+	runtime := handlers.NewWASMRuntime(context.Background())
+	defer runtime.Close(context.Background())
+	registry := handlers.NewRegistry()
+	service, _ := executions.NewService(store, registry)
+	h := newServer(service, registry, nil)
+	h.serviceToken, h.store, h.wasmRuntime, h.wasmFetch = "secret", store, runtime, fetch
+	body := `{"kind":"wasm","manifest":{"handler_key":"transform.wasm","version":"1"},"artifact":"registry.example/functions/transform@sha256:manifest","abi":"conductor:function/v1"}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/handlers", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer secret")
+	h.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("register status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "wasm-http", HandlerKey: "transform.wasm", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
+	if err != nil || execution.Status != "succeeded" || string(execution.Output) != `{"ok":true}` {
+		t.Fatalf("unexpected wasm execution: %#v err=%v", execution, err)
+	}
+	if fetched != 1 {
+		t.Fatalf("eager registration fetches=%d, want 1", fetched)
+	}
+
+	restoredRuntime := handlers.NewWASMRuntime(context.Background())
+	defer restoredRuntime.Close(context.Background())
+	restored := handlers.NewRegistry()
+	if err := loadWASMHandlers(context.Background(), store, restored, restoredRuntime, fetch); err != nil {
+		t.Fatal(err)
+	}
+	if fetched != 1 {
+		t.Fatalf("startup unexpectedly fetched artifact: %d", fetched)
+	}
+	restoredHandler, err := restored.Resolve("transform.wasm", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := restoredHandler.Execute(context.Background(), handlers.Request{Input: json.RawMessage(`{"restored":true}`)})
+	if err != nil || string(result.Output) != `{"restored":true}` || fetched != 2 {
+		t.Fatalf("lazy restored output=%s fetches=%d err=%v", result.Output, fetched, err)
+	}
+}
+
+func TestOCIWASMFetcherRequiresAllowlistedDigestReference(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("0", 64)
+	fetch := newOCIWASMFetcher("registry.example", "", "", "", false)
+	if _, err := fetch(context.Background(), "other.example/functions/demo@"+digest); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("expected registry rejection, got %v", err)
+	}
+	if _, err := fetch(context.Background(), "registry.example/functions/demo:latest"); err == nil || !strings.Contains(err.Error(), "pinned") {
+		t.Fatalf("expected mutable tag rejection, got %v", err)
 	}
 }
 

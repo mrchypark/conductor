@@ -80,6 +80,36 @@ func TestOpenReloadsDynamicHandlerFromRhiza(t *testing.T) {
 	}
 }
 
+func TestWASMHandlerMetadataIsImmutableAndContainsNoArtifactBytes(t *testing.T) {
+	store, err := Open(context.Background(), "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	record := WASMHandlerRecord{
+		HandlerKey: "transform.wasm", Version: "1",
+		ManifestJSON: []byte(`{"handler_key":"transform.wasm","version":"1"}`),
+		ArtifactRef:  "registry.example/functions/transform@sha256:manifest", ManifestDigest: "sha256:manifest",
+		BlobDigest: "sha256:blob", ArtifactSize: 1234, RuntimeABI: "conductor:function/v1",
+	}
+	created, err := store.SaveWASMHandler(context.Background(), record)
+	if err != nil || !created {
+		t.Fatalf("save wasm handler: created=%v err=%v", created, err)
+	}
+	created, err = store.SaveWASMHandler(context.Background(), record)
+	if err != nil || created {
+		t.Fatalf("identical save should be idempotent: created=%v err=%v", created, err)
+	}
+	record.BlobDigest = "sha256:different"
+	if _, err := store.SaveWASMHandler(context.Background(), record); err == nil || !strings.Contains(err.Error(), "different definition") {
+		t.Fatalf("expected immutable version conflict, got %v", err)
+	}
+	records, err := store.ListWASMHandlers(context.Background())
+	if err != nil || len(records) != 1 || records[0].BlobDigest != "sha256:blob" || records[0].ArtifactSize != 1234 {
+		t.Fatalf("unexpected wasm handler metadata: %#v err=%v", records, err)
+	}
+}
+
 func TestLeaseExpiryRecoversQueuedExecution(t *testing.T) {
 	store, err := Open(context.Background(), "file:"+t.TempDir()+"/db")
 	if err != nil {

@@ -84,6 +84,13 @@ type DynamicHandlerRecord struct {
 	Bytecode                                     []byte
 	BytecodeHash, BytecodeSourceHash, RuntimeABI string
 }
+type WASMHandlerRecord struct {
+	HandlerKey, Version                     string
+	ManifestJSON                            []byte
+	ArtifactRef, ManifestDigest, BlobDigest string
+	ArtifactSize                            int64
+	RuntimeABI                              string
+}
 
 func LocalConfig(dir string) persistence.Config {
 	return persistence.Config{ClusterID: "conductor-local", NodeID: "n1", DataDir: dir, Members: []rhiza.Member{{ID: "n1"}}}
@@ -138,7 +145,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		if id != schemaIdentity {
 			return fmt.Errorf("unsupported schema identity %q; expected %q", id, schemaIdentity)
 		}
-		return nil
+		return s.ensureWASMHandlerSchema(ctx)
 	}
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS schema_metadata(id INTEGER PRIMARY KEY CHECK(id=1),identity TEXT NOT NULL)`,
@@ -170,7 +177,16 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil || len(rows) != 1 || str(rows[0][0]) != schemaIdentity {
 		return errors.New("conductor schema initialization was not authoritative")
 	}
-	return nil
+	return s.ensureWASMHandlerSchema(ctx)
+}
+
+func (s *Store) ensureWASMHandlerSchema(ctx context.Context) error {
+	rows, err := s.db.Query(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='wasm_handlers'`)
+	if err == nil && len(rows) == 1 {
+		return nil
+	}
+	_, err = s.db.Mutate(ctx, "initialize wasm handler schema", st(`CREATE TABLE IF NOT EXISTS wasm_handlers(handler_key TEXT NOT NULL,version TEXT NOT NULL,manifest_json BLOB NOT NULL,artifact_ref TEXT NOT NULL,manifest_digest TEXT NOT NULL,blob_digest TEXT NOT NULL,artifact_size INTEGER NOT NULL,runtime_abi TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(handler_key,version))`))
+	return err
 }
 
 func (s *Store) SaveHandlerManifest(ctx context.Context, key, version string, manifest any) error {
@@ -268,6 +284,67 @@ func (s *Store) ListDynamicHandlers(ctx context.Context) ([]DynamicHandlerRecord
 			return nil, e
 		}
 		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (s *Store) SaveWASMHandler(ctx context.Context, r WASMHandlerRecord) (bool, error) {
+	if r.HandlerKey == "" || r.Version == "" || len(r.ManifestJSON) == 0 || r.ArtifactRef == "" || r.ManifestDigest == "" || r.BlobDigest == "" || r.ArtifactSize <= 0 || r.RuntimeABI == "" {
+		return false, errors.New("wasm handler metadata is incomplete")
+	}
+	old, err := s.wasmHandler(ctx, r.HandlerKey, r.Version)
+	if err == nil {
+		return false, compareWASMHandler(old, r)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return false, err
+	}
+	_, err = s.db.Mutate(ctx, "save wasm handler", stm(`INSERT OR IGNORE INTO wasm_handlers(handler_key,version,manifest_json,artifact_ref,manifest_digest,blob_digest,artifact_size,runtime_abi,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, r.HandlerKey, r.Version, r.ManifestJSON, r.ArtifactRef, r.ManifestDigest, r.BlobDigest, r.ArtifactSize, r.RuntimeABI, now()))
+	if err != nil {
+		return false, err
+	}
+	old, err = s.wasmHandler(ctx, r.HandlerKey, r.Version)
+	if err != nil {
+		return false, err
+	}
+	return true, compareWASMHandler(old, r)
+}
+
+func compareWASMHandler(old, current WASMHandlerRecord) error {
+	if !bytes.Equal(old.ManifestJSON, current.ManifestJSON) || old.ArtifactRef != current.ArtifactRef || old.ManifestDigest != current.ManifestDigest || old.BlobDigest != current.BlobDigest || old.ArtifactSize != current.ArtifactSize || old.RuntimeABI != current.RuntimeABI {
+		return errors.New("wasm handler version already exists with different definition")
+	}
+	return nil
+}
+
+func (s *Store) wasmHandler(ctx context.Context, key, version string) (WASMHandlerRecord, error) {
+	rows, err := s.db.Query(ctx, `SELECT manifest_json,artifact_ref,manifest_digest,blob_digest,artifact_size,runtime_abi FROM wasm_handlers WHERE handler_key=? AND version=?`, key, version)
+	if err != nil {
+		return WASMHandlerRecord{}, err
+	}
+	if len(rows) == 0 {
+		return WASMHandlerRecord{}, ErrNotFound
+	}
+	x := rows[0]
+	return WASMHandlerRecord{HandlerKey: key, Version: version, ManifestJSON: blob(x[0]), ArtifactRef: str(x[1]), ManifestDigest: str(x[2]), BlobDigest: str(x[3]), ArtifactSize: int64(num(x[4])), RuntimeABI: str(x[5])}, nil
+}
+
+func (s *Store) DeleteWASMHandler(ctx context.Context, key, version, manifestDigest string) error {
+	if key == "" || version == "" || manifestDigest == "" {
+		return errors.New("wasm handler key, version, and manifest digest are required")
+	}
+	_, err := s.db.Mutate(ctx, "delete wasm handler", stm(`DELETE FROM wasm_handlers WHERE handler_key=? AND version=? AND manifest_digest=?`, key, version, manifestDigest))
+	return err
+}
+
+func (s *Store) ListWASMHandlers(ctx context.Context) ([]WASMHandlerRecord, error) {
+	rows, err := s.db.Query(ctx, `SELECT handler_key,version,manifest_json,artifact_ref,manifest_digest,blob_digest,artifact_size,runtime_abi FROM wasm_handlers ORDER BY handler_key,version`)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WASMHandlerRecord, 0, len(rows))
+	for _, x := range rows {
+		out = append(out, WASMHandlerRecord{HandlerKey: str(x[0]), Version: str(x[1]), ManifestJSON: blob(x[2]), ArtifactRef: str(x[3]), ManifestDigest: str(x[4]), BlobDigest: str(x[5]), ArtifactSize: int64(num(x[6])), RuntimeABI: str(x[7])})
 	}
 	return out, nil
 }

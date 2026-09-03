@@ -50,6 +50,12 @@ Rhiza `dynamic_handlers`에 원본과 SHA-256을 저장하고, 컴파일 결과�
 바이트코드 해시, Kavun 런타임 ABI가 맞으면 즉시 복원하고, 아니면 원본을 다시
 컴파일해 캐시를 갱신합니다.
 
+컴파일된 함수는 `kind: "wasm"`으로도 등록할 수 있습니다. WASM은 허용된 OCI
+registry의 `sha256` digest로 고정하고, Rhiza에는 artifact identity와 manifest만
+저장합니다. 실행은 무권한 JSON ABI와 16 MiB 메모리 상한 안에서 wazero의 새 guest
+instance로 수행됩니다. 빌드·push·등록 형식과 장애/보안 경계는
+[WASM function deployment](docs/spec/2026-09-04-wasm-function-deployment.md)를 참고하세요.
+
 현재 이 전환 범위는 Compos가 위임한 함수/커넥터 실행입니다. workflow graph, task
 completion, submission 같은 업무 상태는 Compos가 계속 소유합니다.
 

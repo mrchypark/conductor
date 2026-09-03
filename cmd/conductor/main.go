@@ -33,6 +33,8 @@ type server struct {
 	store        *storage.Store
 	serviceToken string
 	oauthStore   *connections.Store
+	wasmRuntime  *handlers.WASMRuntime
+	wasmFetch    wasmArtifactFetcher
 }
 
 func newServer(service *executions.Service, registry *handlers.Registry, catalog *ampconnectors.Catalog) *server {
@@ -103,12 +105,15 @@ func isOAuthCallbackPath(path string) bool {
 	return strings.HasPrefix(path, "/v1/oauth/") && strings.HasSuffix(path, "/callback") && strings.TrimSuffix(strings.TrimPrefix(path, "/v1/oauth/"), "/callback") != ""
 }
 
-type kavunRegisterRequest struct {
+type handlerRegisterRequest struct {
+	Kind           string            `json:"kind,omitempty"`
 	Manifest       handlers.Manifest `json:"manifest"`
 	Source         string            `json:"source"`
 	AllowedModules []string          `json:"allowed_modules,omitempty"`
 	MaxFrames      int               `json:"max_frames,omitempty"`
 	MaxStack       int               `json:"max_stack,omitempty"`
+	Artifact       string            `json:"artifact,omitempty"`
+	ABI            string            `json:"abi,omitempty"`
 }
 
 // eventBatch is the wire envelope emitted by Compos' durable-engine outbox.
@@ -311,11 +316,25 @@ func (s *server) registerHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "dynamic handler registration requires CONDUCTOR_SERVICE_TOKEN")
 		return
 	}
-	var input kavunRegisterRequest
+	var input handlerRegisterRequest
 	if err := decodeBody(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid handler registration request")
 		return
 	}
+	if input.Kind == "" {
+		input.Kind = "kavun"
+	}
+	switch input.Kind {
+	case "kavun":
+		s.registerKavunHandler(w, r, input)
+	case "wasm":
+		s.registerWASMHandler(w, r, input)
+	default:
+		writeError(w, http.StatusBadRequest, "handler kind must be kavun or wasm")
+	}
+}
+
+func (s *server) registerKavunHandler(w http.ResponseWriter, r *http.Request, input handlerRegisterRequest) {
 	handler, err := handlers.NewKavunHandler(handlers.KavunSpec{
 		Manifest: input.Manifest, Source: []byte(input.Source), AllowedModules: input.AllowedModules,
 		MaxFrames: input.MaxFrames, MaxStack: input.MaxStack,
@@ -365,6 +384,70 @@ func (s *server) registerHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, handler.Manifest())
 }
 
+func (s *server) registerWASMHandler(w http.ResponseWriter, r *http.Request, input handlerRegisterRequest) {
+	if s.wasmRuntime == nil || s.wasmFetch == nil {
+		writeError(w, http.StatusServiceUnavailable, "wasm runtime is not configured")
+		return
+	}
+	if input.ABI != handlers.WASMRuntimeABI {
+		writeError(w, http.StatusBadRequest, "abi must be "+handlers.WASMRuntimeABI)
+		return
+	}
+	if input.Artifact == "" {
+		writeError(w, http.StatusBadRequest, "artifact is required")
+		return
+	}
+	fetchCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	artifact, err := s.wasmFetch(fetchCtx, input.Artifact)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	load := func(ctx context.Context) ([]byte, error) {
+		fetched, err := s.wasmFetch(ctx, input.Artifact)
+		if err != nil {
+			return nil, err
+		}
+		if fetched.ManifestDigest != artifact.ManifestDigest || fetched.BlobDigest != artifact.BlobDigest || fetched.Size != artifact.Size {
+			return nil, &handlers.Error{Class: "wasm_invalid", Message: "wasm artifact identity changed"}
+		}
+		return fetched.Bytes, nil
+	}
+	handler, err := s.wasmRuntime.NewHandler(fetchCtx, handlers.WASMSpec{Manifest: input.Manifest, Load: load}, artifact.Bytes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.registry.Register(handler); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	manifestJSON, marshalErr := json.Marshal(handler.Manifest())
+	var created bool
+	var saveErr error
+	if s.store != nil && marshalErr == nil {
+		created, saveErr = s.store.SaveWASMHandler(r.Context(), storage.WASMHandlerRecord{
+			HandlerKey: handler.Manifest().Key, Version: handler.Manifest().Version, ManifestJSON: manifestJSON,
+			ArtifactRef: input.Artifact, ManifestDigest: artifact.ManifestDigest, BlobDigest: artifact.BlobDigest,
+			ArtifactSize: artifact.Size, RuntimeABI: handlers.WASMRuntimeABI,
+		})
+	}
+	if marshalErr != nil || saveErr != nil {
+		if created {
+			_ = s.store.DeleteWASMHandler(r.Context(), handler.Manifest().Key, handler.Manifest().Version, artifact.ManifestDigest)
+		}
+		s.registry.Unregister(handler.Manifest().Key, handler.Manifest().Version)
+		if marshalErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encode handler manifest")
+		} else {
+			writeError(w, http.StatusConflict, saveErr.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"kind": "wasm", "manifest": handler.Manifest(), "artifact": input.Artifact, "manifest_digest": artifact.ManifestDigest, "blob_digest": artifact.BlobDigest, "artifact_size": artifact.Size, "abi": handlers.WASMRuntimeABI})
+}
+
 func loadDynamicHandlers(ctx context.Context, store *storage.Store, registry *handlers.Registry) error {
 	if store == nil {
 		return nil
@@ -398,6 +481,47 @@ func loadDynamicHandlers(ctx context.Context, store *storage.Store, registry *ha
 			if err := store.SaveDynamicHandlerBytecode(ctx, record.HandlerKey, record.Version, bytecode, bytecodeHash, record.SourceHash, runtimeABI); err != nil {
 				return fmt.Errorf("dynamic handler %s@%s bytecode cache: %w", record.HandlerKey, record.Version, err)
 			}
+		}
+		if err := registry.Register(handler); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadWASMHandlers(ctx context.Context, store *storage.Store, registry *handlers.Registry, runtime *handlers.WASMRuntime, fetch wasmArtifactFetcher) error {
+	if store == nil || runtime == nil || fetch == nil {
+		return nil
+	}
+	records, err := store.ListWASMHandlers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.RuntimeABI != handlers.WASMRuntimeABI {
+			return fmt.Errorf("wasm handler %s@%s uses unsupported ABI %q", record.HandlerKey, record.Version, record.RuntimeABI)
+		}
+		var manifest handlers.Manifest
+		if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
+			return fmt.Errorf("wasm handler %s@%s manifest: %w", record.HandlerKey, record.Version, err)
+		}
+		if manifest.Key != record.HandlerKey || manifest.Version != record.Version {
+			return fmt.Errorf("wasm handler %s@%s manifest identity mismatch", record.HandlerKey, record.Version)
+		}
+		record := record
+		loader := func(loadCtx context.Context) ([]byte, error) {
+			artifact, err := fetch(loadCtx, record.ArtifactRef)
+			if err != nil {
+				return nil, err
+			}
+			if artifact.ManifestDigest != record.ManifestDigest || artifact.BlobDigest != record.BlobDigest || artifact.Size != record.ArtifactSize {
+				return nil, &handlers.Error{Class: "wasm_invalid", Message: "wasm artifact does not match registered identity"}
+			}
+			return artifact.Bytes, nil
+		}
+		handler, err := runtime.NewLazyHandler(handlers.WASMSpec{Manifest: manifest, Load: loader})
+		if err != nil {
+			return fmt.Errorf("wasm handler %s@%s: %w", record.HandlerKey, record.Version, err)
 		}
 		if err := registry.Register(handler); err != nil {
 			return err
@@ -867,6 +991,15 @@ func main() {
 	}
 	defer store.Close()
 	registry := handlers.NewRegistry()
+	wasmRuntime := handlers.NewWASMRuntime(ctx)
+	defer wasmRuntime.Close(ctx)
+	wasmFetch := newOCIWASMFetcher(
+		os.Getenv("CONDUCTOR_WASM_REGISTRIES"),
+		os.Getenv("CONDUCTOR_WASM_REGISTRY_USERNAME"),
+		os.Getenv("CONDUCTOR_WASM_REGISTRY_PASSWORD"),
+		os.Getenv("CONDUCTOR_WASM_REGISTRY_TOKEN"),
+		strings.EqualFold(os.Getenv("CONDUCTOR_WASM_REGISTRY_PLAIN_HTTP"), "true"),
+	)
 	echo, err := handlers.NewFuncHandler(handlers.Manifest{Key: "payload.echo", Version: "1", DefaultTimeout: 30, Idempotency: "pure", ResourceClass: "small"}, func(_ context.Context, request handlers.Request) (handlers.Result, error) {
 		return handlers.Result{Output: append([]byte(nil), request.Input...)}, nil
 	})
@@ -877,6 +1010,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := loadDynamicHandlers(ctx, store, registry); err != nil {
+		log.Fatal(err)
+	}
+	if err := loadWASMHandlers(ctx, store, registry, wasmRuntime, wasmFetch); err != nil {
 		log.Fatal(err)
 	}
 	service, err := executions.NewService(store, registry)
@@ -946,6 +1082,8 @@ func main() {
 	srv := newServer(service, registry, catalog)
 	srv.store = store
 	srv.oauthStore = connectionStore
+	srv.wasmRuntime = wasmRuntime
+	srv.wasmFetch = wasmFetch
 	if err := http.ListenAndServe(*addr, srv); err != nil {
 		log.Fatal(err)
 	}
