@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/mrchypark/rhiza"
@@ -64,6 +65,7 @@ func (d *DB) Mutate(ctx context.Context, operation string, statements ...Stateme
 	if err := rhiza.ValidateExecuteRequest(req); err != nil {
 		return Receipt{}, err
 	}
+	savepointRetries := 0
 	for {
 		response, err := d.db.Execute(ctx, req)
 		if err == nil {
@@ -72,8 +74,11 @@ func (d *DB) Mutate(ctx context.Context, operation string, statements ...Stateme
 			}
 			return response.MutationReceipt, nil
 		}
-		if !errors.Is(err, rhiza.ErrCommitUnknown) && !errors.Is(err, rhiza.ErrNotReady) && !errors.Is(err, rhiza.ErrQuorumUnavailable) {
+		if !retryableMutationError(err, savepointRetries) {
 			return Receipt{}, err
+		}
+		if lostRhizaSavepoint(err) {
+			savepointRetries++
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
@@ -83,6 +88,15 @@ func (d *DB) Mutate(ctx context.Context, operation string, statements ...Stateme
 		case <-timer.C:
 		}
 	}
+}
+
+func retryableMutationError(err error, savepointRetries int) bool {
+	return errors.Is(err, rhiza.ErrCommitUnknown) || errors.Is(err, rhiza.ErrNotReady) || errors.Is(err, rhiza.ErrQuorumUnavailable) ||
+		lostRhizaSavepoint(err) && savepointRetries == 0
+}
+
+func lostRhizaSavepoint(err error) bool {
+	return strings.Contains(err.Error(), "no such savepoint: rhiza_command")
 }
 
 func (d *DB) Query(ctx context.Context, sql string, args ...any) ([][]any, error) {

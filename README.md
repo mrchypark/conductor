@@ -34,6 +34,8 @@ OAuth endpoints are `POST /v1/oauth/{provider}/begin` and
 Provider redirects may use `GET`/`POST /v1/oauth/{provider}/callback` and resolve the
 attempt from the returned state. Non-OAuth credentials are stored encrypted through
 service-authenticated `POST /v1/connections` (API key, Basic, or custom metadata).
+Already-installed OAuth apps may register an access token through the same encrypted
+boundary with `oauth_access_token`; responses never return the token.
 실행 취소는 `POST /v1/executions/{execution_id}/cancel`입니다.
 runtime event 조회는 `GET /v1/executions/{execution_id}/events`입니다.
 Compos durable-engine outbox는 `POST /v1/events`의 `{"events":[...]}` envelope를

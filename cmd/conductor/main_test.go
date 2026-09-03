@@ -521,6 +521,17 @@ func TestConnectionHTTPStoresEncryptedCredential(t *testing.T) {
 	if err != nil || connection.Metadata["api_key"] != "api-secret" {
 		t.Fatalf("unexpected connection=%+v err=%v", connection, err)
 	}
+	recorder = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/connections", strings.NewReader(`{"connection_id":"conn-oauth","workspace_id":"ws","provider":"slack","oauth_access_token":"xoxb-secret","scopes":["channels:read"]}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("unexpected OAuth status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	connection, err = oauthStore.LoadConnection(context.Background(), "conn-oauth")
+	if err != nil || connection.Token == nil || connection.Token.AccessToken != "xoxb-secret" {
+		t.Fatalf("unexpected OAuth connection=%+v err=%v", connection, err)
+	}
 }
 
 func TestConnectorCredentialsResolverEnforcesConnectionScope(t *testing.T) {

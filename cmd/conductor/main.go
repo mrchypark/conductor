@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/amp-labs/connectors/providers"
 	"github.com/mrchypark/conductor/internal/callbacks"
 	"github.com/mrchypark/conductor/internal/connections"
 	ampconnectors "github.com/mrchypark/conductor/internal/connectors"
@@ -827,6 +828,7 @@ type connectionRegisterRequest struct {
 	WorkspaceID  string            `json:"workspace_id"`
 	Provider     string            `json:"provider"`
 	Scopes       []string          `json:"scopes,omitempty"`
+	OAuthToken   string            `json:"oauth_access_token,omitempty"`
 	APIKey       string            `json:"api_key,omitempty"`
 	BasicUser    string            `json:"basic_user,omitempty"`
 	BasicPass    string            `json:"basic_pass,omitempty"`
@@ -852,10 +854,19 @@ func (s *server) registerConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.catalog != nil {
-		if _, err := s.catalog.Info(input.Provider); err != nil {
+		info, err := s.catalog.Info(input.Provider)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "unknown connector provider")
 			return
 		}
+		if input.OAuthToken != "" && info.AuthType != providers.Oauth2 {
+			writeError(w, http.StatusBadRequest, "oauth_access_token requires an OAuth2 connector provider")
+			return
+		}
+	}
+	if input.OAuthToken != "" && (input.APIKey != "" || input.BasicUser != "" || input.BasicPass != "") {
+		writeError(w, http.StatusBadRequest, "oauth_access_token cannot be combined with API key or Basic credentials")
+		return
 	}
 	metadata := make(map[string]string, len(input.Metadata)+3)
 	for key, value := range input.Metadata {
@@ -870,11 +881,15 @@ func (s *server) registerConnection(w http.ResponseWriter, r *http.Request) {
 	if input.BasicPass != "" {
 		metadata["basic_pass"] = input.BasicPass
 	}
-	if len(metadata) == 0 {
+	if len(metadata) == 0 && input.OAuthToken == "" {
 		writeError(w, http.StatusBadRequest, "at least one encrypted credential value is required")
 		return
 	}
-	if err := s.oauthStore.SaveConnection(r.Context(), input.ConnectionID, input.WorkspaceID, input.Provider, nil, input.Scopes, metadata, time.Now().UTC()); err != nil {
+	var token *oauth2.Token
+	if input.OAuthToken != "" {
+		token = &oauth2.Token{AccessToken: input.OAuthToken, TokenType: "Bearer"}
+	}
+	if err := s.oauthStore.SaveConnection(r.Context(), input.ConnectionID, input.WorkspaceID, input.Provider, token, input.Scopes, metadata, time.Now().UTC()); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

@@ -173,7 +173,7 @@ func TestSubmitAndExecuteRetriesRetryableHandlerAndPersistsCallback(t *testing.T
 	if err := json.Unmarshal(callback.Payload, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["runtime_status"] != "succeeded" || payload["attempt_count"] != float64(2) {
+	if payload["runtime_status"] != "succeeded" || payload["attempt_count"] != float64(2) || payload["provider_key"] != "example.retry" || payload["handler_version"] != "1" {
 		t.Fatalf("unexpected callback payload: %s", callback.Payload)
 	}
 	events, err := store.ListExecutionEvents(context.Background(), execution.ID)
@@ -405,6 +405,73 @@ func TestRunWorkerClaimsQueuedExecution(t *testing.T) {
 			t.Fatal("worker did not finish")
 		}
 		time.Sleep(time.Millisecond * 5)
+	}
+	cancel()
+	<-done
+}
+
+func TestRunWorkerTerminalizesOversizedOutputAndContinues(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registry := handlers.NewRegistry()
+	h, _ := handlers.NewFuncHandler(handlers.Manifest{Key: "worker.output", Version: "1"}, func(_ context.Context, request handlers.Request) (handlers.Result, error) {
+		if request.ExecutionRequestID == "oversized" {
+			output, _ := json.Marshal(map[string]string{"data": strings.Repeat("x", 200_000)})
+			return handlers.Result{Output: output}, nil
+		}
+		return handlers.Result{Output: json.RawMessage(`{"ok":true}`)}, nil
+	})
+	if err := registry.Register(h); err != nil {
+		t.Fatal(err)
+	}
+	service, _ := NewService(store, registry)
+	for _, id := range []string{"oversized", "neighbor"} {
+		if _, err := service.Submit(context.Background(), ExecutionRequest{ExecutionRequestID: id, HandlerKey: "worker.output", HandlerVersion: "1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.RunWorker(ctx, "output-worker", time.Millisecond, time.Second) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("worker stopped before processing the neighboring execution: %v", err)
+		default:
+		}
+		large, largeErr := service.Get(context.Background(), "exec_oversized")
+		neighbor, neighborErr := service.Get(context.Background(), "exec_neighbor")
+		if largeErr == nil && neighborErr == nil && large.Status == "failed" && neighbor.Status == "succeeded" {
+			if large.Error == nil || large.Error.Class != "output_too_large" || len(large.Output) != 0 {
+				t.Fatalf("oversized output did not become a bounded failure: %+v", large)
+			}
+			duplicate, err := service.SubmitAndExecute(context.Background(), ExecutionRequest{ExecutionRequestID: "oversized", HandlerKey: "worker.output", HandlerVersion: "1"})
+			if err != nil || duplicate.Status != "failed" || duplicate.Error == nil || duplicate.Error.Class != "output_too_large" {
+				t.Fatalf("duplicate oversized execution diverged: execution=%+v err=%v", duplicate, err)
+			}
+			events, err := service.Events(context.Background(), large.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminals := 0
+			for _, event := range events {
+				if event.Type == "execution.failed" {
+					terminals++
+				}
+			}
+			if terminals != 1 {
+				t.Fatalf("terminal events=%d, want 1", terminals)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker did not continue: large=%+v largeErr=%v neighbor=%+v neighborErr=%v", large, largeErr, neighbor, neighborErr)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	cancel()
 	<-done

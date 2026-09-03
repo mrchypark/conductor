@@ -552,7 +552,7 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 	if a < 1 {
 		return errors.New("attempt number must be positive")
 	}
-	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.handler_key,r.handler_version FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
 	if e != nil {
 		return e
 	}
@@ -560,9 +560,9 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 		return ErrNotFound
 	}
 	x := rows[0]
-	request, ws, task, wf, corr, cause := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5])
+	request, ws, task, wf, corr, cause, handlerKey, handlerVersion := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7])
 	t := ft(n)
-	cb := map[string]any{"callback_id": "cb_" + id, "execution_request_id": request, "execution_id": id, "workspace_id": ws, "provider_key": "conductor", "provider_run_ref": id, "runtime_status": status, "attempt_count": a, "result": json.RawMessage(out), "error_class": nil, "error_detail": nil, "occurred_at": t}
+	cb := map[string]any{"callback_id": "cb_" + id, "execution_request_id": request, "execution_id": id, "workspace_id": ws, "provider_key": handlerKey, "provider_run_ref": id, "handler_version": handlerVersion, "runtime_status": status, "attempt_count": a, "result": json.RawMessage(out), "error_class": nil, "error_detail": nil, "occurred_at": t}
 	if task != "" {
 		cb["task_id"] = task
 	}
@@ -613,6 +613,9 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 		ss = append(ss, stm(`INSERT INTO callback_deliveries(callback_id,execution_id,target_url,payload,status,claim_id,attempt_count,next_attempt_at,last_error,created_at,updated_at) SELECT ?,?,?,?,'pending','',0,?,'',?,? WHERE EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?) ON CONFLICT(callback_id) DO UPDATE SET target_url=excluded.target_url`, `cb_`+id, id, s.callbackTarget, payload, t, t, t, id, claim, status, payload))
 	}
 	if _, e = s.db.Mutate(ctx, "complete "+id+" "+claim, ss...); e != nil {
+		if status == "succeeded" && errors.Is(e, rhiza.ErrInvalidRequest) && strings.Contains(e.Error(), "encoded command exceeds") {
+			return s.complete(ctx, id, "failed", nil, "output_too_large", "handler output exceeds the durable command size limit", false, a, lease, token, expired, n)
+		}
 		return e
 	}
 	rows, e = s.db.Query(ctx, `SELECT claim_id,status,payload FROM terminal_claims WHERE execution_id=?`, id)
