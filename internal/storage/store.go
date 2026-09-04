@@ -598,19 +598,19 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 		gargs = []any{lease, id, token, t}
 	}
 	q := `INSERT OR IGNORE INTO terminal_claims(execution_id,claim_id,status,payload,created_at) SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM executions WHERE id=? AND status='running') AND ` + guard
-	args := []any{id, claim, status, payload, t, id}
+	encodedPayload := encodeBlob(payload)
+	args := []any{id, claim, status, encodedPayload, t, id}
 	args = append(args, gargs...)
 	attemptStatus := status
 	if status != "succeeded" {
 		attemptStatus = "failed"
 	}
-	encodedPayload := encodeBlob(payload)
 	ss := []persistence.Statement{stm(q, args...), stm(`INSERT OR IGNORE INTO attempts(id,execution_id,attempt_number,status,error_class,error_message,started_at,finished_at) SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?)`, fmt.Sprintf("%s:%d", id, a), id, a, attemptStatus, class, msg, t, t, id, claim, status, encodedPayload), stm(`UPDATE executions SET status=?,output=?,error_class=?,error_message=?,error_retryable=?,updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?)`, status, encodeBlob(out), class, msg, boolNum(retry), t, id, id, claim, status, encodedPayload), stm(`INSERT OR IGNORE INTO callbacks(id,execution_id,status,payload,created_at) SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?)`, `cb_`+id, id, status, encodedPayload, t, id, claim, status, encodedPayload), stm(`INSERT OR IGNORE INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT ?,?,'execution.'||?,?,?,? WHERE EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?)`, `event_`+id+`:terminal`, id, status, a, encodedPayload, t, id, claim, status, encodedPayload)}
 	if expired {
 		ss = append(ss, stm(`UPDATE leases SET status='expired',updated_at=? WHERE lease_id=? AND fencing_token=? AND status='active' AND expires_at<=?`, t, lease, token, t))
 	}
 	if s.callbackTarget != "" {
-		ss = append(ss, stm(`INSERT INTO callback_deliveries(callback_id,execution_id,target_url,payload,status,claim_id,attempt_count,next_attempt_at,last_error,created_at,updated_at) SELECT ?,?,?,?,'pending','',0,?,'',?,? WHERE EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?) ON CONFLICT(callback_id) DO UPDATE SET target_url=excluded.target_url`, `cb_`+id, id, s.callbackTarget, payload, t, t, t, id, claim, status, payload))
+		ss = append(ss, stm(`INSERT INTO callback_deliveries(callback_id,execution_id,target_url,payload,status,claim_id,attempt_count,next_attempt_at,last_error,created_at,updated_at) SELECT ?,?,?,?,'pending','',0,?,'',?,? WHERE EXISTS(SELECT 1 FROM terminal_claims WHERE execution_id=? AND claim_id=? AND status=? AND payload=?) ON CONFLICT(callback_id) DO UPDATE SET target_url=excluded.target_url`, `cb_`+id, id, s.callbackTarget, payload, t, t, t, id, claim, status, encodedPayload))
 	}
 	if _, e = s.db.Mutate(ctx, "complete "+id+" "+claim, ss...); e != nil {
 		if status == "succeeded" && errors.Is(e, rhiza.ErrInvalidRequest) && strings.Contains(e.Error(), "encoded command exceeds") {
