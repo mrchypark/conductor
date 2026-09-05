@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/amp-labs/connectors v0.0.0-20260829081846-8a190bf71dd0
 	github.com/jokruger/kavun v0.6.4
-	github.com/mrchypark/rhiza v0.10.0
+	github.com/mrchypark/rhiza v0.11.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/tetratelabs/wazero v1.12.0
