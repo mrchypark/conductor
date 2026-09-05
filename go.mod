@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/amp-labs/connectors v0.0.0-20260829081846-8a190bf71dd0
 	github.com/jokruger/kavun v0.6.4
-	github.com/mrchypark/rhiza v0.11.0
+	github.com/mrchypark/rhiza v0.12.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/tetratelabs/wazero v1.12.0
@@ -104,7 +104,7 @@ require (
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/minio/minio-go/v7 v7.0.95 // indirect
 	github.com/mitchellh/hashstructure v1.1.0 // indirect
-	github.com/mrchypark/latticedb-go v0.3.0 // indirect
+	github.com/mrchypark/latticedb-go v0.5.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-sqlite3 v0.35.3 // indirect
 	github.com/ncruces/go-sqlite3-wasm/v3 v3.2.35304 // indirect

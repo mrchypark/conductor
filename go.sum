@@ -246,10 +246,10 @@ github.com/mitchellh/mapstructure v1.5.0 h1:jeMsZIYE/09sWLaz43PL7Gy6RuMjD2eJVyua
 github.com/mitchellh/mapstructure v1.5.0/go.mod h1:bFUtVrKA4DC2yAKiSyO/QUcy7e+RRV2QTWOzhPopBRo=
 github.com/mozillazg/go-httpheader v0.2.1 h1:geV7TrjbL8KXSyvghnFm+NyTux/hxwueTSrwhe88TQQ=
 github.com/mozillazg/go-httpheader v0.2.1/go.mod h1:jJ8xECTlalr6ValeXYdOF8fFUISeBAdw6E61aqQma60=
-github.com/mrchypark/latticedb-go v0.3.0 h1:En852aBEnCLzTWyVAj4E0L7VJRzycsEVSfJYitscZAs=
-github.com/mrchypark/latticedb-go v0.3.0/go.mod h1:zBf3fWXvnArVT2EO47AZc2nihz4kzas+Mj04IT2f6V8=
-github.com/mrchypark/rhiza v0.11.0 h1:APUv4p0p/e0amuEhlvOanZniq0r2wxcYBKE/oi5QjYI=
-github.com/mrchypark/rhiza v0.11.0/go.mod h1:ETXGu7Ptk0M2lYUSwvv1OS30oXEUjQmg+WdY96R6Ccs=
+github.com/mrchypark/latticedb-go v0.5.1 h1:mrXz7LlApwKlSr6fQ7vqMyXVSdW7BadgpvUBsHajD34=
+github.com/mrchypark/latticedb-go v0.5.1/go.mod h1:zBf3fWXvnArVT2EO47AZc2nihz4kzas+Mj04IT2f6V8=
+github.com/mrchypark/rhiza v0.12.0 h1:MhY7c+/7yVUise1r+dPTeJ2QlbFsbsXOxnZsbrRTkRE=
+github.com/mrchypark/rhiza v0.12.0/go.mod h1:29r+yP+sgkG6GIZY10ZIM+Ql79BqL1Iw2gpnSJ1FvZU=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f h1:KUppIJq7/+SVif2QVs3tOP0zanoHgBEVAwHxUSIzRqU=
