@@ -24,8 +24,11 @@ import (
 )
 
 var (
-	ErrInvalidState = errors.New("invalid oauth state")
-	ErrExpiredState = errors.New("expired oauth state")
+	ErrInvalidState       = errors.New("invalid oauth state")
+	ErrExpiredState       = errors.New("expired oauth state")
+	ErrConnectionNotFound = errors.New("connection not found")
+	ErrConnectionRevoked  = errors.New("connection revoked")
+	ErrConnectionRevision = errors.New("connection revision mismatch")
 )
 
 type Store struct {
@@ -34,12 +37,14 @@ type Store struct {
 }
 
 type Connection struct {
-	ID          string
-	WorkspaceID string
-	Provider    string
-	Token       *oauth2.Token
-	Scopes      []string
-	Metadata    map[string]string
+	ID           string
+	WorkspaceID  string
+	Provider     string
+	Revision     int64
+	TokenVersion int64
+	Token        *oauth2.Token
+	Scopes       []string
+	Metadata     map[string]string
 }
 
 func NewStore(ctx context.Context, db *persistence.DB, masterKey []byte) (*Store, error) {
@@ -89,7 +94,16 @@ func (s *Store) ensureSchema(ctx context.Context) error {
     expires_at INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
-)`})
+)`},
+		persistence.Statement{SQL: `CREATE TABLE IF NOT EXISTS connection_versions (
+    connection_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+	 token_version INTEGER NOT NULL DEFAULT 1,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    write_id TEXT NOT NULL DEFAULT ''
+)`},
+		persistence.Statement{SQL: `INSERT OR IGNORE INTO connection_versions (connection_id, revision, token_version, revoked, write_id)
+    SELECT connection_id, 1, 1, 0, '' FROM connections`})
 	return err
 }
 
@@ -277,6 +291,16 @@ func (s *Store) SaveToken(ctx context.Context, connectionID, workspaceID, provid
 	return s.SaveConnection(ctx, connectionID, workspaceID, provider, token, scopes, metadata, now)
 }
 
+// SaveTokenAtRevision stores a verified refresh without changing the logical
+// connection revision. Callers must have verified the provider identity and
+// granted scopes remain valid for this connection before calling it.
+func (s *Store) SaveTokenAtRevision(ctx context.Context, connectionID, workspaceID, provider string, token *oauth2.Token, scopes []string, metadata map[string]string, now time.Time, expectedRevision, expectedTokenVersion int64) error {
+	if expectedRevision < 1 || expectedTokenVersion < 1 {
+		return ErrConnectionRevision
+	}
+	return s.saveTokenAtRevision(ctx, connectionID, workspaceID, provider, token, scopes, metadata, now, expectedRevision, expectedTokenVersion)
+}
+
 // SaveConnection persists either an OAuth token or non-OAuth credentials in
 // the same encrypted connection record. Metadata is encrypted because API
 // keys, basic credentials, and provider-specific custom values live there.
@@ -284,83 +308,68 @@ func (s *Store) SaveConnection(ctx context.Context, connectionID, workspaceID, p
 	if connectionID == "" || workspaceID == "" || provider == "" {
 		return errors.New("connection, workspace, and provider are required")
 	}
-	if now.IsZero() {
-		now = time.Now().UTC()
+	revision, tokenVersion, revoked, err := s.connectionVersion(ctx, connectionID)
+	if err != nil && !errors.Is(err, ErrConnectionNotFound) {
+		return err
 	}
-	payload := []byte("null")
-	var err error
-	if token != nil {
-		payload, err = json.Marshal(token)
+	if revoked {
+		return ErrConnectionRevoked
 	}
+	return s.saveConnection(ctx, connectionID, workspaceID, provider, token, scopes, metadata, now, revision, tokenVersion)
+}
+
+func (s *Store) LoadToken(ctx context.Context, connectionID string) (*oauth2.Token, error) {
+	connection, err := s.LoadConnection(ctx, connectionID)
 	if err != nil {
-		return fmt.Errorf("marshal connection token: %w", err)
+		return nil, err
 	}
-	ciphertext, err := s.encryptor.Seal(payload)
+	return connection.Token, nil
+}
+
+func (s *Store) LoadConnection(ctx context.Context, connectionID string) (Connection, error) {
+	return s.loadConnection(ctx, connectionID, 0)
+}
+
+// LoadConnectionAtRevision returns credentials only when the caller still
+// holds the current logical connection revision. Revision zero is retained for
+// legacy callers and still rejects revoked connections.
+func (s *Store) LoadConnectionAtRevision(ctx context.Context, connectionID string, revision int64) (Connection, error) {
+	return s.loadConnection(ctx, connectionID, revision)
+}
+
+// ValidateConnectionRevision checks a connection fence without decrypting its
+// credentials. Revision zero is retained for legacy callers.
+func (s *Store) ValidateConnectionRevision(ctx context.Context, connectionID string, revision int64) error {
+	current, _, revoked, err := s.connectionVersion(ctx, connectionID)
 	if err != nil {
 		return err
 	}
-	scopesJSON, err := json.Marshal(scopes)
-	if err != nil {
-		return err
+	if revoked {
+		return ErrConnectionRevoked
 	}
-	metadataJSON, err := json.Marshal(metadata)
-	if err != nil {
-		return err
-	}
-	metadataCiphertext, err := s.encryptor.Seal(metadataJSON)
-	if err != nil {
-		return err
-	}
-	var expiry any
-	if token != nil && !token.Expiry.IsZero() {
-		expiry = token.Expiry.Unix()
-	}
-	_, err = s.db.Mutate(ctx, "save connection "+connectionID+" at "+fmt.Sprint(now.UnixNano()), persistence.Statement{SQL: `INSERT INTO connections
-        (connection_id, workspace_id, provider, token_ciphertext, scopes_json, metadata_json, expires_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(connection_id) DO UPDATE SET workspace_id=excluded.workspace_id,
-        provider=excluded.provider, token_ciphertext=excluded.token_ciphertext, scopes_json=excluded.scopes_json,
-        metadata_json=excluded.metadata_json, expires_at=excluded.expires_at, updated_at=excluded.updated_at`, Args: []any{
-		connectionID, workspaceID, provider, base64.StdEncoding.EncodeToString(ciphertext), string(scopesJSON), base64.RawStdEncoding.EncodeToString(metadataCiphertext), expiry, now.Unix(), now.Unix()}})
-	if err != nil {
-		return err
-	}
-	rows, err := s.db.Query(ctx, `SELECT workspace_id,provider,updated_at FROM connections WHERE connection_id=?`, connectionID)
-	if err != nil {
-		return err
-	}
-	if len(rows) != 1 || oauthString(rows[0][0]) != workspaceID || oauthString(rows[0][1]) != provider || oauthInt64(rows[0][2]) != now.Unix() {
-		return errors.New("connection mutation was not authoritative")
+	if revision != 0 && revision != current {
+		return ErrConnectionRevision
 	}
 	return nil
 }
 
-func (s *Store) LoadToken(ctx context.Context, connectionID string) (*oauth2.Token, error) {
-	rows, err := s.db.Query(ctx, `SELECT token_ciphertext FROM connections WHERE connection_id = ?`, connectionID)
-	if err != nil {
-		return nil, err
-	}
-	if len(rows) == 0 {
-		return nil, errors.New("connection not found")
-	}
-	ciphertext := oauthBytes(rows[0][0])
-	plaintext, err := s.encryptor.Open(ciphertext)
-	if err != nil {
-		return nil, err
-	}
-	return decodeToken(plaintext)
-}
-
-func (s *Store) LoadConnection(ctx context.Context, connectionID string) (Connection, error) {
-	rows, err := s.db.Query(ctx, `SELECT connection_id,workspace_id,provider,token_ciphertext,scopes_json,metadata_json FROM connections WHERE connection_id=?`, connectionID)
+func (s *Store) loadConnection(ctx context.Context, connectionID string, expectedRevision int64) (Connection, error) {
+	rows, err := s.db.Query(ctx, `SELECT c.connection_id,c.workspace_id,c.provider,c.token_ciphertext,c.scopes_json,c.metadata_json,v.revision,v.token_version,v.revoked
+        FROM connections c JOIN connection_versions v ON v.connection_id=c.connection_id WHERE c.connection_id=?`, connectionID)
 	if err != nil {
 		return Connection{}, err
 	}
 	if len(rows) == 0 {
-		return Connection{}, errors.New("connection not found")
+		return Connection{}, ErrConnectionNotFound
 	}
 	row := rows[0]
-	c := Connection{ID: oauthString(row[0]), WorkspaceID: oauthString(row[1]), Provider: oauthString(row[2])}
+	c := Connection{ID: oauthString(row[0]), WorkspaceID: oauthString(row[1]), Provider: oauthString(row[2]), Revision: oauthInt64(row[6]), TokenVersion: oauthInt64(row[7])}
+	if oauthInt64(row[8]) != 0 {
+		return Connection{}, ErrConnectionRevoked
+	}
+	if expectedRevision != 0 && c.Revision != expectedRevision {
+		return Connection{}, ErrConnectionRevision
+	}
 	ciphertext, scopesJSON, metadataJSON := oauthBytes(row[3]), oauthString(row[4]), oauthString(row[5])
 	plain, err := s.encryptor.Open(ciphertext)
 	if err != nil {
@@ -399,64 +408,203 @@ func decodeToken(plaintext []byte) (*oauth2.Token, error) {
 }
 
 func (s *Store) TokenSource(ctx context.Context, connectionID string, cfg oauth2.Config) (oauth2.TokenSource, error) {
-	token, err := s.LoadToken(ctx, connectionID)
+	connection, err := s.LoadConnection(ctx, connectionID)
 	if err != nil {
 		return nil, err
 	}
-	if token == nil {
+	if connection.Token == nil {
 		return nil, errors.New("connection has no OAuth token")
 	}
-	return &persistingTokenSource{base: cfg.TokenSource(ctx, token), current: token, store: s, connectionID: connectionID}, nil
+	return &persistingTokenSource{base: cfg.TokenSource(ctx, connection.Token), current: connection.Token, store: s, connection: connection}, nil
 }
 
 type persistingTokenSource struct {
-	mu           sync.Mutex
-	base         oauth2.TokenSource
-	current      *oauth2.Token
-	store        *Store
-	connectionID string
+	mu         sync.Mutex
+	base       oauth2.TokenSource
+	current    *oauth2.Token
+	store      *Store
+	connection Connection
 }
 
 func (s *persistingTokenSource) Token() (*oauth2.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.store.ValidateConnectionRevision(context.Background(), s.connection.ID, s.connection.Revision); err != nil {
+		return nil, err
+	}
 	token, err := s.base.Token()
 	if err != nil {
 		return nil, err
 	}
 	if token.AccessToken != s.current.AccessToken || token.RefreshToken != s.current.RefreshToken || !token.Expiry.Equal(s.current.Expiry) {
-		if err := s.store.updateToken(context.Background(), s.connectionID, token); err != nil {
+		if err := s.store.SaveTokenAtRevision(context.Background(), s.connection.ID, s.connection.WorkspaceID, s.connection.Provider, token, s.connection.Scopes, s.connection.Metadata, time.Now().UTC(), s.connection.Revision, s.connection.TokenVersion); err != nil {
 			return nil, err
 		}
 		s.current = token
+		s.connection.TokenVersion++
 	}
 	return token, nil
 }
 
 func (s *Store) updateToken(ctx context.Context, connectionID string, token *oauth2.Token) error {
-	payload, err := json.Marshal(token)
+	connection, err := s.LoadConnection(ctx, connectionID)
 	if err != nil {
 		return err
+	}
+	return s.SaveTokenAtRevision(ctx, connection.ID, connection.WorkspaceID, connection.Provider, token, connection.Scopes, connection.Metadata, time.Now().UTC(), connection.Revision, connection.TokenVersion)
+}
+
+// RevokeConnection tombstones a connection. Repeated revocations leave the
+// tombstone unchanged, and a revoked connection can never be reactivated.
+func (s *Store) RevokeConnection(ctx context.Context, connectionID string) error {
+	if _, _, revoked, err := s.connectionVersion(ctx, connectionID); err != nil {
+		return err
+	} else if revoked {
+		return nil
+	}
+	writeID, err := randomOpaque(16)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Mutate(ctx, "revoke connection "+connectionID, persistence.Statement{SQL: `UPDATE connection_versions
+        SET revision=revision+1, token_version=token_version+1, revoked=1, write_id=?
+        WHERE connection_id=? AND revoked=0`, Args: []any{writeID, connectionID}})
+	if err != nil {
+		return err
+	}
+	_, _, revoked, err := s.connectionVersion(ctx, connectionID)
+	if err != nil {
+		return err
+	}
+	if !revoked {
+		return ErrConnectionRevision
+	}
+	return nil
+}
+
+func (s *Store) connectionVersion(ctx context.Context, connectionID string) (revision, tokenVersion int64, revoked bool, err error) {
+	rows, err := s.db.Query(ctx, `SELECT revision,token_version,revoked FROM connection_versions WHERE connection_id=?`, connectionID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(rows) == 0 {
+		return 0, 0, false, ErrConnectionNotFound
+	}
+	return oauthInt64(rows[0][0]), oauthInt64(rows[0][1]), oauthInt64(rows[0][2]) != 0, nil
+}
+
+func (s *Store) saveConnection(ctx context.Context, connectionID, workspaceID, provider string, token *oauth2.Token, scopes []string, metadata map[string]string, now time.Time, currentRevision, currentTokenVersion int64) error {
+	values, err := s.connectionValues(token, scopes, metadata)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	writeID, err := randomOpaque(16)
+	if err != nil {
+		return err
+	}
+	desiredRevision := currentRevision + 1
+	desiredTokenVersion := currentTokenVersion + 1
+	versionStatement := persistence.Statement{SQL: `INSERT OR IGNORE INTO connection_versions (connection_id,revision,token_version,revoked,write_id)
+        SELECT ?,1,1,0,? WHERE NOT EXISTS (SELECT 1 FROM connections WHERE connection_id=? AND (workspace_id<>? OR provider<>?))`, Args: []any{connectionID, writeID, connectionID, workspaceID, provider}}
+	if currentRevision > 0 {
+		versionStatement = persistence.Statement{SQL: `UPDATE connection_versions SET revision=revision+1,token_version=token_version+1,write_id=?
+			WHERE connection_id=? AND revision=? AND token_version=? AND revoked=0 AND NOT EXISTS (SELECT 1 FROM connections WHERE connection_id=? AND (workspace_id<>? OR provider<>?))`, Args: []any{writeID, connectionID, currentRevision, currentTokenVersion, connectionID, workspaceID, provider}}
+	}
+	_, err = s.db.Mutate(ctx, "replace connection "+connectionID+" at "+fmt.Sprint(now.UnixNano()), versionStatement,
+		persistence.Statement{SQL: `INSERT INTO connections (connection_id,workspace_id,provider,token_ciphertext,scopes_json,metadata_json,expires_at,created_at,updated_at)
+            SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM connection_versions WHERE connection_id=? AND revision=? AND revoked=0 AND write_id=?)
+            ON CONFLICT(connection_id) DO UPDATE SET token_ciphertext=excluded.token_ciphertext,scopes_json=excluded.scopes_json,metadata_json=excluded.metadata_json,expires_at=excluded.expires_at,updated_at=excluded.updated_at
+            WHERE connections.workspace_id=excluded.workspace_id AND connections.provider=excluded.provider AND EXISTS (SELECT 1 FROM connection_versions WHERE connection_id=? AND revision=? AND revoked=0 AND write_id=?)`, Args: []any{
+			connectionID, workspaceID, provider, values.ciphertext, values.scopesJSON, values.metadataJSON, values.expiry, now.Unix(), now.Unix(),
+			connectionID, desiredRevision, writeID, connectionID, desiredRevision, writeID}})
+	if err != nil {
+		return err
+	}
+	return s.verifyConnectionAuthority(ctx, connectionID, workspaceID, provider, desiredRevision, desiredTokenVersion, writeID)
+}
+
+func (s *Store) saveTokenAtRevision(ctx context.Context, connectionID, workspaceID, provider string, token *oauth2.Token, scopes []string, metadata map[string]string, now time.Time, expectedRevision, expectedTokenVersion int64) error {
+	if connectionID == "" || workspaceID == "" || provider == "" {
+		return errors.New("connection, workspace, and provider are required")
+	}
+	values, err := s.connectionValues(token, scopes, metadata)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	writeID, err := randomOpaque(16)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Mutate(ctx, "refresh connection "+connectionID+" at "+fmt.Sprint(now.UnixNano()),
+		persistence.Statement{SQL: `UPDATE connection_versions SET token_version=token_version+1,write_id=?
+            WHERE connection_id=? AND revision=? AND token_version=? AND revoked=0
+            AND EXISTS (SELECT 1 FROM connections WHERE connection_id=? AND workspace_id=? AND provider=?)`, Args: []any{writeID, connectionID, expectedRevision, expectedTokenVersion, connectionID, workspaceID, provider}},
+		persistence.Statement{SQL: `UPDATE connections SET token_ciphertext=?,scopes_json=?,metadata_json=?,expires_at=?,updated_at=?
+            WHERE connection_id=? AND workspace_id=? AND provider=?
+            AND EXISTS (SELECT 1 FROM connection_versions WHERE connection_id=? AND revision=? AND token_version=? AND revoked=0 AND write_id=?)`, Args: []any{
+			values.ciphertext, values.scopesJSON, values.metadataJSON, values.expiry, now.Unix(), connectionID, workspaceID, provider,
+			connectionID, expectedRevision, expectedTokenVersion + 1, writeID}})
+	if err != nil {
+		return err
+	}
+	return s.verifyConnectionAuthority(ctx, connectionID, workspaceID, provider, expectedRevision, expectedTokenVersion+1, writeID)
+}
+
+type sealedConnection struct {
+	ciphertext   string
+	scopesJSON   string
+	metadataJSON string
+	expiry       any
+}
+
+func (s *Store) connectionValues(token *oauth2.Token, scopes []string, metadata map[string]string) (sealedConnection, error) {
+	payload := []byte("null")
+	var err error
+	if token != nil {
+		payload, err = json.Marshal(token)
+	}
+	if err != nil {
+		return sealedConnection{}, fmt.Errorf("marshal connection token: %w", err)
 	}
 	ciphertext, err := s.encryptor.Seal(payload)
 	if err != nil {
-		return err
+		return sealedConnection{}, err
 	}
-	var expiry any
-	if !token.Expiry.IsZero() {
-		expiry = token.Expiry.Unix()
+	scopesJSON, err := json.Marshal(scopes)
+	if err != nil {
+		return sealedConnection{}, err
 	}
-	updated := time.Now().UTC().Unix()
-	_, err = s.db.Mutate(ctx, "update connection token "+connectionID+" at "+fmt.Sprint(updated), persistence.Statement{SQL: `UPDATE connections SET token_ciphertext=?,expires_at=?,updated_at=? WHERE connection_id=?`, Args: []any{base64.StdEncoding.EncodeToString(ciphertext), expiry, updated, connectionID}})
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return sealedConnection{}, err
+	}
+	metadataCiphertext, err := s.encryptor.Seal(metadataJSON)
+	if err != nil {
+		return sealedConnection{}, err
+	}
+	values := sealedConnection{ciphertext: base64.StdEncoding.EncodeToString(ciphertext), scopesJSON: string(scopesJSON), metadataJSON: base64.RawStdEncoding.EncodeToString(metadataCiphertext)}
+	if token != nil && !token.Expiry.IsZero() {
+		values.expiry = token.Expiry.Unix()
+	}
+	return values, nil
+}
+
+func (s *Store) verifyConnectionAuthority(ctx context.Context, connectionID, workspaceID, provider string, revision, tokenVersion int64, writeID string) error {
+	rows, err := s.db.Query(ctx, `SELECT c.workspace_id,c.provider,v.revision,v.token_version,v.revoked,v.write_id FROM connections c JOIN connection_versions v ON v.connection_id=c.connection_id WHERE c.connection_id=?`, connectionID)
 	if err != nil {
 		return err
 	}
-	rows, err := s.db.Query(ctx, `SELECT updated_at FROM connections WHERE connection_id=?`, connectionID)
-	if err != nil {
-		return err
+	if len(rows) == 1 && oauthString(rows[0][0]) == workspaceID && oauthString(rows[0][1]) == provider && oauthInt64(rows[0][4]) != 0 {
+		return ErrConnectionRevoked
 	}
-	if len(rows) != 1 || oauthInt64(rows[0][0]) != updated {
-		return errors.New("connection token update was not authoritative")
+	if len(rows) != 1 || oauthString(rows[0][0]) != workspaceID || oauthString(rows[0][1]) != provider || oauthInt64(rows[0][2]) != revision || oauthInt64(rows[0][3]) != tokenVersion || oauthInt64(rows[0][4]) != 0 || oauthString(rows[0][5]) != writeID {
+		return ErrConnectionRevision
 	}
 	return nil
 }

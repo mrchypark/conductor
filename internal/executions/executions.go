@@ -67,6 +67,7 @@ type ExecutionRequest struct {
 	HandlerVersion     string          `json:"handler_version"`
 	OperationKey       string          `json:"operation_key"`
 	ConnectionID       string          `json:"connection_id"`
+	CredentialRevision int64           `json:"credential_revision"`
 	SubjectRef         json.RawMessage `json:"subject_ref,omitempty"`
 	InputRef           json.RawMessage `json:"input_ref,omitempty"`
 	DeadlineAt         time.Time       `json:"deadline_at,omitempty"`
@@ -347,7 +348,7 @@ func (s *Service) RunWorker(ctx context.Context, workerID string, poll, leaseTTL
 }
 
 func fromRecord(r storage.ExecutionRequestRecord) ExecutionRequest {
-	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
+	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
 }
 
 func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, lease storage.LeaseRecord) error {
@@ -384,7 +385,7 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 		maxAttempts = 1
 	}
 	for attempt := lease.AttemptNumber; attempt <= maxAttempts; attempt++ {
-		result, execErr := handler.Execute(callCtx, handlers.Request{ExecutionID: lease.ExecutionID, ExecutionRequestID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID, WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowInstanceID: request.WorkflowInstanceID, TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, SubjectRef: request.SubjectRef, InputRef: request.InputRef, DeadlineAt: request.DeadlineAt, AttemptNumber: attempt, LeaseID: lease.ID, FencingToken: lease.FencingToken, IdempotencyKey: request.IdempotencyKey, ActorType: request.Actor.Type, ActorID: request.Actor.ID, Input: request.Input})
+		result, execErr := handler.Execute(callCtx, handlers.Request{ExecutionID: lease.ExecutionID, ExecutionRequestID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID, WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowInstanceID: request.WorkflowInstanceID, TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, SubjectRef: request.SubjectRef, InputRef: request.InputRef, DeadlineAt: request.DeadlineAt, AttemptNumber: attempt, LeaseID: lease.ID, FencingToken: lease.FencingToken, IdempotencyKey: request.IdempotencyKey, ActorType: request.Actor.Type, ActorID: request.Actor.ID, Input: request.Input})
 		if execErr == nil {
 			if len(result.Output) > 0 && !json.Valid(result.Output) {
 				_, err = s.finishLease(ctx, lease, lease.ExecutionID, nil, &handlers.Error{Class: "invalid_output", Message: "handler output must be valid JSON"}, attempt)
@@ -492,7 +493,7 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 		result, executeErr := handler.Execute(executionContext, handlers.Request{
 			ExecutionID: executionID, ExecutionRequestID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID,
 			WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowInstanceID: request.WorkflowInstanceID, TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey,
-			HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID,
+			HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision,
 			SubjectRef: append(json.RawMessage(nil), request.SubjectRef...), InputRef: append(json.RawMessage(nil), request.InputRef...),
 			DeadlineAt: request.DeadlineAt, AttemptNumber: attempt, LeaseID: lease.ID, FencingToken: lease.FencingToken,
 			IdempotencyKey: request.IdempotencyKey, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
@@ -567,7 +568,7 @@ func (s *Service) checkIdempotency(ctx context.Context, request ExecutionRequest
 	if err != nil {
 		return err
 	}
-	if record.HandlerKey != request.HandlerKey || record.HandlerVersion != request.HandlerVersion || record.OperationKey != request.OperationKey || record.WorkspaceID != request.WorkspaceID || record.WorkflowKey != request.WorkflowKey || record.WorkflowVersion != request.WorkflowVersion || record.WorkflowID != request.WorkflowInstanceID || record.TaskID != request.TaskID || record.NodeKey != request.NodeKey || record.ConnectionID != request.ConnectionID || record.ActorType != request.Actor.Type || record.ActorID != request.Actor.ID || !bytes.Equal(record.SubjectRef, request.SubjectRef) || !bytes.Equal(record.InputRef, request.InputRef) || !record.DeadlineAt.Equal(request.DeadlineAt) || record.Timeout != request.Timeout || record.MaxAttempts != request.Retry.MaxAttempts || record.RetryBackoff != request.Retry.Backoff || record.RetryBackoffMode != request.Retry.BackoffMode || record.CorrelationID != request.CorrelationID || record.CausationID != request.CausationID || record.IdempotencyKey != request.IdempotencyKey || !bytes.Equal(record.Input, request.Input) {
+	if record.HandlerKey != request.HandlerKey || record.HandlerVersion != request.HandlerVersion || record.OperationKey != request.OperationKey || record.WorkspaceID != request.WorkspaceID || record.WorkflowKey != request.WorkflowKey || record.WorkflowVersion != request.WorkflowVersion || record.WorkflowID != request.WorkflowInstanceID || record.TaskID != request.TaskID || record.NodeKey != request.NodeKey || record.ConnectionID != request.ConnectionID || record.CredentialRevision != request.CredentialRevision || record.ActorType != request.Actor.Type || record.ActorID != request.Actor.ID || !bytes.Equal(record.SubjectRef, request.SubjectRef) || !bytes.Equal(record.InputRef, request.InputRef) || !record.DeadlineAt.Equal(request.DeadlineAt) || record.Timeout != request.Timeout || record.MaxAttempts != request.Retry.MaxAttempts || record.RetryBackoff != request.Retry.Backoff || record.RetryBackoffMode != request.Retry.BackoffMode || record.CorrelationID != request.CorrelationID || record.CausationID != request.CausationID || record.IdempotencyKey != request.IdempotencyKey || !bytes.Equal(record.Input, request.Input) {
 		return errors.New("idempotency_conflict: execution request already exists with different content")
 	}
 	return nil
@@ -647,6 +648,12 @@ func validate(request ExecutionRequest) error {
 	if request.Timeout < 0 || request.Retry.MaxAttempts < 0 || request.Retry.Backoff < 0 {
 		return errors.New("timeout and retry values must not be negative")
 	}
+	if request.CredentialRevision < 0 {
+		return errors.New("credential revision must not be negative")
+	}
+	if request.CredentialRevision > 0 && request.ConnectionID == "" {
+		return errors.New("connection id is required when credential revision is set")
+	}
 	return nil
 }
 
@@ -709,7 +716,7 @@ func toRecord(request ExecutionRequest) storage.ExecutionRequestRecord {
 	return storage.ExecutionRequestRecord{ID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID,
 		WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowID: request.WorkflowInstanceID,
 		TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion,
-		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
+		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
 		SubjectRef: append([]byte(nil), request.SubjectRef...), InputRef: append([]byte(nil), request.InputRef...), DeadlineAt: request.DeadlineAt,
 		Input: append([]byte(nil), request.Input...), Timeout: request.Timeout, MaxAttempts: request.Retry.MaxAttempts, RetryBackoff: request.Retry.Backoff, RetryBackoffMode: request.Retry.BackoffMode,
 		CorrelationID: request.CorrelationID, CausationID: request.CausationID, IdempotencyKey: request.IdempotencyKey}

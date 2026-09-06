@@ -132,6 +132,7 @@ type eventRequest struct {
 }
 
 type eventComposContext struct {
+	CredentialRevision int64
 	WorkspaceID        string
 	ExecutionRequestID string
 	HandlerKey         string
@@ -247,7 +248,7 @@ func executionRequestFromEvent(event eventRequest) (executions.ExecutionRequest,
 		WorkflowKey: ctx.WorkflowKey, WorkflowVersion: ctx.WorkflowVersion,
 		WorkflowInstanceID: ctx.WorkflowInstanceID, TaskID: ctx.TaskID, NodeKey: ctx.NodeKey,
 		HandlerKey: ctx.HandlerKey, HandlerVersion: ctx.HandlerVersion, OperationKey: ctx.OperationKey,
-		ConnectionID: ctx.ConnectionID, SubjectRef: subjectRef, Input: inputJSON,
+		ConnectionID: ctx.ConnectionID, CredentialRevision: ctx.CredentialRevision, SubjectRef: subjectRef, Input: inputJSON,
 		Actor: ctx.Actor, IdempotencyKey: event.IdempotencyKey,
 		Timeout: time.Duration(ctx.TimeoutSeconds * float64(time.Second)), Retry: ctx.RetryPolicy,
 	}
@@ -270,6 +271,7 @@ func unmarshalEventContext(values map[string]json.RawMessage, target *eventCompo
 		return err
 	}
 	var wire struct {
+		CredentialRevision int64                  `json:"credential_revision"`
 		WorkspaceID        string                 `json:"workspace_id"`
 		ExecutionRequestID string                 `json:"execution_request_id"`
 		Handler            string                 `json:"handler"`
@@ -292,6 +294,7 @@ func unmarshalEventContext(values map[string]json.RawMessage, target *eventCompo
 		return fmt.Errorf("invalid data._compos: %w", err)
 	}
 	target.WorkspaceID, target.ExecutionRequestID = wire.WorkspaceID, wire.ExecutionRequestID
+	target.CredentialRevision = wire.CredentialRevision
 	target.HandlerKey, target.HandlerVersion = wire.HandlerKey, wire.HandlerVersion
 	if target.HandlerKey == "" {
 		target.HandlerKey = wire.Handler
@@ -962,21 +965,30 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func connectorCredentialsResolver(connectionStore *connections.Store, catalog *ampconnectors.Catalog) ampconnectors.ScopedCredentialsResolver {
-	return func(ctx context.Context, connectionID, provider, workspace string) (ampconnectors.Credentials, error) {
+	return func(ctx context.Context, connectionID, provider, workspace string, revision int64) (ampconnectors.Credentials, error) {
 		if connectionID == "" {
+			if revision != 0 {
+				return ampconnectors.Credentials{}, errors.New("connection is required for credential revision")
+			}
 			return ampconnectors.Credentials{}, nil
 		}
 		if connectionStore == nil {
 			return ampconnectors.Credentials{}, errors.New("connection store is not configured")
 		}
-		connection, err := connectionStore.LoadConnection(ctx, connectionID)
+		connection, err := connectionStore.LoadConnectionAtRevision(ctx, connectionID, revision)
 		if err != nil {
 			return ampconnectors.Credentials{}, err
 		}
 		if connection.Provider != provider || connection.WorkspaceID != workspace {
 			return ampconnectors.Credentials{}, errors.New("connection scope mismatch")
 		}
+		if revision > 0 && connection.Token != nil && !connection.Token.Valid() {
+			return ampconnectors.Credentials{}, errors.New("reauthorization required: provider refresh continuity is not verified")
+		}
 		creds := ampconnectors.Credentials{OAuthToken: connection.Token, Metadata: connection.Metadata, Custom: connection.Metadata}
+		creds.Validate = func(callCtx context.Context) error {
+			return connectionStore.ValidateConnectionRevision(callCtx, connection.ID, connection.Revision)
+		}
 		if info, err := catalog.Info(provider); err == nil && info.Oauth2Opts != nil {
 			creds.OAuthConfig = &oauth2.Config{ClientID: connection.Metadata["client_id"], ClientSecret: oauthClientSecret(provider), Endpoint: oauth2.Endpoint{AuthURL: info.Oauth2Opts.AuthURL, TokenURL: info.Oauth2Opts.TokenURL}, Scopes: connection.Scopes}
 		}
@@ -984,7 +996,13 @@ func connectorCredentialsResolver(connectionStore *connections.Store, catalog *a
 		creds.BasicUser = connection.Metadata["basic_user"]
 		creds.BasicPass = connection.Metadata["basic_pass"]
 		creds.TokenUpdated = func(_, token *oauth2.Token) error {
-			return connectionStore.SaveToken(context.Background(), connection.ID, connection.WorkspaceID, connection.Provider, token, connection.Scopes, connection.Metadata, time.Now().UTC())
+			if connection.Token != nil && token != nil && token.AccessToken == connection.Token.AccessToken && token.RefreshToken == connection.Token.RefreshToken && token.Expiry.Equal(connection.Token.Expiry) {
+				return connectionStore.ValidateConnectionRevision(ctx, connection.ID, connection.Revision)
+			}
+			if revision > 0 {
+				return errors.New("reauthorization required: provider refresh continuity is not verified")
+			}
+			return connectionStore.SaveTokenAtRevision(context.Background(), connection.ID, connection.WorkspaceID, connection.Provider, token, connection.Scopes, connection.Metadata, time.Now().UTC(), connection.Revision, connection.TokenVersion)
 		}
 		return creds, nil
 	}

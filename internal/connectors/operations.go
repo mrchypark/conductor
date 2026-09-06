@@ -16,12 +16,15 @@ import (
 
 // CredentialsResolver keeps provider secrets outside execution requests.
 type CredentialsResolver func(context.Context, string) (Credentials, error)
-type ScopedCredentialsResolver func(context.Context, string, string, string) (Credentials, error)
+type ScopedCredentialsResolver func(context.Context, string, string, string, int64) (Credentials, error)
 
 // NewInvokeHandler exposes AMP's standard CRUD operations and its authenticated
 // JSON client through the normal Conductor function boundary.
 func (c *Catalog) NewInvokeHandler(version string, client *http.Client, resolve CredentialsResolver) (handlers.Handler, error) {
-	return c.NewInvokeHandlerScoped(version, client, func(ctx context.Context, id, _, _ string) (Credentials, error) {
+	return c.NewInvokeHandlerScoped(version, client, func(ctx context.Context, id, _, _ string, revision int64) (Credentials, error) {
+		if revision != 0 {
+			return Credentials{}, errors.New("legacy resolver does not support credential revisions")
+		}
 		if resolve == nil {
 			return Credentials{}, nil
 		}
@@ -114,10 +117,12 @@ func (c *Catalog) invokeScoped(ctx context.Context, request handlers.Request, cl
 	creds := Credentials{}
 	if resolve != nil {
 		var err error
-		creds, err = resolve(ctx, request.ConnectionID, input.Provider, request.WorkspaceID)
+		creds, err = resolve(ctx, request.ConnectionID, input.Provider, request.WorkspaceID, request.CredentialRevision)
 		if err != nil {
 			return handlers.Result{}, &handlers.Error{Class: "connection_error", Message: err.Error()}
 		}
+	} else if request.CredentialRevision != 0 {
+		return handlers.Result{}, &handlers.Error{Class: "connection_error", Message: "credential revision resolver is required"}
 	}
 	if input.Module == "" && creds.Metadata != nil {
 		input.Module = creds.Metadata["module"]

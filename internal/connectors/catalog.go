@@ -64,6 +64,7 @@ func (c *Catalog) Info(name string, vars ...catalogreplacer.CatalogVariable) (*p
 }
 
 type Credentials struct {
+	Validate     func(context.Context) error
 	OAuthConfig  *oauth2.Config
 	OAuthToken   *oauth2.Token
 	TokenUpdated func(oldToken, newToken *oauth2.Token) error
@@ -136,6 +137,15 @@ func (c *Catalog) NewWithModule(ctx context.Context, name, module string, client
 }
 
 func newAuthClient(ctx context.Context, info *providers.ProviderInfo, client *http.Client, creds Credentials) (common.AuthenticatedHTTPClient, error) {
+	if creds.Validate != nil {
+		copy := *client
+		base := copy.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		copy.Transport = profileGuardTransport{base: base, validate: creds.Validate}
+		client = &copy
+	}
 	params := &providers.NewClientParams{Client: client}
 	switch info.AuthType {
 	case providers.Oauth2:
@@ -177,6 +187,18 @@ func newAuthClient(ctx context.Context, info *providers.ProviderInfo, client *ht
 		params.CustomCreds = &providers.CustomAuthParams{Values: creds.Custom}
 	}
 	return info.NewClient(ctx, params)
+}
+
+type profileGuardTransport struct {
+	base     http.RoundTripper
+	validate func(context.Context) error
+}
+
+func (t profileGuardTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if err := t.validate(r.Context()); err != nil {
+		return nil, err
+	}
+	return t.base.RoundTrip(r)
 }
 
 type Capabilities struct {

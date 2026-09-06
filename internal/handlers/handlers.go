@@ -37,6 +37,7 @@ type Request struct {
 	HandlerVersion     string
 	OperationKey       string
 	ConnectionID       string
+	CredentialRevision int64
 	SubjectRef         json.RawMessage
 	InputRef           json.RawMessage
 	DeadlineAt         time.Time

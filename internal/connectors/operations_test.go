@@ -79,7 +79,7 @@ func TestGowidConnectorCallsV2API(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(`{"data":[]}`))}, nil
 	})}
-	handler, err := catalog.NewInvokeHandlerScoped("1", client, func(context.Context, string, string, string) (Credentials, error) {
+	handler, err := catalog.NewInvokeHandlerScoped("1", client, func(context.Context, string, string, string, int64) (Credentials, error) {
 		return Credentials{APIKey: "secret"}, nil
 	})
 	if err != nil {

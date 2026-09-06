@@ -552,13 +552,13 @@ func TestConnectorCredentialsResolverEnforcesConnectionScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolver := connectorCredentialsResolver(connectionStore, catalog)
-	if _, err := resolver(context.Background(), "conn-scope", "slack", "ws-other"); err == nil || err.Error() != "connection scope mismatch" {
+	if _, err := resolver(context.Background(), "conn-scope", "slack", "ws-other", 0); err == nil || err.Error() != "connection scope mismatch" {
 		t.Fatalf("workspace scope mismatch was accepted: %v", err)
 	}
-	if _, err := resolver(context.Background(), "conn-scope", "salesforce", "ws-owner"); err == nil || err.Error() != "connection scope mismatch" {
+	if _, err := resolver(context.Background(), "conn-scope", "salesforce", "ws-owner", 0); err == nil || err.Error() != "connection scope mismatch" {
 		t.Fatalf("provider scope mismatch was accepted: %v", err)
 	}
-	credentials, err := resolver(context.Background(), "conn-scope", "slack", "ws-owner")
+	credentials, err := resolver(context.Background(), "conn-scope", "slack", "ws-owner", 0)
 	if err != nil || credentials.APIKey != "secret" {
 		t.Fatalf("valid scoped connection was not resolved: %+v %v", credentials, err)
 	}

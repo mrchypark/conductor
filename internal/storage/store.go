@@ -30,6 +30,7 @@ type ExecutionRequestRecord struct {
 	ID, WorkspaceID, WorkflowKey                                                        string
 	WorkflowVersion                                                                     uint64
 	WorkflowID, TaskID, NodeKey, HandlerKey, HandlerVersion, OperationKey, ConnectionID string
+	CredentialRevision                                                                  int64
 	ActorType, ActorID                                                                  string
 	SubjectRef, InputRef                                                                []byte
 	DeadlineAt                                                                          time.Time
@@ -145,12 +146,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		if id != schemaIdentity {
 			return fmt.Errorf("unsupported schema identity %q; expected %q", id, schemaIdentity)
 		}
+		if err := s.ensureExecutionRequestCredentialSchema(ctx); err != nil {
+			return err
+		}
 		return s.ensureWASMHandlerSchema(ctx)
 	}
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS schema_metadata(id INTEGER PRIMARY KEY CHECK(id=1),identity TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,workflow_key TEXT NOT NULL,workflow_version INTEGER NOT NULL,workflow_instance_id TEXT NOT NULL,task_id TEXT NOT NULL,node_key TEXT NOT NULL,handler_key TEXT NOT NULL,handler_version TEXT NOT NULL,operation_key TEXT NOT NULL,connection_id TEXT NOT NULL,actor_type TEXT NOT NULL,actor_id TEXT NOT NULL,subject_ref BLOB NOT NULL,input_ref BLOB NOT NULL,deadline_at TEXT NOT NULL,input BLOB NOT NULL,timeout_ns INTEGER NOT NULL,max_attempts INTEGER NOT NULL,retry_backoff_ns INTEGER NOT NULL,retry_backoff_mode TEXT NOT NULL,correlation_id TEXT NOT NULL,causation_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,created_at TEXT NOT NULL)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_requests_idempotency ON execution_requests(workspace_id,idempotency_key) WHERE idempotency_key<>''`,
+		`CREATE TABLE IF NOT EXISTS execution_request_credentials(execution_request_id TEXT PRIMARY KEY REFERENCES execution_requests(id),connection_id TEXT NOT NULL,credential_revision INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS submission_claims(request_id TEXT PRIMARY KEY,claim_id TEXT NOT NULL,created_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS executions(id TEXT PRIMARY KEY,execution_request_id TEXT NOT NULL UNIQUE REFERENCES execution_requests(id),status TEXT NOT NULL,handler_key TEXT NOT NULL,handler_version TEXT NOT NULL,operation_key TEXT NOT NULL,connection_id TEXT NOT NULL,input BLOB NOT NULL,output BLOB NOT NULL,error_class TEXT NOT NULL,error_message TEXT NOT NULL,error_retryable INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY,execution_id TEXT NOT NULL REFERENCES executions(id),attempt_number INTEGER NOT NULL,status TEXT NOT NULL,error_class TEXT NOT NULL,error_message TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT NOT NULL,UNIQUE(execution_id,attempt_number))`,
@@ -177,7 +182,21 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil || len(rows) != 1 || str(rows[0][0]) != schemaIdentity {
 		return errors.New("conductor schema initialization was not authoritative")
 	}
+	if err := s.ensureExecutionRequestCredentialSchema(ctx); err != nil {
+		return err
+	}
 	return s.ensureWASMHandlerSchema(ctx)
+}
+
+// Execution credentials are a companion record so requests keep the original
+// schema while each new submission pins the connection revision it may use.
+// Existing requests predate revision pinning and therefore read as revision 0.
+func (s *Store) ensureExecutionRequestCredentialSchema(ctx context.Context) error {
+	_, err := s.db.Mutate(ctx, "initialize execution credential schema",
+		st(`CREATE TABLE IF NOT EXISTS execution_request_credentials(execution_request_id TEXT PRIMARY KEY REFERENCES execution_requests(id),connection_id TEXT NOT NULL,credential_revision INTEGER NOT NULL)`),
+		st(`INSERT OR IGNORE INTO execution_request_credentials(execution_request_id,connection_id,credential_revision) SELECT id,connection_id,0 FROM execution_requests`),
+	)
+	return err
 }
 
 func (s *Store) ensureWASMHandlerSchema(ctx context.Context) error {
@@ -358,6 +377,7 @@ func (s *Store) CreateExecution(ctx context.Context, r ExecutionRequestRecord, e
 	ss := []persistence.Statement{
 		stm(`INSERT OR IGNORE INTO submission_claims(request_id,claim_id,created_at) VALUES(?,?,?)`, r.ID, claim, t),
 		stm(`INSERT INTO execution_requests(id,workspace_id,workflow_key,workflow_version,workflow_instance_id,task_id,node_key,handler_key,handler_version,operation_key,connection_id,actor_type,actor_id,subject_ref,input_ref,deadline_at,input,timeout_ns,max_attempts,retry_backoff_ns,retry_backoff_mode,correlation_id,causation_id,idempotency_key,created_at) SELECT ?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.WorkspaceID, r.WorkflowKey, int64(r.WorkflowVersion), r.WorkflowID, r.TaskID, r.NodeKey, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, r.ActorType, r.ActorID, encodeBlob(r.SubjectRef), encodeBlob(r.InputRef), ft(r.DeadlineAt), encodeBlob(r.Input), r.Timeout.Nanoseconds(), r.MaxAttempts, r.RetryBackoff.Nanoseconds(), r.RetryBackoffMode, r.CorrelationID, r.CausationID, r.IdempotencyKey, t, r.ID, claim),
+		stm(`INSERT INTO execution_request_credentials(execution_request_id,connection_id,credential_revision) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.ConnectionID, r.CredentialRevision, r.ID, claim),
 		stm(`INSERT INTO executions(id,execution_request_id,status,handler_key,handler_version,operation_key,connection_id,input,output,error_class,error_message,error_retryable,created_at,updated_at) SELECT ?,?,'queued',?,?,?,?,?,'','','',0,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, executionID, r.ID, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, encodeBlob(r.Input), t, t, r.ID, claim),
 		stm(`INSERT INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT ?,?,'execution.requested',0,'{}',? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, `event_`+executionID+`:requested`, executionID, t, r.ID, claim)}
 	if _, e = s.db.Mutate(ctx, "create execution "+r.ID+" "+claim, ss...); e != nil {
@@ -373,7 +393,7 @@ func (s *Store) CreateExecution(ctx context.Context, r ExecutionRequestRecord, e
 	return str(rows[0][0]) == claim, nil
 }
 func (s *Store) GetExecutionRequest(ctx context.Context, id string) (ExecutionRequestRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT id,workspace_id,workflow_key,workflow_version,workflow_instance_id,task_id,node_key,handler_key,handler_version,operation_key,connection_id,actor_type,actor_id,subject_ref,input_ref,deadline_at,input,timeout_ns,max_attempts,retry_backoff_ns,retry_backoff_mode,correlation_id,causation_id,idempotency_key FROM execution_requests WHERE id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT r.id,r.workspace_id,r.workflow_key,r.workflow_version,r.workflow_instance_id,r.task_id,r.node_key,r.handler_key,r.handler_version,r.operation_key,r.connection_id,r.actor_type,r.actor_id,r.subject_ref,r.input_ref,r.deadline_at,r.input,r.timeout_ns,r.max_attempts,r.retry_backoff_ns,r.retry_backoff_mode,r.correlation_id,r.causation_id,r.idempotency_key,COALESCE(c.credential_revision,0) FROM execution_requests r LEFT JOIN execution_request_credentials c ON c.execution_request_id=r.id WHERE r.id=?`, id)
 	if e != nil {
 		return ExecutionRequestRecord{}, e
 	}
@@ -381,7 +401,7 @@ func (s *Store) GetExecutionRequest(ctx context.Context, id string) (ExecutionRe
 		return ExecutionRequestRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	x := rows[0]
-	r := ExecutionRequestRecord{ID: str(x[0]), WorkspaceID: str(x[1]), WorkflowKey: str(x[2]), WorkflowVersion: uint64(i64(x[3])), WorkflowID: str(x[4]), TaskID: str(x[5]), NodeKey: str(x[6]), HandlerKey: str(x[7]), HandlerVersion: str(x[8]), OperationKey: str(x[9]), ConnectionID: str(x[10]), ActorType: str(x[11]), ActorID: str(x[12]), SubjectRef: blob(x[13]), InputRef: blob(x[14]), DeadlineAt: pt(str(x[15])), Input: blob(x[16]), Timeout: time.Duration(i64(x[17])), MaxAttempts: num(x[18]), RetryBackoff: time.Duration(i64(x[19])), RetryBackoffMode: str(x[20]), CorrelationID: str(x[21]), CausationID: str(x[22]), IdempotencyKey: str(x[23])}
+	r := ExecutionRequestRecord{ID: str(x[0]), WorkspaceID: str(x[1]), WorkflowKey: str(x[2]), WorkflowVersion: uint64(i64(x[3])), WorkflowID: str(x[4]), TaskID: str(x[5]), NodeKey: str(x[6]), HandlerKey: str(x[7]), HandlerVersion: str(x[8]), OperationKey: str(x[9]), ConnectionID: str(x[10]), ActorType: str(x[11]), ActorID: str(x[12]), SubjectRef: blob(x[13]), InputRef: blob(x[14]), DeadlineAt: pt(str(x[15])), Input: blob(x[16]), Timeout: time.Duration(i64(x[17])), MaxAttempts: num(x[18]), RetryBackoff: time.Duration(i64(x[19])), RetryBackoffMode: str(x[20]), CorrelationID: str(x[21]), CausationID: str(x[22]), IdempotencyKey: str(x[23]), CredentialRevision: i64(x[24])}
 	return r, nil
 }
 func (s *Store) FindExecutionRequestByIdempotency(ctx context.Context, ws, key string) (ExecutionRequestRecord, error) {
