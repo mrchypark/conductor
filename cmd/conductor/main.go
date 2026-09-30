@@ -1070,13 +1070,6 @@ func main() {
 			}
 		}
 	}()
-	if workerID := os.Getenv("CONDUCTOR_WORKER_ID"); workerID != "" {
-		go func() {
-			if err := service.RunWorker(workerCtx, workerID, 250*time.Millisecond, time.Minute); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("execution worker: %v", err)
-			}
-		}()
-	}
 	catalog, err := ampconnectors.LoadCatalog()
 	if err != nil {
 		log.Fatal(fmt.Errorf("load connector catalog: %w", err))
@@ -1099,6 +1092,9 @@ func main() {
 	if err := registry.Register(connectorHandler); err != nil {
 		log.Fatal(err)
 	}
+	if err := loadGoAuthyHandler(os.Getenv("CONDUCTOR_GOAUTHY_CONFIG"), os.Getenv("CONDUCTOR_SERVICE_TOKEN"), registry, nil, nil); err != nil {
+		log.Fatal(err)
+	}
 	for _, manifest := range registry.Manifests() {
 		if err := store.SaveHandlerManifest(ctx, manifest.Key, manifest.Version, manifest); err != nil {
 			log.Fatal(err)
@@ -1110,6 +1106,14 @@ func main() {
 				log.Fatal(err)
 			}
 		}
+	}
+	// Register configured handlers before claiming durable work after a restart.
+	if workerID := os.Getenv("CONDUCTOR_WORKER_ID"); workerID != "" {
+		go func() {
+			if err := service.RunWorker(workerCtx, workerID, 250*time.Millisecond, time.Minute); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("execution worker: %v", err)
+			}
+		}()
 	}
 	log.Printf("conductor listening on %s with %d connector providers", *addr, len(catalog.Names()))
 	srv := newServer(service, registry, catalog)
@@ -1130,6 +1134,7 @@ func rhizaConfig(dataDir string) (persistence.Config, error) {
 		BindAddr:             envOr("CONDUCTOR_RHIZA_BIND_ADDR", "127.0.0.1:0"),
 		PeerAddr:             envOr("CONDUCTOR_RHIZA_PEER_ADDR", "127.0.0.1:0"),
 		AdminToken:           os.Getenv("CONDUCTOR_RHIZA_ADMIN_TOKEN"),
+		PeerToken:            os.Getenv("CONDUCTOR_RHIZA_PEER_TOKEN"),
 		ObjStoreProvider:     os.Getenv("CONDUCTOR_RHIZA_S3_PROVIDER"),
 		ObjStoreEndpoint:     os.Getenv("CONDUCTOR_RHIZA_S3_ENDPOINT"),
 		ObjStoreBucket:       os.Getenv("CONDUCTOR_RHIZA_S3_BUCKET"),

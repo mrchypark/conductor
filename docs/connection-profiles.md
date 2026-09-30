@@ -7,7 +7,10 @@ use, not separate AI/SaaS profile types. An OIDC login token is not a provider
 credential. Conductor retains connector execution and its local credential path
 for compatibility and independent testing; there is no credential migration here.
 Shared databases, internal imports and simultaneous deployment are not required.
-The remote extension adapter awaits its explicit API and authorization contract.
+A bounded memory-only API-key delivery adapter and TLS fixtures are described in
+[API-key delivery](api-key-delivery.md). Operator-configured execution wiring is
+available through [GoAuthy executions](goauthy-execution.md). The public user
+authorization lifecycle remains unimplemented; the local credential path is unchanged.
 
 ## Current contract
 
@@ -54,7 +57,9 @@ remain unimplemented. The current generic AMP HTTP capability is not a
 fixed-operation destination policy. The target extension must validate user,
 consumer, profile, generation, consent and permitted destination/use; neither
 claimed identity nor a service token alone grants access. Its credential delivery
-mechanism is not yet agreed. Do not claim the tests establish these guarantees.
+contract supports registered API keys and OAuth access tokens. The adapters are
+wired to trusted-service executions with operator-approved bindings, not a
+public user-authorized API. Do not claim the tests establish these guarantees.
 
 The local transport checks current profile generation before sending, but this
 cannot recall an already transmitted credential or undo a provider side effect.

@@ -69,14 +69,15 @@ func TestThreeProcessRhizaHA(t *testing.T) {
 	peerAddrs := []string{freeUDPAddr(t), freeUDPAddr(t), freeUDPAddr(t)}
 	members := make([]rhiza.Member, 3)
 	for i := range members {
-		members[i] = rhiza.Member{ID: quepaxa.NodeID(fmt.Sprintf("n%d", i+1)), PeerURL: "quic://" + peerAddrs[i], Token: "ha-secret"}
+		id := fmt.Sprintf("n%d", i+1)
+		members[i] = rhiza.Member{ID: quepaxa.NodeID(id), PeerURL: "quic://" + peerAddrs[i], PublicKey: rhiza.PeerPublicKey("conductor-ha-e2e", id, "ha-peer-"+id)}
 	}
 	root := t.TempDir()
 	nodes := make([]*haNode, 3)
 	for i := range nodes {
 		nodes[i] = &haNode{config: haNodeConfig{
 			Rhiza: persistence.Config{
-				ClusterID: "conductor-ha-e2e", NodeID: fmt.Sprintf("n%d", i+1), DataDir: filepath.Join(root, fmt.Sprintf("n%d", i+1)), PeerAddr: peerAddrs[i], AdminToken: "ha-secret", Members: members,
+				ClusterID: "conductor-ha-e2e", NodeID: fmt.Sprintf("n%d", i+1), DataDir: filepath.Join(root, fmt.Sprintf("n%d", i+1)), PeerAddr: peerAddrs[i], AdminToken: "ha-secret", PeerToken: fmt.Sprintf("ha-peer-n%d", i+1), Members: members,
 				ObjStoreProvider: "s3", ObjStoreEndpoint: s3Endpoint, ObjStoreBucket: s3Bucket, ObjStoreAccessKey: s3AccessKey, ObjStoreSecretKey: s3SecretKey, ObjStoreRegion: "us-east-1", ObjStoreInsecure: true,
 			},
 			ControlAddr: freeTCPAddr(t), CallbackURL: callbackServer.URL,

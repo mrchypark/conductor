@@ -16,13 +16,27 @@ delivery (optional `CONDUCTOR_CALLBACK_TOKEN`). `CONDUCTOR_MASTER_KEY` (16/24/32
 bytes) enables encrypted connector connections; `COMPOS_BASE_URL` enables the
 built-in Compos connector boundary.
 
+`CONDUCTOR_GOAUTHY_CONFIG`와 `CONDUCTOR_SERVICE_TOKEN`을 설정하면 GoAuthy의
+승인된 API-key/OAuth 자격증명을 사용하는 `connector.goauthy.invoke@1`을 등록합니다.
+설정과 실행 예시는 [GoAuthy 실행 연동](docs/goauthy-execution.md)을 참고하세요.
+
 Rhiza HA는 각 프로세스에 고유한 `CONDUCTOR_RHIZA_NODE_ID`,
 `CONDUCTOR_RHIZA_PEER_ADDR`, data directory를 주고, 모든 프로세스에 동일한
 `CONDUCTOR_RHIZA_CLUSTER_ID`, `CONDUCTOR_RHIZA_MEMBERS` JSON과 shared S3 설정을
 사용합니다. `CONDUCTOR_RHIZA_MEMBERS`의 각 항목은 `node_id`, `peer_url`
-(`quic://host:port`), `token`을 포함합니다. S3 설정은 Rhiza의
+(`quic://host:port`), `public_key`(32바이트 Ed25519 공개키의 표준 base64)를 포함합니다.
+각 노드는 자신의 비밀값만 `CONDUCTOR_RHIZA_PEER_TOKEN`으로 전달합니다.
+공개키는 Rhiza의 `PeerPublicKey(clusterID, nodeID, peerToken)`으로 생성하며,
+이전 멤버별 `token` 필드는 더 이상 지원하지 않습니다. S3 설정은 Rhiza의
 `ObjStore*` 구성에 대응하며 multi-node 기동에는 명시적인 S3-compatible store가
 필수입니다.
+
+Rhiza `v0.18.0`으로 올릴 때 기존 `v0.12.0` 저장소를 그대로 열면 안 됩니다.
+SQL 실행 정책과 WAL 형식이 변경되어 standalone/HA 모두 새 데이터 디렉터리와
+별도 클러스터·object-store namespace에 애플리케이션 데이터를 논리적으로 이관해야 합니다.
+기존 바이너리와 저장소를 보존하고, 처리 중 실행·callback 결과를 정리한 뒤 이관하세요.
+구버전 checkpoint/WAL 복사나 혼합 버전 HA 롤링 업그레이드는 지원되지 않습니다.
+자세한 절차는 [Rhiza 마이그레이션 문서](https://github.com/mrchypark/rhiza/blob/v0.18.0/docs/sql-execution-policy.md)를 따릅니다.
 
 External workers use the same lease protocol through
 `POST /v1/worker/tasks:poll`, `POST /v1/worker/tasks:heartbeat`,

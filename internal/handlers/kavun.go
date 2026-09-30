@@ -27,7 +27,7 @@ const (
 	maxKavunFrames      = 4096
 	maxKavunStack       = 65536
 	defaultKavunTimeout = 30
-	kavunRuntimeABI     = "kavun-v0.6.4/compiler-o3/input-output"
+	kavunRuntimeABI     = "kavun-v0.7.1/compiler-o3/input-output"
 )
 
 // KavunSpec describes a versioned, sandboxed script handler. The script must
@@ -252,7 +252,7 @@ func validateKavunBytecode(bytecode *vm.Bytecode, modules []string) error {
 func (p *kavunProgram) run(ctx context.Context, input core.Value, maxFrames, maxStack int) (core.Value, error) {
 	globals := make([]core.Value, len(p.globals))
 	for i, value := range p.globals {
-		cloned, err := value.Clone()
+		cloned, err := value.Copy(true)
 		if err != nil {
 			return core.Undefined, err
 		}

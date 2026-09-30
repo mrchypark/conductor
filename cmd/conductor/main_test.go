@@ -18,6 +18,7 @@ import (
 	"github.com/mrchypark/conductor/internal/executions"
 	"github.com/mrchypark/conductor/internal/handlers"
 	"github.com/mrchypark/conductor/internal/storage"
+	"github.com/mrchypark/rhiza"
 )
 
 func TestExecutionHTTPVerticalSlice(t *testing.T) {
@@ -568,7 +569,13 @@ func TestRhizaConfigLoadsHAAndS3Environment(t *testing.T) {
 	t.Setenv("CONDUCTOR_RHIZA_CLUSTER_ID", "cluster-ha")
 	t.Setenv("CONDUCTOR_RHIZA_NODE_ID", "n2")
 	t.Setenv("CONDUCTOR_RHIZA_PEER_ADDR", "127.0.0.1:9002")
-	t.Setenv("CONDUCTOR_RHIZA_MEMBERS", `[{"node_id":"n1","peer_url":"quic://127.0.0.1:9001","token":"secret"},{"node_id":"n2","peer_url":"quic://127.0.0.1:9002","token":"secret"},{"node_id":"n3","peer_url":"quic://127.0.0.1:9003","token":"secret"}]`)
+	t.Setenv("CONDUCTOR_RHIZA_PEER_TOKEN", "peer-n2")
+	members := []rhiza.Member{{ID: "n1", PeerURL: "quic://127.0.0.1:9001", PublicKey: rhiza.PeerPublicKey("cluster-ha", "n1", "peer-n1")}, {ID: "n2", PeerURL: "quic://127.0.0.1:9002", PublicKey: rhiza.PeerPublicKey("cluster-ha", "n2", "peer-n2")}, {ID: "n3", PeerURL: "quic://127.0.0.1:9003", PublicKey: rhiza.PeerPublicKey("cluster-ha", "n3", "peer-n3")}}
+	membersJSON, err := json.Marshal(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CONDUCTOR_RHIZA_MEMBERS", string(membersJSON))
 	t.Setenv("CONDUCTOR_RHIZA_S3_ENDPOINT", "127.0.0.1:9000")
 	t.Setenv("CONDUCTOR_RHIZA_S3_BUCKET", "rhiza")
 	t.Setenv("CONDUCTOR_RHIZA_S3_INSECURE", "true")
@@ -578,5 +585,8 @@ func TestRhizaConfigLoadsHAAndS3Environment(t *testing.T) {
 	}
 	if config.ClusterID != "cluster-ha" || config.NodeID != "n2" || len(config.Members) != 3 || config.ObjStoreProvider != "s3" || config.ObjStoreBucket != "rhiza" || !config.ObjStoreInsecure {
 		t.Fatalf("unexpected Rhiza config: %+v", config)
+	}
+	if config.PeerToken != "peer-n2" || config.Members[1].PublicKey != rhiza.PeerPublicKey(config.ClusterID, config.NodeID, config.PeerToken) {
+		t.Fatal("Rhiza peer identity configuration mismatch")
 	}
 }
