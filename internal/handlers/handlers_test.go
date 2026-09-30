@@ -59,6 +59,17 @@ func TestKavunHandlerCompilesAndRunsPerRequest(t *testing.T) {
 	if err != nil || string(cachedResult.Output) != `{"sum":15}` {
 		t.Fatalf("cached handler failed: %s err=%v", cachedResult.Output, err)
 	}
+	previousRuntime, err := NewKavunHandler(KavunSpec{
+		Manifest: Manifest{Key: "transform.kavun", Version: "1"}, Source: []byte(`output = {"sum": input.a + input.b}`),
+		SourceHash: hashBytes([]byte(`output = {"sum": input.a + input.b}`)), Bytecode: bytecode, BytecodeHash: bytecodeHash,
+		BytecodeSourceHash: hashBytes([]byte(`output = {"sum": input.a + input.b}`)), RuntimeABI: "kavun-v0.6.4/compiler-o3/input-output",
+	})
+	if err != nil || !previousRuntime.BytecodeNeedsRefresh() {
+		t.Fatalf("old runtime cache was not recompiled: %v", err)
+	}
+	if result, err := previousRuntime.Execute(context.Background(), Request{Input: json.RawMessage(`{"a":2,"b":3}`)}); err != nil || string(result.Output) != `{"sum":5}` {
+		t.Fatalf("recompiled handler failed: %s err=%v", result.Output, err)
+	}
 	corrupt := []byte("not kavun bytecode")
 	corruptHash := hashBytes(corrupt)
 	refreshed, err := NewKavunHandler(KavunSpec{
