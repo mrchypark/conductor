@@ -57,7 +57,7 @@ func TestConnectorRejectsInputOperationThatDiffersFromPinnedOperation(t *testing
 	}
 	_, err = handler.Execute(context.Background(), handlers.Request{
 		OperationKey: "records.get",
-		Input:        json.RawMessage(`{"provider":"compos","operation":"records.delete","object_name":"orders","record_id":"o1"}`),
+		Input:        json.RawMessage(`{"provider":"business","operation":"records.delete","object_name":"orders","record_id":"o1"}`),
 	})
 	var failure *handlers.Error
 	if !errors.As(err, &failure) || failure.Class != "invalid_input" {
@@ -94,7 +94,7 @@ func TestGowidConnectorCallsV2API(t *testing.T) {
 	}
 }
 
-func TestComposConnectorProviderErrorsUseExecutionRetryPolicy(t *testing.T) {
+func TestBusinessConnectorProviderErrorsUseExecutionRetryPolicy(t *testing.T) {
 	tests := []struct {
 		name           string
 		operation      string
@@ -105,8 +105,8 @@ func TestComposConnectorProviderErrorsUseExecutionRetryPolicy(t *testing.T) {
 		wantErrorClass string
 	}{
 		{name: "server error retries", firstStatus: http.StatusInternalServerError, secondStatus: http.StatusOK, wantCalls: 2, wantStatus: "succeeded"},
-		{name: "client error does not retry", firstStatus: http.StatusBadRequest, secondStatus: http.StatusOK, wantCalls: 1, wantStatus: "failed", wantErrorClass: "compos_connector_error"},
-		{name: "unknown operation is terminal", operation: "not_registered", firstStatus: http.StatusNotFound, secondStatus: http.StatusOK, wantCalls: 1, wantStatus: "failed", wantErrorClass: "compos_connector_error"},
+		{name: "client error does not retry", firstStatus: http.StatusBadRequest, secondStatus: http.StatusOK, wantCalls: 1, wantStatus: "failed", wantErrorClass: "business_connector_error"},
+		{name: "unknown operation is terminal", operation: "not_registered", firstStatus: http.StatusNotFound, secondStatus: http.StatusOK, wantCalls: 1, wantStatus: "failed", wantErrorClass: "business_connector_error"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,7 +127,7 @@ func TestComposConnectorProviderErrorsUseExecutionRetryPolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			catalog.SetComposClient(&ComposClient{BaseURL: provider.URL, Client: provider.Client()})
+			catalog.SetBusinessClient(&BusinessClient{BaseURL: provider.URL, Client: provider.Client()})
 			handler, err := catalog.NewInvokeHandlerScoped("1", nil, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -149,7 +149,7 @@ func TestComposConnectorProviderErrorsUseExecutionRetryPolicy(t *testing.T) {
 			if operation == "" {
 				operation = "records.get"
 			}
-			input, err := json.Marshal(map[string]any{"provider": "compos", "operation": operation, "object_name": "orders", "record_id": "o1"})
+			input, err := json.Marshal(map[string]any{"provider": "business", "operation": operation, "object_name": "orders", "record_id": "o1"})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -170,7 +170,7 @@ func (r *Registry) Manifests() []Manifest {
 
 // ValidateJSON applies the small, deterministic JSON-Schema subset needed at
 // the handler boundary: type, required, properties, additionalProperties,
-// items, and enum. Complex business schemas remain owned by Compos.
+// items, and enum. Complex business schemas remain owned by the business service.
 func ValidateJSON(schema json.RawMessage, value json.RawMessage) error {
 	if len(schema) == 0 || string(schema) == "null" {
 		return nil

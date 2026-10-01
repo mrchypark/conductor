@@ -13,8 +13,9 @@ go run ./cmd/conductor -db ./conductor-data
 `Prefer: respond-async` stores a queued request; set `CONDUCTOR_WORKER_ID` to
 run the local lease worker. `CONDUCTOR_CALLBACK_URL` enables durable callback
 delivery (optional `CONDUCTOR_CALLBACK_TOKEN`). `CONDUCTOR_MASTER_KEY` (16/24/32
-bytes) enables encrypted connector connections; `COMPOS_BASE_URL` enables the
-built-in Compos connector boundary.
+bytes) enables encrypted connector connections; `BUSINESS_SERVICE_BASE_URL`은
+내장 business connector를 활성화합니다. 대상 API가 Bearer 인증을 요구하면
+`BUSINESS_SERVICE_TOKEN`을 설정합니다.
 
 `CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG`와 `CONDUCTOR_SERVICE_TOKEN`을 설정하면 외부 SaaS 계정
 프로바이더가 제공하는 승인된 API-key/OAuth 자격증명을 사용하는
@@ -53,8 +54,8 @@ Already-installed OAuth apps may register an access token through the same encry
 boundary with `oauth_access_token`; responses never return the token.
 실행 취소는 `POST /v1/executions/{execution_id}/cancel`입니다.
 runtime event 조회는 `GET /v1/executions/{execution_id}/events`입니다.
-Compos durable-engine outbox는 `POST /v1/events`의 `{"events":[...]}` envelope를
-사용할 수 있습니다. 각 event의 `data._compos`에는 `workspace_id`와
+workflow service outbox는 `POST /v1/events`의 `{"events":[...]}` envelope를
+사용할 수 있습니다. 각 event의 `data._execution`에는 `workspace_id`와
 `execution_request_id`가 있어야 하며, 해당 event는 연결된 실행 요청으로만 변환됩니다.
 
 동적 함수는 Kavun 소스로 `POST /v1/handlers`에 등록할 수 있습니다. 요청은
@@ -73,10 +74,17 @@ registry의 `sha256` digest로 고정하고, Rhiza에는 artifact identity와 ma
 instance로 수행됩니다. 빌드·push·등록 형식과 장애/보안 경계는
 [WASM function deployment](docs/spec/2026-09-04-wasm-function-deployment.md)를 참고하세요.
 
-현재 이 전환 범위는 Compos가 위임한 함수/커넥터 실행입니다. workflow graph, task
-completion, submission 같은 업무 상태는 Compos가 계속 소유합니다.
+현재 이 전환 범위는 workflow service가 위임한 함수/커넥터 실행입니다. workflow graph,
+task completion, submission 같은 업무 상태는 workflow service가 계속 소유합니다.
+업무 레코드·schema·mutation API는 별도 business service가 소유하며, 두 역할은 하나의
+애플리케이션 또는 분리된 애플리케이션으로 배포할 수 있습니다.
 
-설계 경계는 [Compos–Conductor 전체 설계 개요](docs/spec/2026-08-29-compos-conductor-system-overview.md),
+이전 서비스별 config/provider/operation prefix와 event metadata 이름에는 호환 별칭이
+없습니다. deployment client와 outbox producer를 현재 이름으로 함께 갱신하고, connector
+실행은 `connector.invoke@2`를 명시적으로 고정하세요. 입력 schema 또는 pinned operation이
+바뀌면 새 immutable handler version을 등록하고, 진행 중인 이전 실행은 필요에 따라 drain합니다.
+
+설계 경계는 [workflow–execution 전체 설계 개요](docs/spec/2026-08-29-workflow-execution-system-overview.md),
 상세 계약은 [Conductor 서비스 상세 설계](docs/spec/2026-08-29-conductor-service-design.md)를 참고하세요.
 
 ## Go checks

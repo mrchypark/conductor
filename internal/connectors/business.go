@@ -12,24 +12,24 @@ import (
 	"strings"
 )
 
-// ComposClient calls Compos' connector boundary over HTTPS; it never shares
-// the Compos database with Conductor.
-type ComposClient struct {
+// BusinessClient calls a business service's typed connector API over HTTPS;
+// it never shares the service's database with Conductor.
+type BusinessClient struct {
 	BaseURL, Token string
 	Client         *http.Client
 }
 
 type HTTPError struct{ StatusCode int }
 
-func (e *HTTPError) Error() string { return fmt.Sprintf("compos returned HTTP %d", e.StatusCode) }
+func (e *HTTPError) Error() string { return fmt.Sprintf("business returned HTTP %d", e.StatusCode) }
 
-func (c *ComposClient) Invoke(ctx context.Context, operation string, input any, requestContext map[string]string) (json.RawMessage, error) {
+func (c *BusinessClient) Invoke(ctx context.Context, operation string, input any, requestContext map[string]string) (json.RawMessage, error) {
 	if c == nil || c.BaseURL == "" {
-		return nil, errors.New("compos client is not configured")
+		return nil, errors.New("business client is not configured")
 	}
 	operation = strings.Trim(operation, "/")
 	if operation == "" || strings.ContainsAny(operation, "/?#%") {
-		return nil, errors.New("invalid compos operation")
+		return nil, errors.New("invalid business operation")
 	}
 	path := "/v1/connector/operations/" + operation + ":invoke"
 	method := http.MethodPost
@@ -44,7 +44,7 @@ func (c *ComposClient) Invoke(ctx context.Context, operation string, input any, 
 		}
 		recordID, _ := m["record_id"].(string)
 		if object != "" {
-			o := strings.TrimPrefix(operation, "compos.")
+			o := strings.TrimPrefix(operation, "business.")
 			base := "/v1/connector/objects/" + url.PathEscape(object)
 			switch o {
 			case "objects.get_schema":
@@ -67,7 +67,7 @@ func (c *ComposClient) Invoke(ctx context.Context, operation string, input any, 
 				path = "/v1/connector/operations/invoke"
 			}
 		}
-		if strings.TrimPrefix(operation, "compos.") == "operations.invoke" {
+		if strings.TrimPrefix(operation, "business.") == "operations.invoke" {
 			path = "/v1/connector/operations/invoke"
 		}
 	}
@@ -111,7 +111,7 @@ func (c *ComposClient) Invoke(ctx context.Context, operation string, input any, 
 		return json.RawMessage("null"), nil
 	}
 	if !json.Valid(out) {
-		return nil, errors.New("compos response is not valid JSON")
+		return nil, errors.New("business response is not valid JSON")
 	}
 	return json.RawMessage(out), nil
 }

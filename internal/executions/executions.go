@@ -81,7 +81,7 @@ type ExecutionRequest struct {
 }
 
 // UnmarshalJSON keeps the internal names stable while accepting the canonical
-// Compos wire aliases (handler, operation, timeout_seconds, retry_policy).
+// execution wire aliases (handler, operation, timeout_seconds, retry_policy).
 func (r *ExecutionRequest) UnmarshalJSON(data []byte) error {
 	type alias ExecutionRequest
 	var wire struct {

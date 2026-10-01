@@ -37,7 +37,7 @@ func (c *Catalog) NewInvokeHandlerScoped(version string, client *http.Client, re
 		return nil, errors.New("connector catalog is required")
 	}
 	if version == "" {
-		version = "1"
+		version = "2"
 	}
 	return handlers.NewFuncHandler(handlers.Manifest{
 		Key: "connector.invoke", Version: version, DefaultTimeout: 30, Idempotency: "provider-defined", ResourceClass: "network",
@@ -97,20 +97,20 @@ func (c *Catalog) invokeScoped(ctx context.Context, request handlers.Request, cl
 		}
 		operation = parts[len(parts)-1]
 	}
-	if strings.EqualFold(input.Provider, "compos") {
-		composOperation := strings.TrimPrefix(input.Operation, "compos.")
+	if strings.EqualFold(input.Provider, "business") {
+		businessOperation := strings.TrimPrefix(input.Operation, "business.")
 		requestContext := map[string]string{"workspace_id": request.WorkspaceID, "workflow_key": request.WorkflowKey, "workflow_instance_id": request.WorkflowInstanceID, "task_id": request.TaskID, "node_key": request.NodeKey, "execution_request_id": request.ExecutionRequestID, "execution_id": request.ExecutionID, "attempt_id": request.LeaseID, "attempt_number": fmt.Sprintf("%d", request.AttemptNumber), "idempotency_key": request.IdempotencyKey, "actor_type": request.ActorType, "actor_id": request.ActorID}
 		if request.WorkflowVersion > 0 {
 			requestContext["workflow_version"] = fmt.Sprintf("%d", request.WorkflowVersion)
 		}
-		output, err := c.compos.Invoke(ctx, composOperation, input, requestContext)
+		output, err := c.business.Invoke(ctx, businessOperation, input, requestContext)
 		if err != nil {
 			retryable := false
 			var httpErr *HTTPError
 			if errors.As(err, &httpErr) {
 				retryable = httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
 			}
-			return handlers.Result{}, &handlers.Error{Class: "compos_connector_error", Message: err.Error(), Retryable: retryable}
+			return handlers.Result{}, &handlers.Error{Class: "business_connector_error", Message: err.Error(), Retryable: retryable}
 		}
 		return handlers.Result{Output: output}, nil
 	}

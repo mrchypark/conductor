@@ -120,7 +120,7 @@ func TestDuplicateSubmitWaitsForTerminalResult(t *testing.T) {
 	}
 }
 
-func TestExecutionRequestAcceptsCanonicalComposWire(t *testing.T) {
+func TestExecutionRequestAcceptsCanonicalExecutionWire(t *testing.T) {
 	var request ExecutionRequest
 	if err := json.Unmarshal([]byte(`{"execution_request_id":"er-wire","handler":"example.run","handler_version":"1","operation":"read","timeout_seconds":2.5,"retry_policy":{"max_attempts":3,"backoff":"exponential"},"subject_ref":{"type":"order","id":"o1"},"input_ref":{"value":1},"deadline_at":"2026-08-30T00:00:00Z"}`), &request); err != nil {
 		t.Fatal(err)

@@ -23,7 +23,7 @@ configured workspace, connection, local revision, and allowed operation.
 
 Set `CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG` to an operator-controlled JSON file and configure
 `CONDUCTOR_SERVICE_TOKEN`. Startup fails if the latter is absent or the config is
-invalid. The existing local `connector.invoke@1` remains independent. There is
+invalid. The existing local `connector.invoke@2` remains independent. There is
 no fallback from a rejected credential-provider grant to local credentials.
 
 Example OAuth binding (replace all sample values with reviewed consent metadata):

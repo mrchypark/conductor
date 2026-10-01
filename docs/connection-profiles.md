@@ -47,10 +47,11 @@ authorization. Do not expose this path as a multi-user execution API.
 ## Integration work remaining
 
 Account identity must use a verified issuer and subject, with a Conductor-specific
-audience and required API scope. Compos owns workspace membership; Conductor owns
-execution authorization, and the external credential provider owns remote profile
-ownership, consent and permitted use. `actor`, `_compos`, `subject_ref` and `X-Beesuh-*`
-metadata alone grant no authority. Cross-client token exchange is not assumed.
+audience and required API scope. The workflow service owns workspace membership;
+Conductor owns execution authorization, and the external credential provider owns
+remote profile ownership, consent and permitted use. `actor`, `_execution`,
+`subject_ref` and client-supplied headers alone grant no authority. Cross-client
+token exchange is not assumed.
 
 User/organization profile ownership, recipient-enforced execution permissions,
 required provider-scope checks and real provider refresh-continuity validation
@@ -80,25 +81,27 @@ fixed GitHub origin with that fixture; it does not contact GitHub.
 These tests require neither another app nor an IdP. Live SaaS, optional real IdP,
 three-node HA and full profile lifecycle verification are separate gates.
 
-## Beesuh execution wire pilot (2026-09-07 KST)
+## Agent client execution wire pilot (2026-09-07 KST)
 
-Beesuh `main@8606a43` plus its local adapter/runtime changes ran
+An agent client `main@8606a43` plus its local adapter/runtime changes ran
 `TestConductorLiveE2E` against a real Conductor process built from
 `main@909b200` plus the in-progress local changes. Both ran locally on macOS
 with Go 1.27 and standalone Rhiza. The service token was supplied through a
 private file and not printed. No IdP, user delegation or SaaS credential was used.
 
-The Beesuh native mock-model/tool emitted an allowlisted `payload.echo@1` request,
+The agent client's native mock-model/tool emitted an allowlisted `payload.echo@1` request,
 read the returned execution ID through `/v1/executions/{id}`, and observed
 `succeeded` with the expected echo result. HTTP replay retained the execution ID;
-native replay did not dispatch the model again. Beesuh separately tested rejection
-of model-supplied `_compos` and `subject_ref` without external effects.
+native replay did not dispatch the model again. The client separately tested rejection
+of model-supplied service-specific execution metadata and `subject_ref` without
+external effects. This is historical evidence for the wire at that time, not a
+test of the current generic metadata name.
 
 The real Conductor worker delivered one terminal callback to a local receiver.
 Its handler identity, request/execution IDs, workspace and result matched.
 Replaying the identical callback directly to that fixture receiver returned 204
 and left one unique record. This is receiver-fixture deduplication, not a test
-of the real Compos receiver or a forced Conductor transport retry. The disposable
+of a real workflow service receiver or a forced Conductor transport retry. The disposable
 processes were stopped. Shared Docker services were not restarted.
 
 The executable was built during development, so this pilot verifies the unchanged

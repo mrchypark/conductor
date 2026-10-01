@@ -109,7 +109,7 @@ public execution wiring, live SaaS and HA acceptance are not established here.
 
 Local validation (2026-09-07): adapter tests including `-race`, `go vet ./...`,
 and the final `go test -count=1 ./...` passed. An earlier full run failed the
-existing Compos callback-count test; three isolated reruns and the final full run
+existing workflow callback-count test; three isolated reruns and the final full run
 passed without changing that code.
 
 Real issuer bridge validation (2026-09-07): the credential provider's disposable fixture

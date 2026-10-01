@@ -93,7 +93,7 @@ func TestExecutionHTTPRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
-func TestComposEventEnvelopeQueuesLinkedExecution(t *testing.T) {
+func TestWorkflowEventEnvelopeQueuesLinkedExecution(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestComposEventEnvelopeQueuesLinkedExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := newServer(service, registry, nil)
-	body := `{"events":[{"id":"evt-1","name":"demo.run","idempotency_key":"execution-dispatch:er-event","data":{"hello":"world","subject_ref":{"type":"task","id":"task-1"},"_compos":{"workspace_id":"ws-1","execution_request_id":"er-event","task_id":"task-1"}}}]}`
+	body := `{"events":[{"id":"evt-1","name":"demo.run","idempotency_key":"execution-dispatch:er-event","data":{"hello":"world","subject_ref":{"type":"task","id":"task-1"},"_execution":{"workspace_id":"ws-1","execution_request_id":"er-event","task_id":"task-1"}}}]}`
 	post := func() map[string]any {
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(body)))
@@ -142,11 +142,11 @@ func TestComposEventEnvelopeQueuesLinkedExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(request.Input) != `{"hello":"world"}` || string(request.SubjectRef) != `{"type":"task","id":"task-1"}` {
-		t.Fatalf("reserved Compos context leaked into request: input=%s subject=%s", request.Input, request.SubjectRef)
+		t.Fatalf("reserved Workflow context leaked into request: input=%s subject=%s", request.Input, request.SubjectRef)
 	}
 }
 
-func TestComposEventEnvelopeRequiresExecutionLinkage(t *testing.T) {
+func TestWorkflowEventEnvelopeRequiresExecutionLinkage(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +163,20 @@ func TestComposEventEnvelopeRequiresExecutionLinkage(t *testing.T) {
 	}
 }
 
-func TestComposFunctionBindingNativeAndConnectorShareExecutionContract(t *testing.T) {
+func TestEventExecutionContextValidation(t *testing.T) {
+	for _, data := range []string{
+		`{"_execution":[]}`,
+		`{"_execution":{"workspace_id":"ws","execution_request_id":"er","timeout_seconds":-1}}`,
+		`{"_execution":{"workspace_id":"ws","execution_request_id":"er","deadline_at":"invalid"}}`,
+	} {
+		_, err := executionRequestFromEvent(eventRequest{Name: "example.run", Data: json.RawMessage(data)})
+		if err == nil || !strings.Contains(err.Error(), "data._execution") {
+			t.Fatalf("invalid execution context accepted: data=%s err=%v", data, err)
+		}
+	}
+}
+
+func TestWorkflowFunctionBindingNativeAndConnectorShareExecutionContract(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
 		t.Fatal(err)
@@ -228,8 +241,8 @@ func TestComposFunctionBindingNativeAndConnectorShareExecutionContract(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	catalog.SetComposClient(&ampconnectors.ComposClient{BaseURL: connectorAPI.URL, Client: connectorAPI.Client()})
-	connectorHandler, err := catalog.NewInvokeHandlerScoped("1", nil, nil)
+	catalog.SetBusinessClient(&ampconnectors.BusinessClient{BaseURL: connectorAPI.URL, Client: connectorAPI.Client()})
+	connectorHandler, err := catalog.NewInvokeHandlerScoped("2", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,15 +258,19 @@ func TestComposFunctionBindingNativeAndConnectorShareExecutionContract(t *testin
 		recorder := httptest.NewRecorder()
 		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(body)))
 		if recorder.Code != http.StatusAccepted {
-			t.Fatalf("canonical Compos event was not accepted: status=%d body=%s", recorder.Code, recorder.Body.String())
+			t.Fatalf("canonical Workflow event was not accepted: status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
 		execution, err := service.Get(context.Background(), "exec_"+requestID)
-		if err != nil || execution.Status != "queued" || execution.HandlerVersion != "1" {
+		version := "1"
+		if requestID == "er-connector" {
+			version = "2"
+		}
+		if err != nil || execution.Status != "queued" || execution.HandlerVersion != version {
 			t.Fatalf("request was not queued with pinned handler version: execution=%+v err=%v", execution, err)
 		}
 	}
-	submitEvent(`{"events":[{"id":"evt-native","name":"native.calculate","idempotency_key":"execution:er-native","data":{"value":2,"subject_ref":{"type":"task","id":"task-er-native"},"_compos":{"workspace_id":"ws-contract","execution_request_id":"er-native","workflow_key":"wf-contract","workflow_version":3,"workflow_instance_id":"wi-contract","task_id":"task-er-native","node_key":"node-er-native","handler_key":"native.calculate","handler_version":"1","operation_key":"calculate","actor":{"type":"user","id":"user-1"}}}}]}`, "er-native")
-	submitEvent(`{"events":[{"id":"evt-connector","name":"connector.invoke","idempotency_key":"execution:er-connector","data":{"provider":"compos","operation":"records.get","object_name":"orders","record_id":"o1","_compos":{"workspace_id":"ws-contract","execution_request_id":"er-connector","workflow_key":"wf-contract","workflow_version":3,"workflow_instance_id":"wi-contract","task_id":"task-er-connector","node_key":"node-er-connector","handler_key":"connector.invoke","handler_version":"1","operation_key":"records.get","actor":{"type":"user","id":"user-1"}}}}]}`, "er-connector")
+	submitEvent(`{"events":[{"id":"evt-native","name":"native.calculate","idempotency_key":"execution:er-native","data":{"value":2,"subject_ref":{"type":"task","id":"task-er-native"},"_execution":{"workspace_id":"ws-contract","execution_request_id":"er-native","workflow_key":"wf-contract","workflow_version":3,"workflow_instance_id":"wi-contract","task_id":"task-er-native","node_key":"node-er-native","handler_key":"native.calculate","handler_version":"1","operation_key":"calculate","actor":{"type":"user","id":"user-1"}}}}]}`, "er-native")
+	submitEvent(`{"events":[{"id":"evt-connector","name":"connector.invoke","idempotency_key":"execution:er-connector","data":{"provider":"business","operation":"business.records.get","object_name":"orders","record_id":"o1","_execution":{"workspace_id":"ws-contract","execution_request_id":"er-connector","workflow_key":"wf-contract","workflow_version":3,"workflow_instance_id":"wi-contract","task_id":"task-er-connector","node_key":"node-er-connector","handler_key":"connector.invoke","handler_version":"2","operation_key":"business.records.get","actor":{"type":"user","id":"user-1"}}}}]}`, "er-connector")
 
 	workerID := "contract-worker"
 	claims := make(map[string]executions.Claim, 2)

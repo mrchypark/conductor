@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestComposClientMapsTypedRecordOperation(t *testing.T) {
+func TestBusinessClientMapsTypedRecordOperation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/connector/objects/orders/records/o1" || r.Method != http.MethodGet {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -19,7 +19,7 @@ func TestComposClientMapsTypedRecordOperation(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"o1"}`))
 	}))
 	defer server.Close()
-	c := &ComposClient{BaseURL: server.URL, Token: "token", Client: server.Client()}
+	c := &BusinessClient{BaseURL: server.URL, Token: "token", Client: server.Client()}
 	out, err := c.Invoke(context.Background(), "records.get", map[string]any{"object_name": "orders", "record_id": "o1"}, map[string]string{"workspace_id": "w1"})
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func TestComposClientMapsTypedRecordOperation(t *testing.T) {
 	}
 }
 
-func TestComposClientMapsOperationsInvokeAndObjectKey(t *testing.T) {
+func TestBusinessClientMapsOperationsInvokeAndObjectKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/connector/operations/invoke" || r.Method != http.MethodPost {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -38,8 +38,8 @@ func TestComposClientMapsOperationsInvokeAndObjectKey(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
-	c := &ComposClient{BaseURL: server.URL, Client: server.Client()}
-	out, err := c.Invoke(context.Background(), "compos.operations.invoke", map[string]any{"object_key": "orders"}, nil)
+	c := &BusinessClient{BaseURL: server.URL, Client: server.Client()}
+	out, err := c.Invoke(context.Background(), "business.operations.invoke", map[string]any{"object_key": "orders"}, nil)
 	if err != nil || string(out) != `{"ok":true}` {
 		t.Fatalf("unexpected output=%s err=%v", out, err)
 	}

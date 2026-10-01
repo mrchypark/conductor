@@ -117,8 +117,8 @@ type handlerRegisterRequest struct {
 	ABI            string            `json:"abi,omitempty"`
 }
 
-// eventBatch is the wire envelope emitted by Compos' durable-engine outbox.
-// It is intentionally an execution-only adapter: events without the Compos
+// eventBatch is the wire envelope emitted by a workflow service durable outbox.
+// It is intentionally an execution-only adapter: events without the required
 // execution linkage are rejected instead of being interpreted as workflows.
 type eventBatch struct {
 	Events []eventRequest `json:"events"`
@@ -131,7 +131,7 @@ type eventRequest struct {
 	Data           json.RawMessage `json:"data"`
 }
 
-type eventComposContext struct {
+type eventExecutionContext struct {
 	CredentialRevision int64
 	WorkspaceID        string
 	ExecutionRequestID string
@@ -204,18 +204,18 @@ func executionRequestFromEvent(event eventRequest) (executions.ExecutionRequest,
 	if err := json.Unmarshal(event.Data, &payload); err != nil {
 		return executions.ExecutionRequest{}, errors.New("data must be a JSON object")
 	}
-	var compos map[string]json.RawMessage
-	if raw := payload["_compos"]; len(raw) > 0 {
-		if err := json.Unmarshal(raw, &compos); err != nil {
-			return executions.ExecutionRequest{}, errors.New("data._compos must be a JSON object")
+	var executionContext map[string]json.RawMessage
+	if raw := payload["_execution"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &executionContext); err != nil {
+			return executions.ExecutionRequest{}, errors.New("data._execution must be a JSON object")
 		}
 	}
-	ctx := eventComposContext{}
-	if err := unmarshalEventContext(compos, &ctx); err != nil {
+	ctx := eventExecutionContext{}
+	if err := unmarshalEventContext(executionContext, &ctx); err != nil {
 		return executions.ExecutionRequest{}, err
 	}
 	if ctx.ExecutionRequestID == "" || ctx.WorkspaceID == "" {
-		return executions.ExecutionRequest{}, errors.New("data._compos.workspace_id and execution_request_id are required")
+		return executions.ExecutionRequest{}, errors.New("data._execution.workspace_id and execution_request_id are required")
 	}
 	if ctx.HandlerKey == "" {
 		ctx.HandlerKey = event.Name
@@ -231,7 +231,7 @@ func executionRequestFromEvent(event eventRequest) (executions.ExecutionRequest,
 	}
 	input := make(map[string]json.RawMessage, len(payload))
 	for key, value := range payload {
-		if key != "_compos" && key != "subject_ref" {
+		if key != "_execution" && key != "subject_ref" {
 			input[key] = value
 		}
 	}
@@ -255,14 +255,14 @@ func executionRequestFromEvent(event eventRequest) (executions.ExecutionRequest,
 	if ctx.DeadlineAt != "" {
 		deadline, err := time.Parse(time.RFC3339Nano, ctx.DeadlineAt)
 		if err != nil {
-			return executions.ExecutionRequest{}, errors.New("data._compos.deadline_at must be RFC3339")
+			return executions.ExecutionRequest{}, errors.New("data._execution.deadline_at must be RFC3339")
 		}
 		request.DeadlineAt = deadline
 	}
 	return request, nil
 }
 
-func unmarshalEventContext(values map[string]json.RawMessage, target *eventComposContext) error {
+func unmarshalEventContext(values map[string]json.RawMessage, target *eventExecutionContext) error {
 	if len(values) == 0 {
 		return nil
 	}
@@ -291,7 +291,7 @@ func unmarshalEventContext(values map[string]json.RawMessage, target *eventCompo
 		RetryPolicy        executions.RetryPolicy `json:"retry_policy"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
-		return fmt.Errorf("invalid data._compos: %w", err)
+		return fmt.Errorf("invalid data._execution: %w", err)
 	}
 	target.WorkspaceID, target.ExecutionRequestID = wire.WorkspaceID, wire.ExecutionRequestID
 	target.CredentialRevision = wire.CredentialRevision
@@ -307,7 +307,7 @@ func unmarshalEventContext(values map[string]json.RawMessage, target *eventCompo
 	target.WorkflowInstanceID, target.TaskID, target.NodeKey = wire.WorkflowInstanceID, wire.TaskID, wire.NodeKey
 	target.Actor, target.DeadlineAt, target.TimeoutSeconds, target.RetryPolicy = wire.Actor, wire.DeadlineAt, wire.TimeoutSeconds, wire.RetryPolicy
 	if target.TimeoutSeconds < 0 || target.TimeoutSeconds > 86400 {
-		return errors.New("data._compos.timeout_seconds is out of range")
+		return errors.New("data._execution.timeout_seconds is out of range")
 	}
 	return nil
 }
@@ -1074,8 +1074,8 @@ func main() {
 	if err != nil {
 		log.Fatal(fmt.Errorf("load connector catalog: %w", err))
 	}
-	if base := os.Getenv("COMPOS_BASE_URL"); base != "" {
-		catalog.SetComposClient(&ampconnectors.ComposClient{BaseURL: base, Token: os.Getenv("COMPOS_SERVICE_TOKEN")})
+	if base := os.Getenv("BUSINESS_SERVICE_BASE_URL"); base != "" {
+		catalog.SetBusinessClient(&ampconnectors.BusinessClient{BaseURL: base, Token: os.Getenv("BUSINESS_SERVICE_TOKEN")})
 	}
 	var connectionStore *connections.Store
 	if key := os.Getenv("CONDUCTOR_MASTER_KEY"); key != "" {
@@ -1085,7 +1085,7 @@ func main() {
 		}
 	}
 	resolver := connectorCredentialsResolver(connectionStore, catalog)
-	connectorHandler, err := catalog.NewInvokeHandlerScoped("1", nil, resolver)
+	connectorHandler, err := catalog.NewInvokeHandlerScoped("2", nil, resolver)
 	if err != nil {
 		log.Fatal(err)
 	}

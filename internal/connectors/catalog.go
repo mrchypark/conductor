@@ -20,8 +20,8 @@ import (
 )
 
 type Catalog struct {
-	infos  map[string]providers.ProviderInfo
-	compos *ComposClient
+	infos    map[string]providers.ProviderInfo
+	business *BusinessClient
 }
 
 func init() {
@@ -45,7 +45,7 @@ func LoadCatalog() (*Catalog, error) {
 	return &Catalog{infos: infos}, nil
 }
 
-func (c *Catalog) SetComposClient(client *ComposClient) { c.compos = client }
+func (c *Catalog) SetBusinessClient(client *BusinessClient) { c.business = client }
 
 func (c *Catalog) Names() []string {
 	names := make([]string, 0, len(c.infos))
