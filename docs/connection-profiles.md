@@ -1,7 +1,8 @@
 # Connection profiles
 
-The target integration uses GoAuthy's optional, versioned external credential
-profile extension. This is not an OAuth/OIDC standard. It uses a common profile
+The integration assumes an external credential provider that owns users' SaaS
+account profiles and credentials, with an explicit versioned delivery contract.
+This is not an OAuth/OIDC standard. It uses a common profile
 model across consumers, distinguished by authentication mechanism and authorized
 use, not separate AI/SaaS profile types. An OIDC login token is not a provider
 credential. Conductor retains connector execution and its local credential path
@@ -9,7 +10,7 @@ for compatibility and independent testing; there is no credential migration here
 Shared databases, internal imports and simultaneous deployment are not required.
 A bounded memory-only API-key delivery adapter and TLS fixtures are described in
 [API-key delivery](api-key-delivery.md). Operator-configured execution wiring is
-available through [GoAuthy executions](goauthy-execution.md). The public user
+available through [credential-provider executions](credential-provider-execution.md). The public user
 authorization lifecycle remains unimplemented; the local credential path is unchanged.
 
 ## Current contract
@@ -47,7 +48,7 @@ authorization. Do not expose this path as a multi-user execution API.
 
 Account identity must use a verified issuer and subject, with a Conductor-specific
 audience and required API scope. Compos owns workspace membership; Conductor owns
-execution authorization, and the optional GoAuthy extension owns remote profile
+execution authorization, and the external credential provider owns remote profile
 ownership, consent and permitted use. `actor`, `_compos`, `subject_ref` and `X-Beesuh-*`
 metadata alone grant no authority. Cross-client token exchange is not assumed.
 
@@ -103,4 +104,4 @@ processes were stopped. Shared Docker services were not restarted.
 The executable was built during development, so this pilot verifies the unchanged
 execution wire path; final revision/refresh changes are covered by the separate
 local tests, not this already-built executable. Neither this pilot nor the local
-profile tests establish the pending GoAuthy extension integration.
+profile tests establish the complete external credential-provider integration.

@@ -19,7 +19,7 @@ import (
 	"github.com/mrchypark/conductor/internal/storage"
 )
 
-func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
+func TestCredentialProviderHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 	const serviceToken = "conductor-service-token"
 	const humanToken = "trusted-human-token"
 	const upstreamToken = "upstream-token-"
@@ -65,11 +65,11 @@ func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte(humanToken+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	config := connectors.GoAuthyConfig{Issuer: authority.URL, Bindings: []connectors.GoAuthyBinding{{
+	config := connectors.CredentialProviderConfig{Issuer: authority.URL, Bindings: []connectors.CredentialProviderBinding{{
 		ConnectionID: "conn-1", WorkspaceID: "workspace-1", Revision: 1, OperationKey: "records.read", TokenFile: tokenFile, OAuth: &binding,
 	}}}
-	configPath := filepath.Join(dir, "goauthy.json")
-	writeConfig := func(value connectors.GoAuthyConfig) {
+	configPath := filepath.Join(dir, "credential-provider.json")
+	writeConfig := func(value connectors.CredentialProviderConfig) {
 		t.Helper()
 		body, err := json.Marshal(value)
 		if err != nil {
@@ -82,16 +82,16 @@ func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 	writeConfig(config)
 
 	registry := handlers.NewRegistry()
-	if err := loadGoAuthyHandler(configPath, serviceToken, registry, authority.Client(), provider.Client()); err != nil {
+	if err := loadCredentialProviderHandler(configPath, serviceToken, registry, authority.Client(), provider.Client()); err != nil {
 		t.Fatal(err)
 	}
 	badConfig := config
 	badBinding := *config.Bindings[0].OAuth
 	badBinding.Scopes = []string{"records.read", "records.read"}
-	badConfig.Bindings = append([]connectors.GoAuthyBinding(nil), config.Bindings...)
+	badConfig.Bindings = append([]connectors.CredentialProviderBinding(nil), config.Bindings...)
 	badConfig.Bindings[0].OAuth = &badBinding
 	writeConfig(badConfig)
-	if err := loadGoAuthyHandler(configPath, serviceToken, handlers.NewRegistry(), authority.Client(), provider.Client()); err == nil {
+	if err := loadCredentialProviderHandler(configPath, serviceToken, handlers.NewRegistry(), authority.Client(), provider.Client()); err == nil {
 		t.Fatal("duplicate scopes configured successfully")
 	}
 	if authorityCalls.Load() != 0 || providerCalls.Load() != 0 {
@@ -116,7 +116,9 @@ func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 	server := newServer(service, registry, nil)
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	workerDone := make(chan error, 1)
-	go func() { workerDone <- service.RunWorker(workerCtx, "goauthy-test", time.Millisecond, time.Second) }()
+	go func() {
+		workerDone <- service.RunWorker(workerCtx, "credential-provider-test", time.Millisecond, time.Second)
+	}()
 	t.Cleanup(func() {
 		stopWorker()
 		<-workerDone
@@ -124,7 +126,7 @@ func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 
 	submit := func(id, workspace string, revision int64) string {
 		t.Helper()
-		body := fmt.Sprintf(`{"execution_request_id":%q,"workspace_id":%q,"handler":"connector.goauthy.invoke","handler_version":"1","operation":"records.read","connection_id":"conn-1","credential_revision":%d,"actor":{"type":"service","id":"tester"},"idempotency_key":%q,"input":{}}`, id, workspace, revision, "idempotency-"+id)
+		body := fmt.Sprintf(`{"execution_request_id":%q,"workspace_id":%q,"handler":"connector.credentials.invoke","handler_version":"1","operation":"records.read","connection_id":"conn-1","credential_revision":%d,"actor":{"type":"service","id":"tester"},"idempotency_key":%q,"input":{}}`, id, workspace, revision, "idempotency-"+id)
 		req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+serviceToken)
 		req.Header.Set("Prefer", "respond-async")
@@ -154,17 +156,17 @@ func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated execution status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
-	pinnedFailureResponse := submit("goauthy-wrong-pin", "other-workspace", 2)
-	pinnedFailure := waitFor("goauthy-wrong-pin", "failed")
+	pinnedFailureResponse := submit("credential-provider-wrong-pin", "other-workspace", 2)
+	pinnedFailure := waitFor("credential-provider-wrong-pin", "failed")
 	if pinnedFailure.Error == nil || pinnedFailure.Error.Class != "connection_error" || authorityCalls.Load() != 0 || providerCalls.Load() != 0 {
 		t.Fatalf("unmatched pin execution=%+v authority=%d provider=%d", pinnedFailure, authorityCalls.Load(), providerCalls.Load())
 	}
-	firstResponse := submit("goauthy-1", "workspace-1", 1)
-	first := waitFor("goauthy-1", "succeeded")
-	secondResponse := submit("goauthy-2", "workspace-1", 1)
-	second := waitFor("goauthy-2", "succeeded")
-	thirdResponse := submit("goauthy-revoked", "workspace-1", 1)
-	revoked := waitFor("goauthy-revoked", "failed")
+	firstResponse := submit("credential-provider-1", "workspace-1", 1)
+	first := waitFor("credential-provider-1", "succeeded")
+	secondResponse := submit("credential-provider-2", "workspace-1", 1)
+	second := waitFor("credential-provider-2", "succeeded")
+	thirdResponse := submit("credential-provider-revoked", "workspace-1", 1)
+	revoked := waitFor("credential-provider-revoked", "failed")
 	outputVersion := func(output json.RawMessage) int {
 		t.Helper()
 		var value struct {
@@ -192,8 +194,8 @@ func TestGoAuthyHandlerExecutesPinnedOAuthDelivery(t *testing.T) {
 	}
 }
 
-func TestGoAuthyConfigurationFailsClosed(t *testing.T) {
-	if err := loadGoAuthyHandler("", "", handlers.NewRegistry(), nil, nil); err != nil {
+func TestCredentialProviderConfigurationFailsClosed(t *testing.T) {
+	if err := loadCredentialProviderHandler("", "", handlers.NewRegistry(), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -208,7 +210,7 @@ func TestGoAuthyConfigurationFailsClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			registry := handlers.NewRegistry()
-			if err := loadGoAuthyHandler(path, tc.token, registry, nil, nil); err == nil {
+			if err := loadCredentialProviderHandler(path, tc.token, registry, nil, nil); err == nil {
 				t.Fatal("invalid configuration accepted")
 			}
 			if len(registry.Manifests()) != 0 {

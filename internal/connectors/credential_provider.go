@@ -13,14 +13,14 @@ import (
 	"github.com/mrchypark/conductor/internal/handlers"
 )
 
-// GoAuthyConfig is trusted operator configuration. It is not execution input.
-type GoAuthyConfig struct {
-	Issuer   string           `json:"issuer"`
-	Bindings []GoAuthyBinding `json:"bindings"`
+// CredentialProviderConfig is trusted operator configuration. It is not execution input.
+type CredentialProviderConfig struct {
+	Issuer   string                      `json:"issuer"`
+	Bindings []CredentialProviderBinding `json:"bindings"`
 }
 
-// GoAuthyBinding pins one connection revision to one reviewed operation.
-type GoAuthyBinding struct {
+// CredentialProviderBinding pins one connection revision to one reviewed operation.
+type CredentialProviderBinding struct {
 	ConnectionID string                `json:"connection_id"`
 	WorkspaceID  string                `json:"workspace_id"`
 	Revision     int64                 `json:"revision"`
@@ -30,44 +30,44 @@ type GoAuthyBinding struct {
 	OAuth        *OAuthDeliveryBinding `json:"oauth,omitempty"`
 }
 
-type goauthyDelivery struct {
-	binding GoAuthyBinding
+type credentialProviderDelivery struct {
+	binding CredentialProviderBinding
 	invoke  func(context.Context) ([]byte, error)
 }
 
-// NewGoAuthyHandler installs only operator-reviewed delivery bindings. It
+// NewCredentialProviderHandler installs only operator-reviewed delivery bindings. It
 // reads a current human authority token for every invocation and never accepts
 // a destination or credential from execution input.
-func NewGoAuthyHandler(config GoAuthyConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
+func NewCredentialProviderHandler(config CredentialProviderConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
 	if config.Issuer == "" || len(config.Bindings) == 0 {
-		return nil, errors.New("GoAuthy configuration requires issuer and bindings")
+		return nil, errors.New("credential provider configuration requires issuer and bindings")
 	}
-	deliveries := make(map[string]goauthyDelivery, len(config.Bindings))
+	deliveries := make(map[string]credentialProviderDelivery, len(config.Bindings))
 	for _, binding := range config.Bindings {
 		if binding.ConnectionID == "" || binding.WorkspaceID == "" || binding.Revision < 1 || binding.OperationKey == "" || binding.TokenFile == "" || (binding.APIKey == nil) == (binding.OAuth == nil) {
-			return nil, errors.New("GoAuthy binding invalid")
+			return nil, errors.New("credential provider binding invalid")
 		}
 		if _, exists := deliveries[binding.ConnectionID]; exists {
-			return nil, errors.New("GoAuthy connection binding duplicated")
+			return nil, errors.New("credential provider connection binding duplicated")
 		}
-		source := func(ctx context.Context) (string, error) { return readGoAuthyToken(ctx, binding.TokenFile) }
-		delivery := goauthyDelivery{binding: binding}
+		source := func(ctx context.Context) (string, error) { return readCredentialProviderToken(ctx, binding.TokenFile) }
+		delivery := credentialProviderDelivery{binding: binding}
 		if binding.APIKey != nil {
 			client, err := NewAPIKeyDelivery(config.Issuer, *binding.APIKey, source, authorityClient, providerClient)
 			if err != nil {
-				return nil, errors.New("GoAuthy API-key binding invalid")
+				return nil, errors.New("credential provider API-key binding invalid")
 			}
 			delivery.invoke = func(ctx context.Context) ([]byte, error) { return client.Invoke(ctx) }
 		} else {
 			client, err := NewOAuthDeliveryClient(config.Issuer, *binding.OAuth, func(ctx context.Context, _ OAuthTokenRequest) (string, error) { return source(ctx) }, authorityClient, providerClient, nil)
 			if err != nil {
-				return nil, errors.New("GoAuthy OAuth binding invalid")
+				return nil, errors.New("credential provider OAuth binding invalid")
 			}
 			endpoint := binding.OAuth.Endpoint
 			delivery.invoke = func(ctx context.Context) ([]byte, error) {
 				req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 				if err != nil {
-					return nil, errors.New("GoAuthy provider request invalid")
+					return nil, errors.New("credential provider SaaS request invalid")
 				}
 				response, err := client.Do(req)
 				if err != nil {
@@ -79,26 +79,26 @@ func NewGoAuthyHandler(config GoAuthyConfig, authorityClient, providerClient *ht
 		}
 		deliveries[binding.ConnectionID] = delivery
 	}
-	return handlers.NewFuncHandler(handlers.Manifest{Key: "connector.goauthy.invoke", Version: "1", DefaultTimeout: 30, Idempotency: "provider-defined", ResourceClass: "network"}, func(ctx context.Context, request handlers.Request) (handlers.Result, error) {
+	return handlers.NewFuncHandler(handlers.Manifest{Key: "connector.credentials.invoke", Version: "1", DefaultTimeout: 30, Idempotency: "provider-defined", ResourceClass: "network"}, func(ctx context.Context, request handlers.Request) (handlers.Result, error) {
 		if input := strings.TrimSpace(string(request.Input)); input != "" {
 			var object map[string]json.RawMessage
 			if json.Unmarshal([]byte(input), &object) != nil || object == nil || len(object) != 0 {
-				return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "GoAuthy delivery input must be empty"}
+				return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "credential provider delivery input must be empty"}
 			}
 		}
 		delivery, ok := deliveries[request.ConnectionID]
 		if !ok || request.WorkspaceID != delivery.binding.WorkspaceID || request.CredentialRevision != delivery.binding.Revision || request.OperationKey != delivery.binding.OperationKey {
-			return handlers.Result{}, &handlers.Error{Class: "connection_error", Message: "GoAuthy binding does not match execution"}
+			return handlers.Result{}, &handlers.Error{Class: "connection_error", Message: "credential provider binding does not match execution"}
 		}
 		output, err := delivery.invoke(ctx)
 		if err != nil {
-			return handlers.Result{}, &handlers.Error{Class: "connection_error", Message: "GoAuthy credential delivery failed"}
+			return handlers.Result{}, &handlers.Error{Class: "connection_error", Message: "credential provider credential delivery failed"}
 		}
 		return handlers.Result{Output: output}, nil
 	})
 }
 
-func readGoAuthyToken(ctx context.Context, path string) (string, error) {
+func readCredentialProviderToken(ctx context.Context, path string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}

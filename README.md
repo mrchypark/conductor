@@ -16,9 +16,10 @@ delivery (optional `CONDUCTOR_CALLBACK_TOKEN`). `CONDUCTOR_MASTER_KEY` (16/24/32
 bytes) enables encrypted connector connections; `COMPOS_BASE_URL` enables the
 built-in Compos connector boundary.
 
-`CONDUCTOR_GOAUTHY_CONFIG`와 `CONDUCTOR_SERVICE_TOKEN`을 설정하면 GoAuthy의
-승인된 API-key/OAuth 자격증명을 사용하는 `connector.goauthy.invoke@1`을 등록합니다.
-설정과 실행 예시는 [GoAuthy 실행 연동](docs/goauthy-execution.md)을 참고하세요.
+`CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG`와 `CONDUCTOR_SERVICE_TOKEN`을 설정하면 외부 SaaS 계정
+프로바이더가 제공하는 승인된 API-key/OAuth 자격증명을 사용하는
+`connector.credentials.invoke@1`을 등록합니다.
+설정과 실행 예시는 [외부 자격증명 프로바이더 실행 연동](docs/credential-provider-execution.md)을 참고하세요.
 
 Rhiza HA는 각 프로세스에 고유한 `CONDUCTOR_RHIZA_NODE_ID`,
 `CONDUCTOR_RHIZA_PEER_ADDR`, data directory를 주고, 모든 프로세스에 동일한

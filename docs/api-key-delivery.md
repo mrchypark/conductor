@@ -1,13 +1,13 @@
 # API-key delivery adapter (local integration slice)
 
-`internal/connectors/delivery.go` implements a memory-only GoAuthy credential
-consumer and a single fixed AMP mapping: Gowid, raw `Authorization`, no prefix,
+`internal/connectors/delivery.go` consumes credentials from an external credential
+provider in memory and uses a single fixed AMP mapping: Gowid, raw `Authorization`, no prefix,
 HTTPS `openapi.gowid.com/v2/expense-statements`, GET only. Query parameters may
 come from the trusted snapshot, never execution/browser input. This uses the
 existing catalog and AMP authentication client, not a second credential store.
 
 The adapter is wired to trusted-service executions through the operator-configured
-[`connector.goauthy.invoke@1` handler](goauthy-execution.md). This does not provide
+[`connector.credentials.invoke@1` handler](credential-provider-execution.md). This does not provide
 public user authentication or consent management. The existing
 service Bearer is not user delegation. Login, code+PKCE callback, session-bound
 handoff/state verification, workspace authorization, confidential-client token
@@ -19,8 +19,8 @@ No service token or another client's token may replace the human token source.
 Construct `connectors.NewAPIKeyDelivery(issuer, binding, tokenSource,
 authorityClient, providerClient)`, then call `Invoke(ctx)` for one fixed GET.
 `DeliveryTokenSource` is `func(context.Context) (string, error)` and must return
-the execution consumer's own current human token for the exact GoAuthy connections
-resource with `goauthy.connections.use`. GoAuthy validates token owner/consumer
+the execution consumer's own current human token for the credential provider's
+configured resource and required credential-use scope. The provider validates token owner/consumer
 and current grant on every retrieval. The caller binds this source to the expected
 user; job metadata is not authority. Source failures are sanitized.
 
@@ -62,10 +62,10 @@ proxy-style output projection. Injected clients/transports/token sources must no
 log secrets. Ordinary Go memory is garbage-collected, not guaranteed zeroized.
 
 Revocation/expiry blocks later retrieval, not a key already delivered or a request
-already sent. There is no atomic GoAuthy/provider transaction. Restarted/expired
+already sent. There is no atomic credential-provider/SaaS transaction. Restarted/expired
 user authority must fail closed; no persistent-token fallback is implemented.
 
-## Verification and GoAuthy fixture bridge
+## Verification and credential-provider fixture bridge
 
 Self-contained certificate-verified TLS authority/provider fixtures:
 
@@ -73,7 +73,7 @@ Self-contained certificate-verified TLS authority/provider fixtures:
 go test -count=1 ./internal/connectors -run '^TestAPIKeyDelivery'
 ```
 
-GoAuthy owns a separate disposable real-authorization fixture. To run the optional
+A compatible credential provider supplies a disposable real-authorization fixture. To run the optional
 bridge, its parent process supplies these environment variables directly to a
 child test process (no token in command arguments, files, shell history or logs):
 
@@ -88,16 +88,16 @@ child test process (no token in command arguments, files, shell history or logs)
   an Invoke error, empty result and zero provider requests
 
 ```sh
-go test -count=1 ./internal/connectors -run '^TestAPIKeyDeliveryGoAuthyFixture$'
+go test -count=1 ./internal/connectors -run '^TestAPIKeyDeliveryCredentialProviderFixture$'
 ```
 
-Run from the Conductor repository. The bridge retrieves twice from real GoAuthy
+Run from the Conductor repository. The bridge retrieves twice from the credential provider
 but routes provider calls exclusively to a local TLS fixture; it never contacts
 Gowid. The environment source is test-only, not a production user-token lifecycle.
 Do not capture child environments or use production tokens. Without explicit
-opt-in the bridge skips; that skip is not real GoAuthy E2E evidence.
+opt-in the bridge skips; that skip is not real credential-provider E2E evidence.
 
-GoAuthy's 2026-09-07 follow-up reports explicit support for the empty Authorization
+The credential provider's 2026-09-07 follow-up reports explicit support for the empty Authorization
 prefix, removing the initial registration mismatch in its current worktree.
 Its documented producer tests cover HTTPS standalone/restart delivery and local
 TLS raw-header injection; the Conductor bridge subsequently passed as recorded below.
@@ -112,22 +112,18 @@ and the final `go test -count=1 ./...` passed. An earlier full run failed the
 existing Compos callback-count test; three isolated reruns and the final full run
 passed without changing that code.
 
-Real issuer bridge validation (2026-09-07): the GoAuthy-owned disposable fixture
+Real issuer bridge validation (2026-09-07): the credential provider's disposable fixture
 ran the actual Conductor test before and after HTTPS standalone restart. Both
 runs passed delivery with a real confidential-consumer human token and two local
-provider GETs with exact API-key equality. After owner revocation, GoAuthy checked
+provider GETs with exact API-key equality. After owner revocation, the credential provider checked
 HTTP 404 and reran Conductor with the same token/binding in denied mode: error,
 empty output and zero provider requests. The producer's source and success log
-`/tmp/goauthy-conductor-delivery-live-20260907.log` were inspected; the two delivery
+were inspected; the two delivery
 subtests took 9.86s and 8.57s. Provider traffic remained local TLS, not live Gowid.
 This completes the adapter's real-issuer gate, not application login, BFF state
 consumption, queue/public execution wiring, or HA acceptance.
 
-To reproduce from the GoAuthy repository with a disposable fixture:
-
-```sh
-GOAUTHY_E2E_TLS=1 GOAUTHY_E2E_USE_GRANTS=1 \
-GOAUTHY_E2E_CREDENTIAL_DELIVERY=1 GOAUTHY_E2E_RAW_AUTHORIZATION=1 \
-GOAUTHY_E2E_CONDUCTOR_DELIVERY_PROJECT_DIR=/Users/cypark/Documents/work/conductor \
-sh scripts/e2e-open-registration-standalone.sh
-```
+To reproduce, the credential provider's own fixture runner must start a disposable
+HTTPS issuer, create reviewed delivery consent, and pass the generic
+`CONDUCTOR_DELIVERY_*` environment variables above to Conductor's child test.
+The fixture runner's setup commands belong to that provider's implementation.

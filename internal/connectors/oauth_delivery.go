@@ -33,7 +33,7 @@ type OAuthDeliveryBinding struct {
 }
 
 // OAuthTokenRequest selects the owner's execution-consumer human authority at
-// the trusted host. These labels are not authentication; GoAuthy checks the
+// the trusted host. These labels are not authentication; the credential provider checks the
 // actual token and grant. No client-credentials or other-client token fallback.
 type OAuthTokenRequest struct{ OwnerSubject, Resource, ConsumerClientID string }
 

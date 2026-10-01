@@ -14,7 +14,7 @@ import (
 	"github.com/mrchypark/conductor/internal/handlers"
 )
 
-func TestGoAuthyHandlerPinsBindingAndReadsFreshToken(t *testing.T) {
+func TestCredentialProviderHandlerPinsBindingAndReadsFreshToken(t *testing.T) {
 	binding := deliveryBinding()
 	var authorityCalls, providerCalls atomic.Int32
 	var wantHuman atomic.Value
@@ -40,11 +40,11 @@ func TestGoAuthyHandlerPinsBindingAndReadsFreshToken(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte("human-one\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	handler, err := NewGoAuthyHandler(GoAuthyConfig{Issuer: authority.URL, Bindings: []GoAuthyBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 3, OperationKey: "expense-statements.read", TokenFile: tokenFile, APIKey: &binding}}}, authority.Client(), rewriteClient(provider))
+	handler, err := NewCredentialProviderHandler(CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 3, OperationKey: "expense-statements.read", TokenFile: tokenFile, APIKey: &binding}}}, authority.Client(), rewriteClient(provider))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest := handler.Manifest(); manifest.Key != "connector.goauthy.invoke" || manifest.Version != "1" {
+	if manifest := handler.Manifest(); manifest.Key != "connector.credentials.invoke" || manifest.Version != "1" {
 		t.Fatalf("manifest = %+v", manifest)
 	}
 	_, err = handler.Execute(context.Background(), handlers.Request{ConnectionID: "connection", WorkspaceID: "other", CredentialRevision: 3, OperationKey: "expense-statements.read"})
@@ -67,7 +67,7 @@ func TestGoAuthyHandlerPinsBindingAndReadsFreshToken(t *testing.T) {
 	}
 }
 
-func TestGoAuthyHandlerDenialBlocksProvider(t *testing.T) {
+func TestCredentialProviderHandlerDenialBlocksSaaS(t *testing.T) {
 	binding := deliveryBinding()
 	var providerCalls atomic.Int32
 	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -83,7 +83,7 @@ func TestGoAuthyHandlerDenialBlocksProvider(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte("human-token\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	handler, err := NewGoAuthyHandler(GoAuthyConfig{Issuer: authority.URL, Bindings: []GoAuthyBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "expense-statements.read", TokenFile: tokenFile, APIKey: &binding}}}, authority.Client(), rewriteClient(provider))
+	handler, err := NewCredentialProviderHandler(CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "expense-statements.read", TokenFile: tokenFile, APIKey: &binding}}}, authority.Client(), rewriteClient(provider))
 	if err != nil {
 		t.Fatal(err)
 	}

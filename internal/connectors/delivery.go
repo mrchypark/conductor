@@ -88,7 +88,7 @@ type deliveredAPIKey struct {
 // Invoke retrieves a fresh credential for each fixed GET, with no cached-key
 // fallback or application retry. It does not persist credentials or expose them
 // to execution inputs. Injected transports/token sources must not log secrets.
-// GoAuthy revocation cannot recall a key once delivered or undo an upstream call.
+// Provider revocation cannot recall a key once delivered or undo an upstream SaaS call.
 func (d *APIKeyDelivery) Invoke(ctx context.Context) (json.RawMessage, error) {
 	if d.binding.ConsentExpiresAtUnixMS <= time.Now().UnixMilli() {
 		return nil, errors.New("delivery consent expired")

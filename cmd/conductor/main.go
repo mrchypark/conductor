@@ -1092,7 +1092,7 @@ func main() {
 	if err := registry.Register(connectorHandler); err != nil {
 		log.Fatal(err)
 	}
-	if err := loadGoAuthyHandler(os.Getenv("CONDUCTOR_GOAUTHY_CONFIG"), os.Getenv("CONDUCTOR_SERVICE_TOKEN"), registry, nil, nil); err != nil {
+	if err := loadCredentialProviderHandler(os.Getenv("CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG"), os.Getenv("CONDUCTOR_SERVICE_TOKEN"), registry, nil, nil); err != nil {
 		log.Fatal(err)
 	}
 	for _, manifest := range registry.Manifests() {

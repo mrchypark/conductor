@@ -13,11 +13,11 @@ import (
 	"testing"
 )
 
-// Opt-in bridge to a separately owned, disposable GoAuthy HTTPS fixture.
+// Opt-in bridge to a separately owned, disposable credential-provider HTTPS fixture.
 // Only credential retrieval is live; provider traffic is always local TLS.
-func TestAPIKeyDeliveryGoAuthyFixture(t *testing.T) {
+func TestAPIKeyDeliveryCredentialProviderFixture(t *testing.T) {
 	if os.Getenv("CONDUCTOR_DELIVERY_LIVE") != "1" {
-		t.Skip("requires explicitly enabled disposable GoAuthy fixture")
+		t.Skip("requires explicitly enabled disposable credential-provider fixture")
 	}
 	expectedKey := os.Getenv("CONDUCTOR_DELIVERY_EXPECTED_API_KEY")
 	humanToken := os.Getenv("CONDUCTOR_DELIVERY_HUMAN_TOKEN")
