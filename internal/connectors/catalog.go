@@ -14,9 +14,9 @@ import (
 	"github.com/amp-labs/connectors/connector"
 	"github.com/amp-labs/connectors/generic"
 	"github.com/amp-labs/connectors/providers"
+	gowid "github.com/mrchypark/gowid-go-sdk/client"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
-	gowid "gowid-api-go/client"
 )
 
 type Catalog struct {

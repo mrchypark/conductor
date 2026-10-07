@@ -42,8 +42,6 @@ github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1 h1:WJ
 github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1/go.mod h1:tCcJZ0uHAmvjsVYzEFivsRTN00oz5BEsRgQHu5JZ9WE=
 github.com/AzureAD/microsoft-authentication-library-for-go v1.10.0 h1:Byx2mFH6zOunKuxJlzKj/L31czf2B45rsjToG4yo8uI=
 github.com/AzureAD/microsoft-authentication-library-for-go v1.10.0/go.mod h1:OZ+YRWCg7N54lg8lzu1OiGRGbWsqPh+FEGHA7bvbLKA=
-github.com/mrchypark/gowid-go-sdk v0.1.0 h1:UdOogim73ZxA31OX8jTelq/9lkdj4rNC1ZkeoJCXcOw=
-github.com/mrchypark/gowid-go-sdk v0.1.0/go.mod h1:qTsN/lsgNiqT8bMlmEmaL7hpKwjZSbd8FOkK6AHcqck=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.38.0 h1:rmzbFS2CkHq0y2L5LkMVWm+QXjjNEXxjmhrJqga/QGk=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.38.0/go.mod h1:iIyrdhveU5Ow84ipRlxtjCOQnIM0DiqSMxuxm50xwZY=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.62.0 h1:5y2LR2pripbccOte6BpZ+guv5O5W0OQIfKvUYZrGaAQ=
@@ -256,6 +254,8 @@ github.com/mitchellh/mapstructure v1.5.0 h1:jeMsZIYE/09sWLaz43PL7Gy6RuMjD2eJVyua
 github.com/mitchellh/mapstructure v1.5.0/go.mod h1:bFUtVrKA4DC2yAKiSyO/QUcy7e+RRV2QTWOzhPopBRo=
 github.com/mozillazg/go-httpheader v0.2.1 h1:geV7TrjbL8KXSyvghnFm+NyTux/hxwueTSrwhe88TQQ=
 github.com/mozillazg/go-httpheader v0.2.1/go.mod h1:jJ8xECTlalr6ValeXYdOF8fFUISeBAdw6E61aqQma60=
+github.com/mrchypark/gowid-go-sdk v0.1.0 h1:UdOogim73ZxA31OX8jTelq/9lkdj4rNC1ZkeoJCXcOw=
+github.com/mrchypark/gowid-go-sdk v0.1.0/go.mod h1:qTsN/lsgNiqT8bMlmEmaL7hpKwjZSbd8FOkK6AHcqck=
 github.com/mrchypark/latticedb-go v0.10.0 h1:hVbW2iTwR0A9rKybAekilzQdYYkyOjaoswA76/RZF3w=
 github.com/mrchypark/latticedb-go v0.10.0/go.mod h1:0lE7Ig+DYuVRHocNZLNlvAmIEq3xvyJQXIfh83CbHkM=
 github.com/mrchypark/rhiza v0.18.0 h1:tD4TNyjJBcLxCVFjgiSahxpH0S4kydTZC2Fe+6wrIz8=

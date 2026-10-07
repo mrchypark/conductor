@@ -5,16 +5,14 @@ go 1.27.1
 require (
 	github.com/amp-labs/connectors v0.0.0-20260926000507-12b379106601
 	github.com/jokruger/kavun v0.7.1
+	github.com/mrchypark/gowid-go-sdk v0.1.0
 	github.com/mrchypark/rhiza v0.18.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/tetratelabs/wazero v1.12.0
 	golang.org/x/oauth2 v0.37.0
-	gowid-api-go v0.0.0
 	oras.land/oras-go/v2 v2.6.2
 )
-
-replace gowid-api-go => github.com/mrchypark/gowid-go-sdk v0.1.0
 
 require (
 	cel.dev/expr v0.25.3 // indirect
