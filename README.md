@@ -1,102 +1,213 @@
-# conductor
+# Conductor
 
-Go 실행 런타임이 함수 실행 경계를 담당합니다. 요청은 embedded Rhiza에 한 번 저장된 뒤
-등록된 `handler@version`을 실행하고, retryable 실패를 재시도하며, terminal runtime
-callback을 기록합니다. AMP connectors 카탈로그와 OAuth/PKCE 저장소도 같은 경계에서
-사용할 수 있습니다.
+Conductor is a Go runtime for durable, versioned function and connector execution.
+It persists execution requests in embedded [Rhiza](https://github.com/mrchypark/rhiza),
+runs a pinned `handler@version`, retries retryable failures, and records terminal
+results and runtime callbacks. Local and external workers share a lease and fencing
+protocol. Connector support uses the AMP connectors catalog, with encrypted
+connections and OAuth/PKCE support.
 
-```bash
-go test ./...
-go run ./cmd/conductor -db ./conductor-data
+Conductor owns execution. A workflow service owns workflow graphs, task completion,
+and submissions; a business service owns business records, schemas, and mutations.
+Those services may live in one application or separate applications. Conductor's
+`POST /v1/events` adapter accepts execution-linked workflow outbox events; it does
+not interpret workflow graphs.
+
+## Run from source
+
+Prerequisites:
+
+- **Go 1.27.1 or newer**, matching `go.mod` (CI targets Go 1.27.x).
+- Git and network access to download Go modules; curl for the example below.
+- Docker with BuildKit/buildx for container builds, if needed.
+
+The current embedded database dependencies do not require a separately installed
+native database library or database server. Normal builds can use `CGO_ENABLED=0`;
+Go's race detector requires CGO and a supported C toolchain.
+
+From a checkout of this repository:
+
+```sh
+go mod download
+go build -o ./conductor ./cmd/conductor
+CONDUCTOR_SERVICE_TOKEN=local-development-token \
+  ./conductor -addr 127.0.0.1:8080 -db ./conductor-data
 ```
 
-`Prefer: respond-async` stores a queued request; set `CONDUCTOR_WORKER_ID` to
-run the local lease worker. `CONDUCTOR_CALLBACK_URL` enables durable callback
-delivery (optional `CONDUCTOR_CALLBACK_TOKEN`). `CONDUCTOR_MASTER_KEY` (16/24/32
-bytes) enables encrypted connector connections; `BUSINESS_SERVICE_BASE_URL`은
-내장 business connector를 활성화합니다. 대상 API가 Bearer 인증을 요구하면
-`BUSINESS_SERVICE_TOKEN`을 설정합니다.
+`-db` names a Rhiza **data directory**, not a SQLite file. Keep that directory across
+restarts. Without flags or environment overrides, the source binary listens on
+`:8080` and uses `conductor.db` as its data directory.
 
-`CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG`와 `CONDUCTOR_SERVICE_TOKEN`을 설정하면 외부 SaaS 계정
-프로바이더가 제공하는 승인된 API-key/OAuth 자격증명을 사용하는
-`connector.credentials.invoke@1`을 등록합니다.
-설정과 실행 예시는 [외부 자격증명 프로바이더 실행 연동](docs/credential-provider-execution.md)을 참고하세요.
+In another terminal, execute the built-in echo handler:
 
-Rhiza HA는 각 프로세스에 고유한 `CONDUCTOR_RHIZA_NODE_ID`,
-`CONDUCTOR_RHIZA_PEER_ADDR`, data directory를 주고, 모든 프로세스에 동일한
-`CONDUCTOR_RHIZA_CLUSTER_ID`, `CONDUCTOR_RHIZA_MEMBERS` JSON과 shared S3 설정을
-사용합니다. `CONDUCTOR_RHIZA_MEMBERS`의 각 항목은 `node_id`, `peer_url`
-(`quic://host:port`), `public_key`(32바이트 Ed25519 공개키의 표준 base64)를 포함합니다.
-각 노드는 자신의 비밀값만 `CONDUCTOR_RHIZA_PEER_TOKEN`으로 전달합니다.
-공개키는 Rhiza의 `PeerPublicKey(clusterID, nodeID, peerToken)`으로 생성하며,
-이전 멤버별 `token` 필드는 더 이상 지원하지 않습니다. S3 설정은 Rhiza의
-`ObjStore*` 구성에 대응하며 multi-node 기동에는 명시적인 S3-compatible store가
-필수입니다.
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/executions \
+  -H 'Authorization: Bearer local-development-token' \
+  -H 'Content-Type: application/json' \
+  --data '{"execution_request_id":"er-http","workspace_id":"ws-local","handler":"payload.echo","handler_version":"1","operation":"echo","actor":{"type":"service","id":"readme-client"},"idempotency_key":"readme:er-http","input":{"ok":true}}'
 
-Rhiza `v0.18.0`으로 올릴 때 기존 `v0.12.0` 저장소를 그대로 열면 안 됩니다.
-SQL 실행 정책과 WAL 형식이 변경되어 standalone/HA 모두 새 데이터 디렉터리와
-별도 클러스터·object-store namespace에 애플리케이션 데이터를 논리적으로 이관해야 합니다.
-기존 바이너리와 저장소를 보존하고, 처리 중 실행·callback 결과를 정리한 뒤 이관하세요.
-구버전 checkpoint/WAL 복사나 혼합 버전 HA 롤링 업그레이드는 지원되지 않습니다.
-자세한 절차는 [Rhiza 마이그레이션 문서](https://github.com/mrchypark/rhiza/blob/v0.18.0/docs/sql-execution-policy.md)를 따릅니다.
+curl --fail-with-body http://127.0.0.1:8080/v1/executions/exec_er-http \
+  -H 'Authorization: Bearer local-development-token'
+```
 
-External workers use the same lease protocol through
-`POST /v1/worker/tasks:poll`, `POST /v1/worker/tasks:heartbeat`,
-`POST /v1/worker/tasks:complete`, and `POST /v1/worker/tasks:fail` (the shorter
-`/v1/worker/{poll,heartbeat,complete,fail}` aliases are also accepted).
+Authenticated submissions require `workspace_id`, an actor with `type` and `id`,
+and an `idempotency_key`. The synchronous POST returns HTTP 200 with
+`id: "exec_er-http"`, `status: "succeeded"`, and the echoed
+input in `output`; GET retrieves the persisted execution. Use a new
+`execution_request_id` and `idempotency_key` for a different request.
 
-OAuth endpoints are `POST /v1/oauth/{provider}/begin` and
-`POST` or `GET /v1/oauth/callback`; callback responses never return provider tokens.
-Provider redirects may use `GET`/`POST /v1/oauth/{provider}/callback` and resolve the
-attempt from the returned state. Non-OAuth credentials are stored encrypted through
-service-authenticated `POST /v1/connections` (API key, Basic, or custom metadata).
-Already-installed OAuth apps may register an access token through the same encrypted
-boundary with `oauth_access_token`; responses never return the token.
-실행 취소는 `POST /v1/executions/{execution_id}/cancel`입니다.
-runtime event 조회는 `GET /v1/executions/{execution_id}/events`입니다.
-workflow service outbox는 `POST /v1/events`의 `{"events":[...]}` envelope를
-사용할 수 있습니다. 각 event의 `data._execution`에는 `workspace_id`와
-`execution_request_id`가 있어야 하며, 해당 event는 연결된 실행 요청으로만 변환됩니다.
+For queued execution, add `Prefer: respond-async`. Set `CONDUCTOR_WORKER_ID` before
+starting the server to enable its local lease worker, or use an external worker.
+Queued submissions return HTTP 202 and need a worker to execute them.
 
-동적 함수는 Kavun 소스로 `POST /v1/handlers`에 등록할 수 있습니다. 요청은
-`{"manifest":{"handler_key":"...","version":"..."},"source":"output = input"}`
-형식이며 `CONDUCTOR_SERVICE_TOKEN`이 설정된 서비스 인증 요청만 허용됩니다. 소스는
-`input`을 읽고 `output`을 설정하는 버전 핸들러로 컴파일되고, 파일 import와 기본 모듈은
-비활성화됩니다(허용 모듈: `base64`, `hex`, `json`, `math`, `text`). 정의와 소스는
-Rhiza `dynamic_handlers`에 원본과 SHA-256을 저장하고, 컴파일 결과는
-`dynamic_handler_bytecode`에 별도 캐시로 저장합니다. 재시작 시 캐시의 소스 해시,
-바이트코드 해시, Kavun 런타임 ABI가 맞으면 즉시 복원하고, 아니면 원본을 다시
-컴파일해 캐시를 갱신합니다.
+## Docker
 
-컴파일된 함수는 `kind: "wasm"`으로도 등록할 수 있습니다. WASM은 허용된 OCI
-registry의 `sha256` digest로 고정하고, Rhiza에는 artifact identity와 manifest만
-저장합니다. 실행은 무권한 JSON ABI와 16 MiB 메모리 상한 안에서 wazero의 새 guest
-instance로 수행됩니다. 빌드·push·등록 형식과 장애/보안 경계는
-[WASM function deployment](docs/spec/2026-09-04-wasm-function-deployment.md)를 참고하세요.
+The self-contained multi-stage Dockerfile builds the binary from source; no
+prebuilt `target/` binary is needed. Build and run a Linux amd64 image locally:
 
-현재 이 전환 범위는 workflow service가 위임한 함수/커넥터 실행입니다. workflow graph,
-task completion, submission 같은 업무 상태는 workflow service가 계속 소유합니다.
-업무 레코드·schema·mutation API는 별도 business service가 소유하며, 두 역할은 하나의
-애플리케이션 또는 분리된 애플리케이션으로 배포할 수 있습니다.
+```sh
+docker buildx build --platform linux/amd64 --load -t conductor:local .
+docker volume create conductor-data
+docker run --rm --name conductor --platform linux/amd64 \
+  -p 127.0.0.1:8080:8080 \
+  -v conductor-data:/data \
+  -e CONDUCTOR_DB=/data/conductor.db \
+  -e CONDUCTOR_SERVICE_TOKEN=local-development-token \
+  conductor:local
+```
 
-이전 서비스별 config/provider/operation prefix와 event metadata 이름에는 호환 별칭이
-없습니다. deployment client와 outbox producer를 현재 이름으로 함께 갱신하고, connector
-실행은 `connector.invoke@2`를 명시적으로 고정하세요. 입력 schema 또는 pinned operation이
-바뀌면 새 immutable handler version을 등록하고, 진행 중인 이전 실행은 필요에 따라 drain합니다.
+The container uses `/data/conductor.db` as its database directory within the `/data`
+volume and port 8080 for HTTP. The named volume
+preserves data when the container is removed; deleting the volume deletes that
+stored state. The curl example above works with this container too.
 
-설계 경계는 [workflow–execution 전체 설계 개요](docs/spec/2026-08-29-workflow-execution-system-overview.md),
-상세 계약은 [Conductor 서비스 상세 설계](docs/spec/2026-08-29-conductor-service-design.md)를 참고하세요.
+The planned main-branch publication target is
+`ghcr.io/mrchypark/conductor` for **linux/amd64**, with `latest` and a tag containing
+the **full Git commit SHA**. Publication follows Go formatting, vet, tests, race
+checks, and Docker build/smoke checks. Availability depends on a successful publish;
+these tags are not a claim that an image has already been released.
 
-## Go checks
+Once published, replace `conductor:local` in the run command with
+`ghcr.io/mrchypark/conductor:latest`, or pin a published full SHA:
 
-```bash
-go test ./...
+```sh
+CONDUCTOR_IMAGE_SHA=replace-with-a-published-full-commit-sha
+docker pull --platform linux/amd64 "ghcr.io/mrchypark/conductor:$CONDUCTOR_IMAGE_SHA"
+```
+
+## Configuration and security
+
+Flags `-addr` and `-db` override their environment defaults. Optional integrations
+are enabled through the following settings:
+
+| Setting | Purpose / default |
+| --- | --- |
+| `CONDUCTOR_ADDR` | HTTP listen address; `:8080`. |
+| `CONDUCTOR_DB` | Rhiza data directory; `conductor.db` from source, `/data/conductor.db` in the container. |
+| `CONDUCTOR_SERVICE_TOKEN` | Incoming API Bearer token; unset by default. |
+| `CONDUCTOR_WORKER_ID` | Enables the local execution worker when nonempty. |
+| `CONDUCTOR_CALLBACK_URL`, `CONDUCTOR_CALLBACK_TOKEN` | Durable callback destination and optional outgoing Bearer token. |
+| `CONDUCTOR_MASTER_KEY` | Raw 16, 24, or 32-byte key enabling encrypted connection storage. Preserve it across restarts. |
+| `BUSINESS_SERVICE_BASE_URL`, `BUSINESS_SERVICE_TOKEN` | Enables the business connector and supplies its optional outgoing Bearer token. |
+| `CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG` | External credential-provider configuration; with the service token, registers `connector.credentials.invoke@1`. |
+| `CONDUCTOR_OAUTH_CLIENT_SECRET`, `CONDUCTOR_OAUTH_CLIENT_SECRET_<PROVIDER>` | OAuth client secret fallback and provider override; provider names are uppercased with `-`, `.`, and `/` replaced by `_`. |
+| `CONDUCTOR_WASM_REGISTRIES` | Comma-separated registry host allowlist for WASM artifacts; empty allows none. |
+| `CONDUCTOR_WASM_REGISTRY_USERNAME`, `CONDUCTOR_WASM_REGISTRY_PASSWORD`, `CONDUCTOR_WASM_REGISTRY_TOKEN` | Optional host-side OCI credentials. |
+| `CONDUCTOR_WASM_REGISTRY_PLAIN_HTTP` | Allows plain HTTP registry access when `true`; for controlled local development. |
+
+When the service token is configured, API requests require
+`Authorization: Bearer <token>` except OAuth callback routes, which must remain
+reachable by providers. Without it, other API routes are unauthenticated;
+**dynamic handler and connection registration still reject requests**. Use a
+strong token and an HTTPS reverse proxy for deployment; the server itself serves
+HTTP. The example token is only for local development.
+
+Connection registration requires both service authentication and an enabled
+connection store. API-key, Basic, custom metadata, and pre-existing OAuth access
+tokens can be stored through that encrypted boundary. Connection and OAuth callback
+responses do not return provider tokens. Connector credentials stay in host-side
+execution code and must not be exposed to WASM guest code.
+
+## API and documentation
+
+| API | Purpose |
+| --- | --- |
+| `POST /v1/executions`, `GET /v1/executions/{id}` | Submit and inspect execution. |
+| `POST /v1/executions/{id}/cancel`, `GET /v1/executions/{id}/events` | Cancel and inspect runtime events. |
+| `GET /v1/handlers`, `POST /v1/handlers` | List manifests and register dynamic handlers. |
+| `GET /v1/connectors`, `GET /v1/connectors/{provider}` | Discover connector providers and manifests. |
+| `POST /v1/worker/tasks:poll`, `tasks:heartbeat`, `tasks:complete`, `tasks:fail` | External worker lease protocol; all four use the `/v1/worker/` prefix. Short `/v1/worker/{poll,heartbeat,complete,fail}` aliases also work. |
+| `POST /v1/connections` | Register encrypted credentials. |
+| `POST /v1/oauth/{provider}/begin` | Begin OAuth authorization. |
+| `GET` or `POST /v1/oauth/callback` or `/v1/oauth/{provider}/callback` | Resolve OAuth attempts using returned state. |
+| `POST /v1/events` | Accept an `{"events":[...]}` envelope; each event needs `data._execution.workspace_id` and `execution_request_id`. |
+
+See the focused documents for full contracts and deployment details:
+
+- [System boundaries](docs/spec/2026-08-29-workflow-execution-system-overview.md)
+- [Execution service design](docs/spec/2026-08-29-conductor-service-design.md)
+- [Connection profiles](docs/connection-profiles.md)
+- [API-key delivery](docs/api-key-delivery.md)
+- [External credential-provider execution](docs/credential-provider-execution.md)
+- [WASM function deployment](docs/spec/2026-09-04-wasm-function-deployment.md)
+
+Handlers are immutable: create a new version when executable behavior, input/output
+schemas, limits, pinned connector operations, or the WASM artifact digest changes.
+Pin connector execution to `connector.invoke@2`; older service-specific config,
+provider/operation prefixes, and event metadata names have no compatibility aliases.
+Update clients and outbox producers together and drain older executions as needed.
+
+Dynamic handlers may use Kavun source or `kind: "wasm"`. Kavun disables file imports
+and default modules, with an allowlist of `base64`, `hex`, `json`, `math`, and `text`.
+WASM references must use an allowlisted OCI registry and a **SHA-256 manifest digest**,
+not a mutable tag. Rhiza stores artifact identity and manifest metadata, never WASM
+bytes. Each invocation uses a fresh wazero guest with an unprivileged JSON ABI and
+a 16 MiB memory ceiling. See the deployment document rather than treating this as
+an unrestricted code-execution environment.
+
+## Persistence, HA, and migration
+
+Standalone operation uses embedded Rhiza without an external object store.
+Multi-node HA requires an explicit shared S3-compatible store. Give each process
+its own data directory, `CONDUCTOR_RHIZA_NODE_ID`, `CONDUCTOR_RHIZA_PEER_ADDR`, and
+`CONDUCTOR_RHIZA_PEER_TOKEN`; use the same `CONDUCTOR_RHIZA_CLUSTER_ID` and
+`CONDUCTOR_RHIZA_MEMBERS` JSON across the cluster.
+
+Membership entries contain `node_id`, `peer_url` (`quic://host:port`), and
+`public_key` (standard base64 of a 32-byte Ed25519 public key), generated with
+Rhiza's `PeerPublicKey(clusterID, nodeID, peerToken)`. Each node receives only its
+own peer secret. The old per-member `token` field is unsupported.
+
+`CONDUCTOR_RHIZA_BIND_ADDR` and `CONDUCTOR_RHIZA_PEER_ADDR` default to
+`127.0.0.1:0`; cluster/node IDs default to `conductor`/`n1`.
+`CONDUCTOR_RHIZA_ADMIN_TOKEN` configures Rhiza's admin token. Shared object-store
+settings are `CONDUCTOR_RHIZA_S3_PROVIDER`, `_ENDPOINT`, `_BUCKET`, `_PREFIX`,
+`_REGION`, `_ACCESS_KEY`, `_SECRET_KEY`, `_SESSION_TOKEN`, and `_INSECURE` (each
+suffix uses the `CONDUCTOR_RHIZA_S3` prefix). An endpoint without a provider selects
+`s3`. These map to Rhiza's `ObjStore*` configuration.
+
+**Rhiza v0.12.0 → v0.18.0 migration warning:** never open an existing v0.12.0
+store directly with v0.18.0. SQL execution policy and WAL formats changed.
+Standalone and HA deployments both require logical application-data migration to
+new data directories and a separate cluster/object-store namespace. Preserve the
+old binary and store, and reconcile in-flight executions and callback results
+before migration. Copying old checkpoints/WALs and mixed-version HA rolling
+upgrades are unsupported. Follow the
+[Rhiza migration procedure](https://github.com/mrchypark/rhiza/blob/v0.18.0/docs/sql-execution-policy.md).
+
+## Development
+
+```sh
+gofmt -w ./cmd ./internal
 go vet ./...
+go test ./...
+go test -race ./...
 ```
 
-실제 3프로세스 HA E2E는 미리 생성된 S3 bucket을 대상으로 실행합니다.
+The optional three-process HA test needs a running S3-compatible service and an
+already-created bucket. Without `CONDUCTOR_HA_E2E_S3_ENDPOINT`, it skips:
 
-```bash
+```sh
 CONDUCTOR_HA_E2E_S3_ENDPOINT=127.0.0.1:9000 \
 CONDUCTOR_HA_E2E_S3_BUCKET=conductor-ha-e2e \
 CONDUCTOR_HA_E2E_S3_ACCESS_KEY=minioadmin \
@@ -104,9 +215,9 @@ CONDUCTOR_HA_E2E_S3_SECRET_KEY=minioadmin \
 go test -run '^TestThreeProcessRhizaHA$' -count=1 ./internal/storage
 ```
 
-## Development
+The current implementation is Go. The previous Rust implementation is retained
+on the [`legacy-rust` branch](../../tree/legacy-rust).
 
-```bash
-go test ./...
-go vet ./...
-```
+## License
+
+Conductor is licensed under the [MIT License](LICENSE).
