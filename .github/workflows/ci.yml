@@ -27,7 +27,11 @@ jobs:
         run: go test -race -count=1 -timeout 1200s ./...
 
   docker-check:
+    needs: go
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -37,34 +41,32 @@ jobs:
           load: true
           tags: conductor:smoke
           platforms: linux/amd64
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha,scope=conductor-build
           cache-to: type=gha,mode=max,scope=conductor-build
       - name: Container smoke test
         run: sh scripts/smoke-container.sh conductor:smoke
 
-  docker-publish:
-    needs: [go, docker-check]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ghcr.io/mrchypark/conductor:latest
-            ghcr.io/mrchypark/conductor:${{ github.sha }}
-          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          cache-from: type=gha,scope=conductor-build
-          cache-to: type=gha,mode=max,scope=conductor-build
+      - name: Publish tested image
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          IMAGE: ghcr.io/mrchypark/conductor
+          COMMIT: ${{ github.sha }}
+        run: |
+          docker tag conductor:smoke "$IMAGE:$COMMIT"
+          docker tag conductor:smoke "$IMAGE:latest"
+          output=$(docker push "$IMAGE:$COMMIT")
+          echo "$output"
+          [[ $output =~ digest:\ (sha256:[0-9a-f]{64}) ]] || exit 1
+          digest=${BASH_REMATCH[1]}
+          output=$(docker push "$IMAGE:latest")
+          echo "$output"
+          [[ $output =~ digest:\ (sha256:[0-9a-f]{64}) ]] || exit 1
+          [[ ${BASH_REMATCH[1]} == "$digest" ]] || exit 1
+          echo "Published image: $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"

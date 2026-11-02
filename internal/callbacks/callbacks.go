@@ -43,7 +43,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 		req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, item.TargetURL, bytes.NewReader(item.Payload))
 		if err != nil {
 			cancel()
-			_ = d.Store.MarkCallbackDelivery(ctx, item.ID, "failed", err.Error(), now())
+			_ = d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, "failed", err.Error(), now())
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -57,7 +57,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 			resp.Body.Close()
 		}
 		if callErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			if err := d.Store.MarkCallbackDelivery(ctx, item.ID, "delivered", "", now()); err != nil {
+			if err := d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, "delivered", "", now()); err != nil {
 				return err
 			}
 			continue
@@ -74,7 +74,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 		if callErr == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
 			status = "failed"
 		}
-		if err := d.Store.MarkCallbackDelivery(ctx, item.ID, status, message, now().UTC().Add(delay)); err != nil {
+		if err := d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, status, message, now().UTC().Add(delay)); err != nil {
 			return err
 		}
 	}

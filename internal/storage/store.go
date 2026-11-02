@@ -57,6 +57,7 @@ type LeaseRecord struct {
 }
 type CallbackDeliveryRecord struct {
 	ID, ExecutionID, TargetURL string
+	ClaimID                    string
 	Payload                    []byte
 	Status                     string
 	AttemptCount               int
@@ -704,7 +705,7 @@ func (s *Store) DueCallbackDeliveries(ctx context.Context, n time.Time, limit in
 	}
 	out := make([]CallbackDeliveryRecord, 0, len(rows))
 	for _, x := range rows {
-		out = append(out, CallbackDeliveryRecord{ID: str(x[0]), ExecutionID: str(x[1]), TargetURL: str(x[2]), Payload: blob(x[3]), Status: str(x[4]), AttemptCount: num(x[5]), NextAttemptAt: pt(str(x[6])), LastError: str(x[7])})
+		out = append(out, CallbackDeliveryRecord{ID: str(x[0]), ExecutionID: str(x[1]), TargetURL: str(x[2]), ClaimID: claim, Payload: blob(x[3]), Status: str(x[4]), AttemptCount: num(x[5]), NextAttemptAt: pt(str(x[6])), LastError: str(x[7])})
 	}
 	return out, nil
 }
@@ -715,9 +716,12 @@ func (s *Store) RecoverCallbackDeliveries(ctx context.Context, n time.Time, age 
 	_, e := s.db.Mutate(ctx, "recover callbacks "+ft(n), stm(`UPDATE callback_deliveries SET status='retry_wait',claim_id='',next_attempt_at=?,last_error='stale delivery claim recovered',updated_at=? WHERE status='sending' AND updated_at<=?`, ft(n), ft(n), ft(n.Add(-age))))
 	return e
 }
-func (s *Store) MarkCallbackDelivery(ctx context.Context, id, status, last string, next time.Time) error {
+func (s *Store) MarkCallbackDelivery(ctx context.Context, id, claim, status, last string, next time.Time) error {
+	if claim == "" {
+		return errors.New("callback claim is required")
+	}
 	t := now()
-	_, e := s.db.Mutate(ctx, "mark callback "+id+" "+status+" "+t, stm(`UPDATE callback_deliveries SET status=?,claim_id='',attempt_count=attempt_count+1,last_error=?,next_attempt_at=?,updated_at=? WHERE callback_id=? AND status='sending'`, status, last, ft(next), t, id))
+	_, e := s.db.Mutate(ctx, "mark callback "+id+" "+status+" "+t, stm(`UPDATE callback_deliveries SET status=?,claim_id='',attempt_count=attempt_count+1,last_error=?,next_attempt_at=?,updated_at=? WHERE callback_id=? AND status='sending' AND claim_id=?`, status, last, ft(next), t, id, claim))
 	return e
 }
 
