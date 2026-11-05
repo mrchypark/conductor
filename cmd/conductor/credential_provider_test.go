@@ -295,6 +295,14 @@ func TestCredentialV2RecoveryAfterRestartWithoutWorker(t *testing.T) {
 		store.Close()
 		t.Fatal(err)
 	}
+	if created, err := store.CreateExecution(ctx, storage.ExecutionRequestRecord{ID: "regular", HandlerKey: "example", HandlerVersion: "1", MaxAttempts: 1}, "exec_regular"); err != nil || !created {
+		store.Close()
+		t.Fatalf("create regular execution: %v %v", created, err)
+	}
+	if _, err := store.AcquireLease(ctx, "exec_regular", "remote-worker", time.Millisecond, 1); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -315,6 +323,10 @@ func TestCredentialV2RecoveryAfterRestartWithoutWorker(t *testing.T) {
 			}
 			if _, err := store.AcquireInlineLease(ctx, "exec_abandoned", time.Minute); err == nil {
 				t.Fatal("recovered execution can be replayed")
+			}
+			regular, err := store.GetExecution(ctx, "exec_regular")
+			if err != nil || regular.Status != "running" {
+				t.Fatalf("recovery changed regular execution: %+v %v", regular, err)
 			}
 			return
 		}

@@ -1213,7 +1213,7 @@ func startExecutionProcessing(ctx context.Context, service *executions.Service, 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			if err := store.RecoverExpiredLeases(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
+			if err := store.RecoverExpiredInlineLeases(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("execution recovery: %v", err)
 			}
 			select {

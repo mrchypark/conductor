@@ -463,9 +463,30 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 		}
 		return s.waitForTerminal(ctx, executionID)
 	}
+	var handler handlers.Handler
+	var resolveErr error
+	if inlineOnly {
+		handler, resolveErr = s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
+	}
 	leaseTTL := request.Timeout
+	if inlineOnly && leaseTTL <= 0 && resolveErr == nil && handler.Manifest().DefaultTimeout > 0 {
+		seconds := handler.Manifest().DefaultTimeout
+		if int64(seconds) > math.MaxInt64/int64(time.Second) {
+			leaseTTL = time.Duration(math.MaxInt64)
+		} else {
+			leaseTTL = time.Duration(seconds) * time.Second
+		}
+	}
 	if leaseTTL <= 0 {
 		leaseTTL = time.Minute
+	}
+	if inlineOnly {
+		// Allow time for setup and durable completion after the handler deadline.
+		if leaseTTL > time.Duration(math.MaxInt64)-time.Minute {
+			leaseTTL = time.Duration(math.MaxInt64)
+		} else {
+			leaseTTL += time.Minute
+		}
 	}
 	var lease storage.LeaseRecord
 	if inlineOnly {
@@ -480,9 +501,11 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 		defer s.store.ReleaseLease(context.Background(), lease.ID, lease.FencingToken)
 	}
 
-	handler, err := s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
-	if err != nil {
-		return s.finishLease(ctx, lease, executionID, nil, &handlers.Error{Class: "handler_not_found", Message: err.Error()}, 1)
+	if !inlineOnly {
+		handler, resolveErr = s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
+	}
+	if resolveErr != nil {
+		return s.finishLease(ctx, lease, executionID, nil, &handlers.Error{Class: "handler_not_found", Message: resolveErr.Error()}, 1)
 	}
 	if err := handlers.ValidateJSON(handler.Manifest().InputSchema, request.Input); err != nil {
 		return s.finishLease(ctx, lease, executionID, nil, &handlers.Error{Class: "validation_failed", Message: err.Error()}, 1)

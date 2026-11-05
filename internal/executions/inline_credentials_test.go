@@ -103,3 +103,52 @@ func TestCanceledInlineCompletionRemainsRecoverable(t *testing.T) {
 		t.Fatalf("recovery: %+v %v", execution, err)
 	}
 }
+
+func TestCredentialV2LeaseCoversHandlerDeadlineAndCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		timeout        time.Duration
+		defaultTimeout int
+	}{
+		{name: "requested timeout", timeout: time.Second, defaultTimeout: 30},
+		{name: "manifest timeout", defaultTimeout: 120},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := storage.Open(ctx, "file:"+t.TempDir()+"/db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			registry := handlers.NewRegistry()
+			h, err := handlers.NewFuncHandler(handlers.Manifest{Key: "connector.credentials.invoke", Version: "2", DefaultTimeout: tc.defaultTimeout}, func(callCtx context.Context, req handlers.Request) (handlers.Result, error) {
+				deadline, ok := callCtx.Deadline()
+				if !ok {
+					t.Fatal("handler deadline missing")
+				}
+				lease, err := store.ActiveLease(ctx, req.ExecutionID)
+				if err != nil || !lease.ExpiresAt.After(deadline.Add(30*time.Second)) {
+					t.Fatalf("lease does not cover completion: %+v deadline=%v err=%v", lease, deadline, err)
+				}
+				if err := store.RecoverExpiredInlineLeases(ctx, deadline.Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				return handlers.Result{Output: json.RawMessage(`{}`)}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.Register(h); err != nil {
+				t.Fatal(err)
+			}
+			service, err := NewService(store, registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, err := service.SubmitAndExecute(ctx, ExecutionRequest{ExecutionRequestID: "deadline", HandlerKey: "connector.credentials.invoke", HandlerVersion: "2", Timeout: tc.timeout})
+			if err != nil || execution.Status != "succeeded" {
+				t.Fatalf("execution: %+v %v", execution, err)
+			}
+		})
+	}
+}

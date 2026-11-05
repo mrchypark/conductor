@@ -79,3 +79,44 @@ func TestInlinePendingRecoversAfterReopen(t *testing.T) {
 		t.Fatal("recovered request replayed")
 	}
 }
+
+func TestInlineRecoveryLeavesGeneralExecutionsUntouched(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, req := range []ExecutionRequestRecord{
+		{ID: "inline", HandlerKey: "connector.credentials.invoke", HandlerVersion: "2"},
+		{ID: "general", HandlerKey: "example", HandlerVersion: "1"},
+	} {
+		if created, err := store.CreateExecution(ctx, req, "exec_"+req.ID); err != nil || !created {
+			t.Fatalf("create: %v %v", created, err)
+		}
+	}
+	if _, err := store.AcquireInlineLease(ctx, "exec_inline", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireLease(ctx, "exec_general", "worker", time.Millisecond, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverExpiredInlineLeases(ctx, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	inline, err := store.GetExecution(ctx, "exec_inline")
+	if err != nil || inline.Status != "failed" {
+		t.Fatalf("inline: %+v %v", inline, err)
+	}
+	general, err := store.GetExecution(ctx, "exec_general")
+	if err != nil || general.Status != "running" {
+		t.Fatalf("general: %+v %v", general, err)
+	}
+	if err := store.RecoverExpiredLeases(ctx, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	general, err = store.GetExecution(ctx, "exec_general")
+	if err != nil || general.Status != "failed" {
+		t.Fatalf("general recovery: %+v %v", general, err)
+	}
+}

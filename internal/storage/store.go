@@ -666,6 +666,15 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 	return nil
 }
 func (s *Store) RecoverExpiredLeases(ctx context.Context, n time.Time) error {
+	return s.recoverExpiredLeases(ctx, n, false)
+}
+
+// RecoverExpiredInlineLeases recovers only synchronous credential invocations.
+func (s *Store) RecoverExpiredInlineLeases(ctx context.Context, n time.Time) error {
+	return s.recoverExpiredLeases(ctx, n, true)
+}
+
+func (s *Store) recoverExpiredLeases(ctx context.Context, n time.Time, inlineOnly bool) error {
 	pending, e := s.db.Query(ctx, `SELECT id FROM executions WHERE status='inline_pending' AND handler_key='connector.credentials.invoke' AND handler_version='2' AND updated_at<=?`, ft(n.Add(-time.Minute)))
 	if e != nil {
 		return e
@@ -684,7 +693,11 @@ func (s *Store) RecoverExpiredLeases(ctx context.Context, n time.Time) error {
 			return err
 		}
 	}
-	rows, e := s.db.Query(ctx, `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,CASE WHEN e.handler_key='connector.credentials.invoke' AND e.handler_version='2' THEN 1 ELSE r.max_attempts END FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`, ft(n))
+	query := `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,CASE WHEN e.handler_key='connector.credentials.invoke' AND e.handler_version='2' THEN 1 ELSE r.max_attempts END FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`
+	if inlineOnly {
+		query += ` AND e.handler_key='connector.credentials.invoke' AND e.handler_version='2'`
+	}
+	rows, e := s.db.Query(ctx, query, ft(n))
 	if e != nil {
 		return e
 	}
