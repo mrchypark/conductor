@@ -334,3 +334,60 @@ func TestCredentialV2RecoveryAfterRestartWithoutWorker(t *testing.T) {
 	}
 	t.Fatal("abandoned execution was not recovered without a worker")
 }
+
+func TestCredentialV2RecoveryWhileWorkerIsBusy(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.Open(ctx, "file:"+filepath.Join(t.TempDir(), "conductor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registry := handlers.NewRegistry()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler, err := handlers.NewFuncHandler(handlers.Manifest{Key: "busy", Version: "1"}, func(ctx context.Context, _ handlers.Request) (handlers.Result, error) {
+		close(started)
+		select {
+		case <-release:
+			return handlers.Result{Output: json.RawMessage(`{}`)}, nil
+		case <-ctx.Done():
+			return handlers.Result{}, ctx.Err()
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(handler); err != nil {
+		t.Fatal(err)
+	}
+	service, err := executions.NewService(store, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Submit(ctx, executions.ExecutionRequest{ExecutionRequestID: "busy", HandlerKey: "busy", HandlerVersion: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	done := startExecutionProcessing(workerCtx, service, store, "worker", 10*time.Millisecond)
+	defer func() { cancel(); close(release); <-done }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not start")
+	}
+	if created, err := store.CreateExecution(ctx, storage.ExecutionRequestRecord{ID: "inline-busy", HandlerKey: "connector.credentials.invoke", HandlerVersion: "2"}, "exec_inline-busy"); err != nil || !created {
+		t.Fatalf("create inline execution: %v %v", created, err)
+	}
+	if _, err := store.AcquireInlineLease(ctx, "exec_inline-busy", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		execution, err := store.GetExecution(ctx, "exec_inline-busy")
+		if err == nil && execution.Status == "failed" && execution.ErrorClass == "outcome_unknown" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("inline execution was not recovered while worker was busy")
+}

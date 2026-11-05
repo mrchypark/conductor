@@ -1204,11 +1204,15 @@ func startExecutionProcessing(ctx context.Context, service *executions.Service, 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		var workerDone chan struct{}
 		if workerID != "" {
-			if err := service.RunWorker(ctx, workerID, interval, time.Minute); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("execution worker: %v", err)
-			}
-			return
+			workerDone = make(chan struct{})
+			go func() {
+				defer close(workerDone)
+				if err := service.RunWorker(ctx, workerID, interval, time.Minute); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("execution worker: %v", err)
+				}
+			}()
 		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -1218,6 +1222,9 @@ func startExecutionProcessing(ctx context.Context, service *executions.Service, 
 			}
 			select {
 			case <-ctx.Done():
+				if workerDone != nil {
+					<-workerDone
+				}
 				return
 			case <-ticker.C:
 			}
