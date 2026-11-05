@@ -491,10 +491,15 @@ func TestHandlerDefinitionEscapedIdentifiersAndIntegrity(t *testing.T) {
 	h.serviceToken, h.store = "secret", store
 	key := strings.Repeat("k", 2048) + "/@?&+\n"
 	version := "v/1 &+\n"
+	escapeHeavy := strings.Repeat("<", 8000)
+	manifestJSON, err := json.Marshal(handlers.Manifest{Key: key, Version: version, ResourceClass: escapeHeavy})
+	if err != nil || !bytes.Contains(manifestJSON, []byte(`\u003c`)) || len(manifestJSON) <= len(escapeHeavy)*5 {
+		t.Fatalf("manifest escaping: size=%d err=%v", len(manifestJSON), err)
+	}
 	var body bytes.Buffer
 	encoder := json.NewEncoder(&body)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(handlerRegisterRequest{Manifest: handlers.Manifest{Key: key, Version: version, ResourceClass: strings.Repeat("<", 200000)}, Source: "output = input"}); err != nil {
+	if err := encoder.Encode(handlerRegisterRequest{Manifest: handlers.Manifest{Key: key, Version: version, ResourceClass: escapeHeavy}, Source: "output = input"}); err != nil {
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodPost, "/v1/handlers", &body)
@@ -510,7 +515,7 @@ func TestHandlerDefinitionEscapedIdentifiersAndIntegrity(t *testing.T) {
 	response = httptest.NewRecorder()
 	h.ServeHTTP(response, request)
 	var definition handlerRegisterRequest
-	if err := json.Unmarshal(response.Body.Bytes(), &definition); response.Code != http.StatusOK || err != nil || definition.Manifest.Key != key || definition.Manifest.Version != version || definition.Manifest.ResourceClass != strings.Repeat("<", 200000) || definition.Source != "output = input" {
+	if err := json.Unmarshal(response.Body.Bytes(), &definition); response.Code != http.StatusOK || err != nil || definition.Manifest.Key != key || definition.Manifest.Version != version || definition.Manifest.ResourceClass != escapeHeavy || definition.Source != "output = input" {
 		t.Fatalf("definition status=%d err=%v", response.Code, err)
 	}
 	manifest, _ := json.Marshal(handlers.Manifest{Key: "corrupt", Version: "1"})
