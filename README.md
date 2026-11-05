@@ -135,12 +135,26 @@ execution code and must not be exposed to WASM guest code.
 | `POST /v1/executions`, `GET /v1/executions/{id}` | Submit and inspect execution. |
 | `POST /v1/executions/{id}/cancel`, `GET /v1/executions/{id}/events` | Cancel and inspect runtime events. |
 | `GET /v1/handlers`, `POST /v1/handlers` | List manifests and register dynamic handlers. |
+| `GET /v1/handlers/definition?handler_key=...&version=...` | Read one stored Kavun definition with service authentication. |
 | `GET /v1/connectors`, `GET /v1/connectors/{provider}` | Discover connector providers and manifests. |
 | `POST /v1/worker/tasks:poll`, `tasks:heartbeat`, `tasks:complete`, `tasks:fail` | External worker lease protocol; all four use the `/v1/worker/` prefix. Short `/v1/worker/{poll,heartbeat,complete,fail}` aliases also work. |
 | `POST /v1/connections` | Register encrypted credentials. |
 | `POST /v1/oauth/{provider}/begin` | Begin OAuth authorization. |
 | `GET` or `POST /v1/oauth/callback` or `/v1/oauth/{provider}/callback` | Resolve OAuth attempts using returned state. |
 | `POST /v1/events` | Accept an `{"events":[...]}` envelope; each event needs `data._execution.workspace_id` and `execution_request_id`. |
+
+The definition endpoint requires a configured service token and exactly one URL-encoded
+`handler_key` and `version`. It returns `kind`, `manifest`, `source`,
+`allowed_modules`, `max_frames`, and `max_stack`, with `Cache-Control: no-store`.
+Invalid queries return 400; an absent configured token returns 403 and an invalid
+bearer token returns 401. Missing definitions, including built-in and WASM handlers,
+return 404. Unavailable storage returns 503; invalid stored definitions or storage errors return 500.
+The serialized response is limited to 6 MiB plus 4 KiB; stored source is checked
+against its SHA-256 hash before it is returned. The HTTP server's standard 1 MiB
+header limit includes the request target and headers, and clients or proxies may
+impose lower limits. Consequently, some previously registered long identifiers
+cannot be retrieved through this GET endpoint. The application also caps the
+encoded query at 3 MiB.
 
 See the focused documents for full contracts and deployment details:
 

@@ -11,10 +11,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/amp-labs/connectors/providers"
 	"github.com/mrchypark/conductor/internal/callbacks"
@@ -43,6 +45,9 @@ func newServer(service *executions.Service, registry *handlers.Registry, catalog
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/handlers/definition" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	if s.serviceToken != "" && !isOAuthCallbackPath(r.URL.Path) && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.serviceToken)) != 1 {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -76,6 +81,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.getExecution(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/handlers":
 		writeJSON(w, http.StatusOK, s.registry.Manifests())
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/handlers/definition":
+		s.getHandlerDefinition(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/connectors":
 		if s.catalog == nil {
 			writeError(w, http.StatusServiceUnavailable, "connector catalog unavailable")
@@ -101,6 +108,57 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "route not found")
 	}
+}
+
+func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request) {
+	if s.serviceToken == "" {
+		writeError(w, http.StatusForbidden, "handler definition requires CONDUCTOR_SERVICE_TOKEN")
+		return
+	}
+	if len(r.URL.RawQuery) > 3<<20 {
+		writeError(w, http.StatusBadRequest, "invalid handler query")
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil || len(query) != 2 || len(query["handler_key"]) != 1 || len(query["version"]) != 1 || query.Get("handler_key") == "" || query.Get("version") == "" || !utf8.ValidString(query.Get("handler_key")) || !utf8.ValidString(query.Get("version")) {
+		writeError(w, http.StatusBadRequest, "valid handler key and exactly one version are required")
+		return
+	}
+	if s.store == nil {
+		writeError(w, http.StatusServiceUnavailable, "handler store unavailable")
+		return
+	}
+	key, version := query.Get("handler_key"), query.Get("version")
+	record, err := s.store.GetDynamicHandler(r.Context(), key, version)
+	if errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "stored Kavun source unavailable for handler")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load handler definition")
+		return
+	}
+	var manifest handlers.Manifest
+	hash := sha256.Sum256(record.Source)
+	if len(record.Source) == 0 || len(record.Source) > 256<<10 || !utf8.Valid(record.Source) || fmt.Sprintf("%x", hash[:]) != record.SourceHash || len(record.ManifestJSON) > (6<<20)+1024 || json.Unmarshal(record.ManifestJSON, &manifest) != nil || manifest.Key != key || manifest.Version != record.Version {
+		writeError(w, http.StatusInternalServerError, "invalid stored handler definition")
+		return
+	}
+	response, err := json.Marshal(struct {
+		Kind           string            `json:"kind"`
+		Manifest       handlers.Manifest `json:"manifest"`
+		Source         string            `json:"source"`
+		AllowedModules []string          `json:"allowed_modules"`
+		MaxFrames      int               `json:"max_frames"`
+		MaxStack       int               `json:"max_stack"`
+	}{"kavun", manifest, string(record.Source), record.AllowedModules, record.MaxFrames, record.MaxStack})
+	if err != nil || len(response) > (6<<20)+4096 {
+		writeError(w, http.StatusInternalServerError, "handler definition exceeds response limit")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(response)
 }
 
 func isOAuthCallbackPath(path string) bool {

@@ -278,6 +278,10 @@ func (s *Store) dynamic(ctx context.Context, key, version string) (DynamicHandle
 	}
 	return r, nil
 }
+
+func (s *Store) GetDynamicHandler(ctx context.Context, key, version string) (DynamicHandlerRecord, error) {
+	return s.dynamic(ctx, key, version)
+}
 func (s *Store) DeleteDynamicHandler(ctx context.Context, key, version, hash string) error {
 	if key == "" || version == "" || hash == "" {
 		return errors.New("dynamic handler key, version, and hash are required")

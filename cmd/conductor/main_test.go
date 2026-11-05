@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -397,12 +400,63 @@ func TestDynamicKavunHandlerRegistrationRequiresServiceToken(t *testing.T) {
 	h := newServer(service, registry, nil)
 	h.serviceToken = "secret"
 	h.store = store
+	builtin, err := handlers.NewFuncHandler(handlers.Manifest{Key: "built/in@key", Version: "v 1"}, func(context.Context, handlers.Request) (handlers.Result, error) { return handlers.Result{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(builtin); err != nil {
+		t.Fatal(err)
+	}
 	registered := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/handlers", strings.NewReader(requestBody))
 	req.Header.Set("Authorization", "Bearer secret")
 	h.ServeHTTP(registered, req)
 	if registered.Code != http.StatusCreated {
 		t.Fatalf("expected registration success, got %d: %s", registered.Code, registered.Body.String())
+	}
+	for _, tc := range []struct {
+		name, target, token string
+		status              int
+	}{
+		{"stored", "/v1/handlers/definition?handler_key=transform.kavun&version=1", "secret", 200},
+		{"unauthorized", "/v1/handlers/definition?handler_key=transform.kavun&version=1", "wrong", 401},
+		{"missing", "/v1/handlers/definition?handler_key=missing&version=1", "secret", 404},
+		{"builtin", "/v1/handlers/definition?handler_key=built%2Fin%40key&version=v+1", "secret", 404},
+		{"duplicate", "/v1/handlers/definition?handler_key=x&handler_key=y&version=1", "secret", 400},
+		{"missing version", "/v1/handlers/definition?handler_key=x", "secret", 400},
+		{"invalid escape", "/v1/handlers/definition?handler_key=x%zz&version=1", "secret", 400},
+		{"extra", "/v1/handlers/definition?handler_key=x&version=1&other=y", "secret", 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			request.Header.Set("Authorization", "Bearer "+tc.token)
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, request)
+			if response.Code != tc.status || response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+			}
+			if tc.status == 200 {
+				var definition map[string]json.RawMessage
+				if err := json.Unmarshal(response.Body.Bytes(), &definition); err != nil || string(definition["source"]) != `"output = input"` || string(definition["kind"]) != `"kavun"` || definition["manifest"] == nil || definition["allowed_modules"] == nil || definition["max_frames"] == nil || definition["max_stack"] == nil || len(definition) != 6 {
+					t.Fatalf("unexpected definition: %s, err=%v", response.Body.String(), err)
+				}
+			}
+		})
+	}
+	disabled := newServer(service, registry, nil)
+	response := httptest.NewRecorder()
+	disabled.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=x&version=1", nil))
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("expected disabled definition access, got %d", response.Code)
+	}
+	unavailable := newServer(service, registry, nil)
+	unavailable.serviceToken = "secret"
+	request := httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=x&version=1", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response = httptest.NewRecorder()
+	unavailable.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected unavailable store, got %d", response.Code)
 	}
 	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "kavun-http", HandlerKey: "transform.kavun", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
 	if err != nil || execution.Status != "succeeded" || string(execution.Output) != `{"ok":true}` {
@@ -419,6 +473,88 @@ func TestDynamicKavunHandlerRegistrationRequiresServiceToken(t *testing.T) {
 	restoredExecution, err := restoredService.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "kavun-restored", HandlerKey: "transform.kavun", HandlerVersion: "1", Input: json.RawMessage(`{"restored":true}`)})
 	if err != nil || restoredExecution.Status != "succeeded" || string(restoredExecution.Output) != `{"restored":true}` {
 		t.Fatalf("unexpected restored dynamic execution: %#v err=%v", restoredExecution, err)
+	}
+}
+
+func TestHandlerDefinitionEscapedIdentifiersAndIntegrity(t *testing.T) {
+	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registry := handlers.NewRegistry()
+	service, err := executions.NewService(store, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newServer(service, registry, nil)
+	h.serviceToken, h.store = "secret", store
+	key := strings.Repeat("k", 2048) + "/@?&+\n"
+	version := "v/1 &+\n"
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(handlerRegisterRequest{Manifest: handlers.Manifest{Key: key, Version: version, ResourceClass: strings.Repeat("<", 200000)}, Source: "output = input"}); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/handlers", &body)
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("registration: %d %s", response.Code, response.Body.String())
+	}
+	values := url.Values{"handler_key": {key}, "version": {version}}
+	request = httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?"+values.Encode(), nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	var definition handlerRegisterRequest
+	if err := json.Unmarshal(response.Body.Bytes(), &definition); response.Code != http.StatusOK || err != nil || definition.Manifest.Key != key || definition.Manifest.Version != version || definition.Manifest.ResourceClass != strings.Repeat("<", 200000) || definition.Source != "output = input" {
+		t.Fatalf("definition status=%d err=%v", response.Code, err)
+	}
+	manifest, _ := json.Marshal(handlers.Manifest{Key: "corrupt", Version: "1"})
+	hash := sha256.Sum256([]byte("different source"))
+	if _, err := store.SaveDynamicHandler(context.Background(), storage.DynamicHandlerRecord{HandlerKey: "corrupt", Version: "1", ManifestJSON: manifest, Source: []byte("output = input"), SourceHash: fmt.Sprintf("%x", hash[:])}); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=corrupt&version=1", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "output = input") {
+		t.Fatalf("corrupt definition: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHandlerDefinitionRealServerRequestTargetLimit(t *testing.T) {
+	server := httptest.NewServer(&server{serviceToken: "secret"})
+	defer server.Close()
+	valid, err := http.NewRequest(http.MethodGet, server.URL+"/v1/handlers/definition?handler_key="+strings.Repeat("x", 2048)+"%2F%40%0A&version=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid.Header.Set("Authorization", "Bearer secret")
+	accepted, err := server.Client().Do(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.Body.Close()
+	if accepted.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("valid request status=%d, want %d", accepted.StatusCode, http.StatusServiceUnavailable)
+	}
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/v1/handlers/definition?handler_key="+strings.Repeat("x", http.DefaultMaxHeaderBytes+8192)+"&version=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer secret")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("oversized request status=%d, want %d", response.StatusCode, http.StatusRequestHeaderFieldsTooLarge)
 	}
 }
 
@@ -450,6 +586,13 @@ func TestWASMHandlerRegistrationPersistsMetadataAndReloadsLazily(t *testing.T) {
 	h.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("register status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	detail := httptest.NewRecorder()
+	detailRequest := httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=transform.wasm&version=1", nil)
+	detailRequest.Header.Set("Authorization", "Bearer secret")
+	h.ServeHTTP(detail, detailRequest)
+	if detail.Code != http.StatusNotFound {
+		t.Fatalf("WASM definition: %d %s", detail.Code, detail.Body.String())
 	}
 	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "wasm-http", HandlerKey: "transform.wasm", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
 	if err != nil || execution.Status != "succeeded" || string(execution.Output) != `{"ok":true}` {
