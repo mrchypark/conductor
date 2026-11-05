@@ -160,7 +160,11 @@ func (d *APIKeyDelivery) Invoke(ctx context.Context) (json.RawMessage, error) {
 	}
 	// Return only the inspected JSON tree; duplicate object members discarded by
 	// decoding must not smuggle an uninspected value into execution output.
-	return json.Marshal(decoded)
+	clean, err := json.Marshal(decoded)
+	if err != nil || bytes.Contains(clean, []byte(key.APIKey)) || bytes.Contains(clean, []byte(token)) {
+		return nil, errors.New("delivery provider response invalid or contains credentials")
+	}
+	return clean, nil
 }
 
 func readDeliveryBody(reader io.Reader, limit int64) ([]byte, error) {
@@ -223,6 +227,8 @@ func containsDeliverySecret(value any, key, token string) bool {
 	switch v := value.(type) {
 	case string:
 		return strings.Contains(v, key) || strings.Contains(v, token)
+	case json.Number:
+		return strings.Contains(string(v), key) || strings.Contains(string(v), token)
 	case map[string]any:
 		for name, item := range v {
 			if containsDeliverySecret(name, key, token) || containsDeliverySecret(item, key, token) {

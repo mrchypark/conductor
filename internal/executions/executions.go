@@ -284,6 +284,9 @@ func NewService(store *storage.Store, registry *handlers.Registry) (*Service, er
 func (s *Service) SetCallbackTarget(url string) { s.store.SetCallbackTarget(url) }
 
 func (s *Service) Submit(ctx context.Context, request ExecutionRequest) (Execution, error) {
+	if request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2" {
+		return Execution{}, errors.New("connector.credentials.invoke version 2 requires synchronous execution")
+	}
 	request = normalizeRetryBudget(request)
 	if err := validate(request); err != nil {
 		return Execution{}, err
@@ -426,6 +429,16 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 // SubmitAndExecute stores a request once, leases it, executes its pinned handler
 // with the requested retry policy, and returns the existing execution for duplicates.
 func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest) (Execution, error) {
+	inlineOnly := request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2"
+	if inlineOnly && (len(request.SubjectRef) > 0 || len(request.InputRef) > 0) {
+		return Execution{}, errors.New("credential invocation version 2 does not accept subject_ref or input_ref")
+	}
+	if inlineOnly && len(bytes.TrimSpace(request.Input)) > 0 {
+		var input map[string]json.RawMessage
+		if err := json.Unmarshal(request.Input, &input); err != nil || input == nil || len(input) != 0 {
+			return Execution{}, errors.New("credential invocation version 2 input must be an empty object")
+		}
+	}
 	request = normalizeRetryBudget(request)
 	if err := validate(request); err != nil {
 		return Execution{}, err
@@ -442,6 +455,9 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 		return Execution{}, err
 	}
 	if !created {
+		if inlineOnly {
+			return Execution{}, errors.New("idempotency_conflict: credential invocation version 2 requires a new execution request")
+		}
 		if err := s.checkIdempotency(ctx, request); err != nil {
 			return Execution{}, err
 		}
@@ -451,11 +467,18 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	if leaseTTL <= 0 {
 		leaseTTL = time.Minute
 	}
-	lease, err := s.store.AcquireLease(ctx, executionID, "inline:"+executionID, leaseTTL, 1)
+	var lease storage.LeaseRecord
+	if inlineOnly {
+		lease, err = s.store.AcquireInlineLease(ctx, executionID, leaseTTL)
+	} else {
+		lease, err = s.store.AcquireLease(ctx, executionID, "inline:"+executionID, leaseTTL, 1)
+	}
 	if err != nil {
 		return Execution{}, err
 	}
-	defer s.store.ReleaseLease(context.Background(), lease.ID, lease.FencingToken)
+	if !inlineOnly {
+		defer s.store.ReleaseLease(context.Background(), lease.ID, lease.FencingToken)
+	}
 
 	handler, err := s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
 	if err != nil {

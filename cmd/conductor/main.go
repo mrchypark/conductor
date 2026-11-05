@@ -47,6 +47,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	if len(r.Header.Values("X-Conductor-Human-Authorization")) > 0 && (r.Method != http.MethodPost || r.URL.Path != "/v1/executions") {
+		writeError(w, http.StatusBadRequest, "human authorization is only accepted for synchronous credential executions")
+		return
+	}
 	switch {
 	case r.Method == http.MethodPost && (r.URL.Path == "/v1/worker/poll" || r.URL.Path == "/v1/worker/tasks:poll"):
 		s.workerPoll(w, r)
@@ -172,6 +176,10 @@ func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request) {
 		request, err := executionRequestFromEvent(event)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("event %q: %v", event.Name, err))
+			return
+		}
+		if request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2" {
+			writeError(w, http.StatusBadRequest, "credential invocation version 2 requires synchronous execution")
 			return
 		}
 		requests[i].event = event
@@ -902,8 +910,9 @@ func (s *server) registerConnection(w http.ResponseWriter, r *http.Request) {
 func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	var raw json.RawMessage
 	var request executions.ExecutionRequest
-	if err := decoder.Decode(&request); err != nil {
+	if err := decoder.Decode(&raw); err != nil || json.Unmarshal(raw, &request) != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON request")
 		return
 	}
@@ -916,6 +925,55 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if s.serviceToken != "" && (request.WorkspaceID == "" || request.Actor.Type == "" || request.Actor.ID == "" || request.IdempotencyKey == "") {
 		writeError(w, http.StatusBadRequest, "workspace_id, actor, and idempotency_key are required")
+		return
+	}
+	humanHeaders := r.Header.Values("X-Conductor-Human-Authorization")
+	isHumanExecution := request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2"
+	if isHumanExecution {
+		if s.serviceToken == "" || len(r.Header.Values("Authorization")) != 1 {
+			writeError(w, http.StatusUnauthorized, "service authentication is required")
+			return
+		}
+		if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
+			writeError(w, http.StatusBadRequest, "credential invocation version 2 requires synchronous execution")
+			return
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			writeError(w, http.StatusBadRequest, "invalid execution request")
+			return
+		}
+		for key := range fields {
+			if strings.EqualFold(key, "retry") || strings.EqualFold(key, "retry_policy") {
+				writeError(w, http.StatusBadRequest, "credential invocation version 2 does not accept a retry policy")
+				return
+			}
+		}
+		if len(humanHeaders) != 1 || !strings.HasPrefix(humanHeaders[0], "Bearer ") {
+			writeError(w, http.StatusBadRequest, "one human Bearer authorization is required")
+			return
+		}
+		token := strings.TrimPrefix(humanHeaders[0], "Bearer ")
+		if len(token) == 0 || len(token) > 8192 || strings.IndexFunc(token, func(r rune) bool { return r < 33 || r > 126 || r == ',' }) >= 0 {
+			writeError(w, http.StatusBadRequest, "invalid human Bearer authorization")
+			return
+		}
+		type executionRequestData executions.ExecutionRequest
+		encoded, err := json.Marshal(executionRequestData(request))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid execution request")
+			return
+		}
+		var value any
+		requestDecoder := json.NewDecoder(strings.NewReader(string(encoded)))
+		requestDecoder.UseNumber()
+		if requestDecoder.Decode(&value) != nil || containsHumanToken(value, token) {
+			writeError(w, http.StatusBadRequest, "execution request must not contain human authorization")
+			return
+		}
+		r = r.WithContext(ampconnectors.WithHumanToken(r.Context(), token))
+	} else if len(humanHeaders) != 0 {
+		writeError(w, http.StatusBadRequest, "human authorization is only accepted for credential invocation version 2")
 		return
 	}
 	if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
@@ -934,6 +992,28 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, execution)
+}
+
+func containsHumanToken(value any, token string) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.Contains(v, token)
+	case json.Number:
+		return strings.Contains(string(v), token)
+	case map[string]any:
+		for key, item := range v {
+			if strings.Contains(key, token) || containsHumanToken(item, token) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if containsHumanToken(item, token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *server) getExecution(w http.ResponseWriter, r *http.Request) {
@@ -1108,13 +1188,7 @@ func main() {
 		}
 	}
 	// Register configured handlers before claiming durable work after a restart.
-	if workerID := os.Getenv("CONDUCTOR_WORKER_ID"); workerID != "" {
-		go func() {
-			if err := service.RunWorker(workerCtx, workerID, 250*time.Millisecond, time.Minute); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("execution worker: %v", err)
-			}
-		}()
-	}
+	startExecutionProcessing(workerCtx, service, store, os.Getenv("CONDUCTOR_WORKER_ID"), 250*time.Millisecond)
 	log.Printf("conductor listening on %s with %d connector providers", *addr, len(catalog.Names()))
 	srv := newServer(service, registry, catalog)
 	srv.store = store
@@ -1124,6 +1198,32 @@ func main() {
 	if err := http.ListenAndServe(*addr, srv); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func startExecutionProcessing(ctx context.Context, service *executions.Service, store *storage.Store, workerID string, interval time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if workerID != "" {
+			if err := service.RunWorker(ctx, workerID, interval, time.Minute); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("execution worker: %v", err)
+			}
+			return
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			if err := store.RecoverExpiredLeases(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("execution recovery: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return done
 }
 
 func rhizaConfig(dataDir string) (persistence.Config, error) {

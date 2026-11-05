@@ -40,9 +40,27 @@ func loadCredentialProviderHandler(path, serviceToken string, registry *handlers
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return errors.New("external credential provider configuration must contain one JSON object")
 	}
-	handler, err := connectors.NewCredentialProviderHandler(config, authority, provider)
+	v2, err := connectors.NewCredentialProviderHandlerV2(config, authority, provider)
 	if err != nil {
 		return err
 	}
-	return registry.Register(handler)
+	fileBacked := 0
+	for _, binding := range config.Bindings {
+		if binding.TokenFile != "" {
+			fileBacked++
+		}
+	}
+	if fileBacked != 0 && fileBacked != len(config.Bindings) {
+		return errors.New("credential provider token files must be configured for all bindings or none")
+	}
+	if fileBacked > 0 {
+		v1, err := connectors.NewCredentialProviderHandler(config, authority, provider)
+		if err != nil {
+			return err
+		}
+		if err := registry.Register(v1); err != nil {
+			return err
+		}
+	}
+	return registry.Register(v2)
 }

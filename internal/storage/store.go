@@ -375,11 +375,15 @@ func (s *Store) CreateExecution(ctx context.Context, r ExecutionRequestRecord, e
 		return false, e
 	}
 	t := now()
+	status := "queued"
+	if r.HandlerKey == "connector.credentials.invoke" && r.HandlerVersion == "2" {
+		status = "inline_pending"
+	}
 	ss := []persistence.Statement{
 		stm(`INSERT OR IGNORE INTO submission_claims(request_id,claim_id,created_at) VALUES(?,?,?)`, r.ID, claim, t),
 		stm(`INSERT INTO execution_requests(id,workspace_id,workflow_key,workflow_version,workflow_instance_id,task_id,node_key,handler_key,handler_version,operation_key,connection_id,actor_type,actor_id,subject_ref,input_ref,deadline_at,input,timeout_ns,max_attempts,retry_backoff_ns,retry_backoff_mode,correlation_id,causation_id,idempotency_key,created_at) SELECT ?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.WorkspaceID, r.WorkflowKey, int64(r.WorkflowVersion), r.WorkflowID, r.TaskID, r.NodeKey, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, r.ActorType, r.ActorID, encodeBlob(r.SubjectRef), encodeBlob(r.InputRef), ft(r.DeadlineAt), encodeBlob(r.Input), r.Timeout.Nanoseconds(), r.MaxAttempts, r.RetryBackoff.Nanoseconds(), r.RetryBackoffMode, r.CorrelationID, r.CausationID, r.IdempotencyKey, t, r.ID, claim),
 		stm(`INSERT INTO execution_request_credentials(execution_request_id,connection_id,credential_revision) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.ConnectionID, r.CredentialRevision, r.ID, claim),
-		stm(`INSERT INTO executions(id,execution_request_id,status,handler_key,handler_version,operation_key,connection_id,input,output,error_class,error_message,error_retryable,created_at,updated_at) SELECT ?,?,'queued',?,?,?,?,?,'','','',0,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, executionID, r.ID, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, encodeBlob(r.Input), t, t, r.ID, claim),
+		stm(`INSERT INTO executions(id,execution_request_id,status,handler_key,handler_version,operation_key,connection_id,input,output,error_class,error_message,error_retryable,created_at,updated_at) SELECT ?,?,?,?,?,?,?,?,'','','',0,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, executionID, r.ID, status, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, encodeBlob(r.Input), t, t, r.ID, claim),
 		stm(`INSERT INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT ?,?,'execution.requested',0,'{}',? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, `event_`+executionID+`:requested`, executionID, t, r.ID, claim)}
 	if _, e = s.db.Mutate(ctx, "create execution "+r.ID+" "+claim, ss...); e != nil {
 		return false, e
@@ -428,6 +432,15 @@ func (s *Store) GetExecution(ctx context.Context, id string) (ExecutionRecord, e
 }
 
 func (s *Store) AcquireLease(ctx context.Context, executionID, worker string, ttl time.Duration, attempt int) (LeaseRecord, error) {
+	return s.acquireLease(ctx, executionID, worker, ttl, attempt, false)
+}
+
+// AcquireInlineLease claims a newly submitted synchronous-only execution once.
+func (s *Store) AcquireInlineLease(ctx context.Context, executionID string, ttl time.Duration) (LeaseRecord, error) {
+	return s.acquireLease(ctx, executionID, "inline:"+executionID, ttl, 1, true)
+}
+
+func (s *Store) acquireLease(ctx context.Context, executionID, worker string, ttl time.Duration, attempt int, inline bool) (LeaseRecord, error) {
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
@@ -441,9 +454,13 @@ func (s *Store) AcquireLease(ctx context.Context, executionID, worker string, tt
 	id = "lease_" + id
 	n := time.Now().UTC()
 	t, x := ft(n), ft(n.Add(ttl))
+	claimable := "e.status IN('queued','retry_wait') AND NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version='2')"
+	if inline {
+		claimable = "e.status='inline_pending' AND e.handler_key='connector.credentials.invoke' AND e.handler_version='2'"
+	}
 	ss := []persistence.Statement{
-		stm(`INSERT INTO leases(lease_id,execution_id,attempt_number,worker_id,fencing_token,expires_at,created_at,updated_at,status) SELECT ?,e.id,?,?,COALESCE((SELECT fencing_token FROM leases WHERE execution_id=e.id),0)+1,?,?,?,'active' FROM executions e WHERE e.id=? AND e.status IN('queued','retry_wait') ON CONFLICT(execution_id) DO UPDATE SET lease_id=excluded.lease_id,attempt_number=excluded.attempt_number,worker_id=excluded.worker_id,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,updated_at=excluded.updated_at,status='active'`, id, attempt, worker, x, t, t, executionID),
-		stm(`UPDATE executions SET status='running',updated_at=? WHERE id=? AND status IN('queued','retry_wait') AND EXISTS(SELECT 1 FROM leases WHERE execution_id=? AND lease_id=?)`, t, executionID, executionID, id),
+		stm(`INSERT INTO leases(lease_id,execution_id,attempt_number,worker_id,fencing_token,expires_at,created_at,updated_at,status) SELECT ?,e.id,?,?,COALESCE((SELECT fencing_token FROM leases WHERE execution_id=e.id),0)+1,?,?,?,'active' FROM executions e WHERE e.id=? AND `+claimable+` ON CONFLICT(execution_id) DO UPDATE SET lease_id=excluded.lease_id,attempt_number=excluded.attempt_number,worker_id=excluded.worker_id,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,updated_at=excluded.updated_at,status='active'`, id, attempt, worker, x, t, t, executionID),
+		stm(`UPDATE executions SET status='running',updated_at=? WHERE id=? AND status IN('queued','retry_wait','inline_pending') AND EXISTS(SELECT 1 FROM leases WHERE execution_id=? AND lease_id=?)`, t, executionID, executionID, id),
 		stm(`UPDATE retry_timers SET status='claimed' WHERE execution_id=? AND status='scheduled' AND EXISTS(SELECT 1 FROM leases WHERE execution_id=? AND lease_id=?)`, executionID, executionID, id),
 		stm(`INSERT OR IGNORE INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT 'event_'||?||':started:'||fencing_token,?,'execution.started',?,'{}',? FROM leases WHERE execution_id=? AND lease_id=?`, executionID, executionID, attempt, t, executionID, id)}
 	if _, e = s.db.Mutate(ctx, "acquire lease "+id, ss...); e != nil {
@@ -459,7 +476,7 @@ func (s *Store) AcquireLease(ctx context.Context, executionID, worker string, tt
 	return l, e
 }
 func (s *Store) ClaimNext(ctx context.Context, worker string, ttl time.Duration) (ExecutionRequestRecord, LeaseRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),(SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'),1),e.id FROM executions e WHERE e.status='queued' OR(e.status='retry_wait' AND EXISTS(SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND t.run_at<=?)) ORDER BY e.created_at,e.id LIMIT 1`, now())
+	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),(SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'),1),e.id FROM executions e WHERE NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version='2') AND (e.status='queued' OR(e.status='retry_wait' AND EXISTS(SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND t.run_at<=?))) ORDER BY e.created_at,e.id LIMIT 1`, now())
 	if e != nil {
 		return ExecutionRequestRecord{}, LeaseRecord{}, e
 	}
@@ -649,7 +666,25 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 	return nil
 }
 func (s *Store) RecoverExpiredLeases(ctx context.Context, n time.Time) error {
-	rows, e := s.db.Query(ctx, `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,r.max_attempts FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`, ft(n))
+	pending, e := s.db.Query(ctx, `SELECT id FROM executions WHERE status='inline_pending' AND handler_key='connector.credentials.invoke' AND handler_version='2' AND updated_at<=?`, ft(n.Add(-time.Minute)))
+	if e != nil {
+		return e
+	}
+	for _, row := range pending {
+		id := str(row[0])
+		lease, err := s.AcquireInlineLease(ctx, id, time.Minute)
+		if err != nil {
+			current, getErr := s.GetExecution(ctx, id)
+			if getErr != nil || current.Status == "inline_pending" {
+				return err
+			}
+			continue
+		}
+		if err := s.CompleteExecutionWithLease(ctx, lease.ID, lease.FencingToken, id, "failed", nil, "outcome_unknown", "inline execution was interrupted before its outcome was recorded", false, 1); err != nil {
+			return err
+		}
+	}
+	rows, e := s.db.Query(ctx, `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,CASE WHEN e.handler_key='connector.credentials.invoke' AND e.handler_version='2' THEN 1 ELSE r.max_attempts END FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`, ft(n))
 	if e != nil {
 		return e
 	}

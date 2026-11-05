@@ -39,18 +39,43 @@ type credentialProviderDelivery struct {
 // reads a current human authority token for every invocation and never accepts
 // a destination or credential from execution input.
 func NewCredentialProviderHandler(config CredentialProviderConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
+	return newCredentialProviderHandler(config, authorityClient, providerClient, false)
+}
+
+type humanTokenKey struct{}
+
+// WithHumanToken attaches the human authority token to a single request context.
+func WithHumanToken(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, humanTokenKey{}, token)
+}
+
+// NewCredentialProviderHandlerV2 obtains human authority tokens only from request contexts.
+func NewCredentialProviderHandlerV2(config CredentialProviderConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
+	return newCredentialProviderHandler(config, authorityClient, providerClient, true)
+}
+
+func newCredentialProviderHandler(config CredentialProviderConfig, authorityClient, providerClient *http.Client, contextToken bool) (handlers.Handler, error) {
 	if config.Issuer == "" || len(config.Bindings) == 0 {
 		return nil, errors.New("credential provider configuration requires issuer and bindings")
 	}
 	deliveries := make(map[string]credentialProviderDelivery, len(config.Bindings))
 	for _, binding := range config.Bindings {
-		if binding.ConnectionID == "" || binding.WorkspaceID == "" || binding.Revision < 1 || binding.OperationKey == "" || binding.TokenFile == "" || (binding.APIKey == nil) == (binding.OAuth == nil) {
+		if binding.ConnectionID == "" || binding.WorkspaceID == "" || binding.Revision < 1 || binding.OperationKey == "" || (!contextToken && binding.TokenFile == "") || (binding.APIKey == nil) == (binding.OAuth == nil) {
 			return nil, errors.New("credential provider binding invalid")
 		}
 		if _, exists := deliveries[binding.ConnectionID]; exists {
 			return nil, errors.New("credential provider connection binding duplicated")
 		}
 		source := func(ctx context.Context) (string, error) { return readCredentialProviderToken(ctx, binding.TokenFile) }
+		if contextToken {
+			source = func(ctx context.Context) (string, error) {
+				token, _ := ctx.Value(humanTokenKey{}).(string)
+				if !oauthBearer(token) {
+					return "", errors.New("token unavailable")
+				}
+				return token, nil
+			}
+		}
 		delivery := credentialProviderDelivery{binding: binding}
 		if binding.APIKey != nil {
 			client, err := NewAPIKeyDelivery(config.Issuer, *binding.APIKey, source, authorityClient, providerClient)
@@ -79,7 +104,11 @@ func NewCredentialProviderHandler(config CredentialProviderConfig, authorityClie
 		}
 		deliveries[binding.ConnectionID] = delivery
 	}
-	return handlers.NewFuncHandler(handlers.Manifest{Key: "connector.credentials.invoke", Version: "1", DefaultTimeout: 30, Idempotency: "provider-defined", ResourceClass: "network"}, func(ctx context.Context, request handlers.Request) (handlers.Result, error) {
+	version := "1"
+	if contextToken {
+		version = "2"
+	}
+	return handlers.NewFuncHandler(handlers.Manifest{Key: "connector.credentials.invoke", Version: version, DefaultTimeout: 30, Idempotency: "provider-defined", ResourceClass: "network"}, func(ctx context.Context, request handlers.Request) (handlers.Result, error) {
 		if input := strings.TrimSpace(string(request.Input)); input != "" {
 			var object map[string]json.RawMessage
 			if json.Unmarshal([]byte(input), &object) != nil || object == nil || len(object) != 0 {

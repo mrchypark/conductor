@@ -219,3 +219,106 @@ func TestCredentialProviderConfigurationFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestCredentialProviderV2HTTPUsesRequestHumanToken(t *testing.T) {
+	const humanToken = "request-human-token"
+	expires := time.Now().Add(time.Hour).UnixMilli()
+	binding := connectors.OAuthDeliveryBinding{GrantID: "grant", ProviderID: "fixture", AccountID: "account", ConnectionGeneration: "generation", Resource: "https://conductor.example/connections", ConsumerClientID: "conductor", OwnerSubject: "owner", Scopes: []string{"read"}, CredentialVersion: 1, ConsentExpiresAtUnixMS: expires}
+	var calls atomic.Int32
+	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer "+humanToken {
+			http.Error(w, "wrong token", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"kind": "oauth2", "access_token": "upstream-secret", "token_type": "Bearer", "grant_id": binding.GrantID, "provider_id": binding.ProviderID, "connection_generation": binding.ConnectionGeneration, "credential_version": 1, "account_id": binding.AccountID, "scopes": binding.Scopes, "token_expires_at_unix_ms": expires - 1, "consent_expires_at_unix_ms": expires})
+	}))
+	defer authority.Close()
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer upstream-secret" {
+			http.Error(w, "wrong token", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer provider.Close()
+	binding.Endpoint = provider.URL + "/approved"
+	config := connectors.CredentialProviderConfig{Issuer: authority.URL, Bindings: []connectors.CredentialProviderBinding{{ConnectionID: "conn", WorkspaceID: "ws", Revision: 1, OperationKey: "read", OAuth: &binding}}}
+	body, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry := handlers.NewRegistry()
+	if err := loadCredentialProviderHandler(path, "service", registry, authority.Client(), provider.Client()); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(context.Background(), "file:"+filepath.Join(dir, "conductor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := executions.NewService(store, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{executions: service, registry: registry, serviceToken: "service"}
+	req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(`{"execution_request_id":"v2","workspace_id":"ws","handler":"connector.credentials.invoke","handler_version":"2","operation":"read","connection_id":"conn","credential_revision":1,"actor":{"type":"service","id":"caller"},"idempotency_key":"v2","input":{}}`))
+	req.Header.Set("Authorization", "Bearer service")
+	req.Header.Set("X-Conductor-Human-Authorization", "Bearer "+humanToken)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"succeeded"`) || calls.Load() != 1 {
+		t.Fatalf("unexpected execution status=%d body=%s calls=%d", w.Code, w.Body.String(), calls.Load())
+	}
+	if strings.Contains(w.Body.String(), humanToken) || strings.Contains(w.Body.String(), "upstream-secret") {
+		t.Fatal("credential leaked in response")
+	}
+}
+
+func TestCredentialV2RecoveryAfterRestartWithoutWorker(t *testing.T) {
+	ctx := context.Background()
+	dsn := "file:" + filepath.Join(t.TempDir(), "conductor.db")
+	store, err := storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created, err := store.CreateExecution(ctx, storage.ExecutionRequestRecord{ID: "abandoned", HandlerKey: "connector.credentials.invoke", HandlerVersion: "2"}, "exec_abandoned"); err != nil || !created {
+		store.Close()
+		t.Fatalf("create: %v %v", created, err)
+	}
+	if _, err := store.AcquireInlineLease(ctx, "exec_abandoned", time.Millisecond); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = storage.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	recoveryCtx, cancel := context.WithCancel(ctx)
+	done := startExecutionProcessing(recoveryCtx, nil, store, "", 10*time.Millisecond)
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		execution, err := store.GetExecution(ctx, "exec_abandoned")
+		if err == nil && execution.Status == "failed" {
+			if execution.ErrorClass != "outcome_unknown" {
+				t.Fatalf("unexpected recovery error: %s", execution.ErrorClass)
+			}
+			if _, err := store.AcquireInlineLease(ctx, "exec_abandoned", time.Minute); err == nil {
+				t.Fatal("recovered execution can be replayed")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("abandoned execution was not recovered without a worker")
+}

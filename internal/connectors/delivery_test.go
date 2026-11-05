@@ -184,6 +184,39 @@ func TestAPIKeyDeliveryRejectsMismatchedOrSecretResponse(t *testing.T) {
 	}
 }
 
+func TestAPIKeyDeliveryRejectsScalarSecretsInOutput(t *testing.T) {
+	for _, tt := range []struct {
+		name, key, token, output string
+		wantErr                  bool
+	}{
+		{"numeric key", "123456789", "human-token", `{"nested":[123456789]}`, true},
+		{"numeric human token", "provider-key", "987654321", `{"nested":[987654321]}`, true},
+		{"boolean key", "true", "human-token", `{"nested":[true]}`, true},
+		{"null human token", "provider-key", "null", `{"nested":[null]}`, true},
+		{"unrelated number", "123456789", "human-token", `{"nested":[42]}`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			binding := deliveryBinding()
+			authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				writeDelivery(t, w, binding, tt.key)
+			}))
+			defer authority.Close()
+			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tt.output))
+			}))
+			defer provider.Close()
+			delivery, err := NewAPIKeyDelivery(authority.URL, binding, func(context.Context) (string, error) { return tt.token, nil }, authority.Client(), rewriteClient(provider))
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := delivery.Invoke(context.Background())
+			if (err != nil) != tt.wantErr || (tt.wantErr && len(output) != 0) || (!tt.wantErr && string(output) != tt.output) {
+				t.Fatal("unexpected delivery result")
+			}
+		})
+	}
+}
+
 func TestAPIKeyDeliveryRejectsMalformedOrDuplicateCredentialEnvelope(t *testing.T) {
 	tests := []struct {
 		name string
