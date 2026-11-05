@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -47,6 +48,83 @@ func TestInlineCredentialExecutionCannotBeReplayed(t *testing.T) {
 	}
 	if _, err := store.AcquireInlineLease(ctx, "exec_inline", time.Minute); err == nil {
 		t.Fatal("inline replay accepted")
+	}
+}
+
+func TestConcurrentInlineAndGeneralRecovery(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, "file:"+t.TempDir()+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, id := range []string{"pending", "expired"} {
+		req := ExecutionRequestRecord{ID: id, HandlerKey: "connector.credentials.invoke", HandlerVersion: "2", MaxAttempts: 3}
+		if created, err := store.CreateExecution(ctx, req, "exec_"+id); err != nil || !created {
+			t.Fatalf("create %s: %v %v", id, created, err)
+		}
+	}
+	lease, err := store.AcquireInlineLease(ctx, "exec_expired", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Mutate(ctx, "make inline recovery fixtures stale",
+		stm(`UPDATE executions SET updated_at=? WHERE id='exec_pending'`, ft(time.Now().Add(-2*time.Minute))),
+		stm(`UPDATE leases SET expires_at=? WHERE lease_id=?`, ft(time.Now().Add(-time.Minute)), lease.ID)); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, recover := range []func(context.Context, time.Time) error{store.RecoverExpiredLeases, store.RecoverExpiredInlineLeases} {
+		go func() {
+			<-start
+			results <- recover(ctx, time.Now().UTC())
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent recovery: %v", err)
+		}
+	}
+	for _, id := range []string{"pending", "expired"} {
+		executionID := "exec_" + id
+		execution, err := store.GetExecution(ctx, executionID)
+		if err != nil || execution.Status != "failed" || execution.ErrorClass != "outcome_unknown" {
+			t.Fatalf("%s execution: %+v %v", id, execution, err)
+		}
+		callback, err := store.Callback(ctx, executionID)
+		var payload struct {
+			RuntimeStatus string `json:"runtime_status"`
+			ErrorClass    string `json:"error_class"`
+		}
+		if err != nil || callback.Status != execution.Status || json.Unmarshal(callback.Payload, &payload) != nil || payload.RuntimeStatus != execution.Status || payload.ErrorClass != execution.ErrorClass {
+			t.Fatalf("%s callback: %+v payload=%+v err=%v", id, callback, payload, err)
+		}
+		events, err := store.ListExecutionEvents(ctx, executionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		terminal := 0
+		for _, event := range events {
+			if event.Type == "execution.failed" {
+				terminal++
+			}
+		}
+		if terminal != 1 {
+			t.Fatalf("%s terminal events: %d", id, terminal)
+		}
+		if _, err := store.AcquireInlineLease(ctx, executionID, time.Minute); err == nil {
+			t.Fatalf("%s inline replay accepted", id)
+		}
+	}
+	if _, _, err := store.ClaimNext(ctx, "worker", time.Minute); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("worker replay: %v", err)
+	}
+	_ = store.CompleteExecutionWithLease(ctx, lease.ID, lease.FencingToken, "exec_expired", "succeeded", []byte(`{}`), "", "", false, 1)
+	execution, err := store.GetExecution(ctx, "exec_expired")
+	if err != nil || execution.Status != "failed" || execution.ErrorClass != "outcome_unknown" {
+		t.Fatalf("expired lease changed terminal state: %+v %v", execution, err)
 	}
 }
 
