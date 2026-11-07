@@ -195,6 +195,45 @@ func TestCredentialProviderV3ProviderIdentity(t *testing.T) {
 	}
 }
 
+func TestCredentialProviderVersionsShareOAuthVersionGuard(t *testing.T) {
+	for _, first := range []string{"2", "3"} {
+		t.Run(first, func(t *testing.T) {
+			binding := oauthBinding(time.Now())
+			var authorityCalls, providerCalls atomic.Int32
+			authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				version := binding.CredentialVersion
+				if authorityCalls.Add(1) == 1 {
+					version++
+				}
+				writeOAuthDelivery(w, binding, oauthDeliverySecret, version)
+			}))
+			defer authority.Close()
+			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				providerCalls.Add(1)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer provider.Close()
+			config := CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "read", OAuth: &binding}}}
+			v2, v3, err := NewCredentialProviderHandlers(config, authority.Client(), rewriteGitHubClient(provider))
+			if err != nil {
+				t.Fatal(err)
+			}
+			high, low := v2, v3
+			if first == "3" {
+				high, low = v3, v2
+			}
+			ctx := WithHumanToken(context.Background(), "human-token")
+			request := handlers.Request{ConnectionID: "connection", WorkspaceID: "workspace", CredentialRevision: 1, OperationKey: "read"}
+			if _, err := high.Execute(ctx, request); err != nil {
+				t.Fatalf("newer credential: %v", err)
+			}
+			if _, err := low.Execute(ctx, request); err == nil || authorityCalls.Load() != 2 || providerCalls.Load() != 1 {
+				t.Fatalf("older credential: err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
+			}
+		})
+	}
+}
+
 func TestCredentialProviderV3RejectsMismatchedOAuthDelivery(t *testing.T) {
 	binding := oauthBinding(time.Now())
 	var authorityCalls, providerCalls atomic.Int64
