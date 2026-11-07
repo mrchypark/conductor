@@ -380,7 +380,7 @@ func (s *Store) CreateExecution(ctx context.Context, r ExecutionRequestRecord, e
 	}
 	t := now()
 	status := "queued"
-	if r.HandlerKey == "connector.credentials.invoke" && r.HandlerVersion == "2" {
+	if r.HandlerKey == "connector.credentials.invoke" && (r.HandlerVersion == "2" || r.HandlerVersion == "3") {
 		status = "inline_pending"
 	}
 	ss := []persistence.Statement{
@@ -458,9 +458,9 @@ func (s *Store) acquireLease(ctx context.Context, executionID, worker string, tt
 	id = "lease_" + id
 	n := time.Now().UTC()
 	t, x := ft(n), ft(n.Add(ttl))
-	claimable := "e.status IN('queued','retry_wait') AND NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version='2')"
+	claimable := "e.status IN('queued','retry_wait') AND NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3'))"
 	if inline {
-		claimable = "e.status='inline_pending' AND e.handler_key='connector.credentials.invoke' AND e.handler_version='2'"
+		claimable = "e.status='inline_pending' AND e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3')"
 	}
 	ss := []persistence.Statement{
 		stm(`INSERT INTO leases(lease_id,execution_id,attempt_number,worker_id,fencing_token,expires_at,created_at,updated_at,status) SELECT ?,e.id,?,?,COALESCE((SELECT fencing_token FROM leases WHERE execution_id=e.id),0)+1,?,?,?,'active' FROM executions e WHERE e.id=? AND `+claimable+` ON CONFLICT(execution_id) DO UPDATE SET lease_id=excluded.lease_id,attempt_number=excluded.attempt_number,worker_id=excluded.worker_id,fencing_token=excluded.fencing_token,expires_at=excluded.expires_at,updated_at=excluded.updated_at,status='active'`, id, attempt, worker, x, t, t, executionID),
@@ -480,7 +480,7 @@ func (s *Store) acquireLease(ctx context.Context, executionID, worker string, tt
 	return l, e
 }
 func (s *Store) ClaimNext(ctx context.Context, worker string, ttl time.Duration) (ExecutionRequestRecord, LeaseRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),(SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'),1),e.id FROM executions e WHERE NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version='2') AND (e.status='queued' OR(e.status='retry_wait' AND EXISTS(SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND t.run_at<=?))) ORDER BY e.created_at,e.id LIMIT 1`, now())
+	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),(SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'),1),e.id FROM executions e WHERE NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3')) AND (e.status='queued' OR(e.status='retry_wait' AND EXISTS(SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND t.run_at<=?))) ORDER BY e.created_at,e.id LIMIT 1`, now())
 	if e != nil {
 		return ExecutionRequestRecord{}, LeaseRecord{}, e
 	}
@@ -679,7 +679,7 @@ func (s *Store) RecoverExpiredInlineLeases(ctx context.Context, n time.Time) err
 }
 
 func (s *Store) recoverExpiredLeases(ctx context.Context, n time.Time, inlineOnly bool) error {
-	pending, e := s.db.Query(ctx, `SELECT id FROM executions WHERE status='inline_pending' AND handler_key='connector.credentials.invoke' AND handler_version='2' AND updated_at<=?`, ft(n.Add(-time.Minute)))
+	pending, e := s.db.Query(ctx, `SELECT id FROM executions WHERE status='inline_pending' AND handler_key='connector.credentials.invoke' AND handler_version IN('2','3') AND updated_at<=?`, ft(n.Add(-time.Minute)))
 	if e != nil {
 		return e
 	}
@@ -697,9 +697,9 @@ func (s *Store) recoverExpiredLeases(ctx context.Context, n time.Time, inlineOnl
 			return err
 		}
 	}
-	query := `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,CASE WHEN e.handler_key='connector.credentials.invoke' AND e.handler_version='2' THEN 1 ELSE r.max_attempts END FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`
+	query := `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,CASE WHEN e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3') THEN 1 ELSE r.max_attempts END FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`
 	if inlineOnly {
-		query += ` AND e.handler_key='connector.credentials.invoke' AND e.handler_version='2'`
+		query += ` AND e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3')`
 	}
 	rows, e := s.db.Query(ctx, query, ft(n))
 	if e != nil {

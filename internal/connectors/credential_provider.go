@@ -7,9 +7,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"syscall"
 
+	"github.com/amp-labs/connectors/generic"
+	"github.com/amp-labs/connectors/providers"
 	"github.com/mrchypark/conductor/internal/handlers"
 )
 
@@ -39,7 +42,7 @@ type credentialProviderDelivery struct {
 // reads a current human authority token for every invocation and never accepts
 // a destination or credential from execution input.
 func NewCredentialProviderHandler(config CredentialProviderConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
-	return newCredentialProviderHandler(config, authorityClient, providerClient, false)
+	return newCredentialProviderHandler(config, authorityClient, providerClient, false, false)
 }
 
 type humanTokenKey struct{}
@@ -51,10 +54,16 @@ func WithHumanToken(ctx context.Context, token string) context.Context {
 
 // NewCredentialProviderHandlerV2 obtains human authority tokens only from request contexts.
 func NewCredentialProviderHandlerV2(config CredentialProviderConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
-	return newCredentialProviderHandler(config, authorityClient, providerClient, true)
+	return newCredentialProviderHandler(config, authorityClient, providerClient, true, false)
 }
 
-func newCredentialProviderHandler(config CredentialProviderConfig, authorityClient, providerClient *http.Client, contextToken bool) (handlers.Handler, error) {
+// NewCredentialProviderHandlerV3 routes reviewed OAuth requests through AMP.
+// Unknown providers fail per invocation, allowing other bindings and @2 to work.
+func NewCredentialProviderHandlerV3(config CredentialProviderConfig, authorityClient, providerClient *http.Client) (handlers.Handler, error) {
+	return newCredentialProviderHandler(config, authorityClient, providerClient, true, true)
+}
+
+func newCredentialProviderHandler(config CredentialProviderConfig, authorityClient, providerClient *http.Client, contextToken, ampOAuth bool) (handlers.Handler, error) {
 	if config.Issuer == "" || len(config.Bindings) == 0 {
 		return nil, errors.New("credential provider configuration requires issuer and bindings")
 	}
@@ -89,6 +98,25 @@ func newCredentialProviderHandler(config CredentialProviderConfig, authorityClie
 				return nil, errors.New("credential provider OAuth binding invalid")
 			}
 			endpoint := binding.OAuth.Endpoint
+			if ampOAuth {
+				if !slices.Contains(providers.AllNames(), binding.OAuth.ProviderID) {
+					delivery.invoke = func(context.Context) ([]byte, error) {
+						return nil, errors.New("credential provider AMP provider unsupported")
+					}
+					deliveries[binding.ConnectionID] = delivery
+					continue
+				}
+				conn, err := generic.NewConnector(binding.OAuth.ProviderID, generic.WithAuthenticatedClient(client))
+				if err != nil {
+					return nil, errors.New("credential provider AMP binding invalid")
+				}
+				delivery.invoke = func(ctx context.Context) ([]byte, error) {
+					_, body, err := conn.HTTPClient().Get(ctx, endpoint)
+					return body, err
+				}
+				deliveries[binding.ConnectionID] = delivery
+				continue
+			}
 			delivery.invoke = func(ctx context.Context) ([]byte, error) {
 				req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 				if err != nil {
@@ -107,6 +135,9 @@ func newCredentialProviderHandler(config CredentialProviderConfig, authorityClie
 	version := "1"
 	if contextToken {
 		version = "2"
+	}
+	if ampOAuth {
+		version = "3"
 	}
 	return handlers.NewFuncHandler(handlers.Manifest{Key: "connector.credentials.invoke", Version: version, DefaultTimeout: 30, Idempotency: "provider-defined", ResourceClass: "network"}, func(ctx context.Context, request handlers.Request) (handlers.Result, error) {
 		if input := strings.TrimSpace(string(request.Input)); input != "" {

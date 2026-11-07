@@ -26,23 +26,26 @@ func TestHumanAuthorizationHTTPRejectsUnsafeRequests(t *testing.T) {
 		{name: "event route", method: "POST", path: "/v1/events", body: `{"events":[{"name":"connector.credentials.invoke","data":{"_execution":{"execution_request_id":"e","workspace_id":"w","handler_version":"2"}}}]}`, serviceToken: "service", authorization: "Bearer service", want: http.StatusBadRequest},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := &server{serviceToken: tt.serviceToken}
-			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
-			req.Header.Set("Authorization", tt.authorization)
-			req.Header.Set("Prefer", tt.prefer)
-			for _, value := range tt.headers {
-				req.Header.Add("X-Conductor-Human-Authorization", value)
-			}
-			w := httptest.NewRecorder()
-			s.ServeHTTP(w, req)
-			if w.Code != tt.want {
-				t.Fatalf("status = %d, want %d: %s", w.Code, tt.want, w.Body.String())
-			}
-			if strings.Contains(w.Body.String(), "Bearer human") {
-				t.Fatal("response exposed human authorization")
-			}
-		})
+		for _, version := range []string{"2", "3"} {
+			t.Run(tt.name+"/v"+version, func(t *testing.T) {
+				s := &server{serviceToken: tt.serviceToken}
+				body := strings.ReplaceAll(tt.body, `"handler_version":"2"`, `"handler_version":"`+version+`"`)
+				req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(body))
+				req.Header.Set("Authorization", tt.authorization)
+				req.Header.Set("Prefer", tt.prefer)
+				for _, value := range tt.headers {
+					req.Header.Add("X-Conductor-Human-Authorization", value)
+				}
+				w := httptest.NewRecorder()
+				s.ServeHTTP(w, req)
+				if w.Code != tt.want {
+					t.Fatalf("status = %d, want %d: %s", w.Code, tt.want, w.Body.String())
+				}
+				if strings.Contains(w.Body.String(), "Bearer human") {
+					t.Fatal("response exposed human authorization")
+				}
+			})
+		}
 	}
 }
 
@@ -56,16 +59,18 @@ func TestHumanAuthorizationRejectedInExecutionRequest(t *testing.T) {
 		{"numeric retry duration", "123456", `"actor":{"type":"service","id":"s"},"idempotency_key":"i","retry_policy":{"backoff":123456}`},
 		{"retry alias", "secret-token", `"actor":{"type":"service","id":"s"},"idempotency_key":"i","retry":{"backoff":123456}`},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			body := `{"handler":"connector.credentials.invoke","handler_version":"2","workspace_id":"w",` + tc.fields + `}`
-			req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(body))
-			req.Header.Set("Authorization", "Bearer service")
-			req.Header.Set("X-Conductor-Human-Authorization", "Bearer "+tc.token)
-			w := httptest.NewRecorder()
-			(&server{serviceToken: "service"}).ServeHTTP(w, req)
-			if w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), tc.token) {
-				t.Fatalf("request was not safely rejected: status=%d", w.Code)
-			}
-		})
+		for _, version := range []string{"2", "3"} {
+			t.Run(tc.name+"/v"+version, func(t *testing.T) {
+				body := `{"handler":"connector.credentials.invoke","handler_version":"` + version + `","workspace_id":"w",` + tc.fields + `}`
+				req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(body))
+				req.Header.Set("Authorization", "Bearer service")
+				req.Header.Set("X-Conductor-Human-Authorization", "Bearer "+tc.token)
+				w := httptest.NewRecorder()
+				(&server{serviceToken: "service"}).ServeHTTP(w, req)
+				if w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), tc.token) {
+					t.Fatalf("request was not safely rejected: status=%d", w.Code)
+				}
+			})
+		}
 	}
 }

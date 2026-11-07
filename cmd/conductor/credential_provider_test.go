@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -224,17 +225,38 @@ func TestCredentialProviderV2HTTPUsesRequestHumanToken(t *testing.T) {
 	const humanToken = "request-human-token"
 	expires := time.Now().Add(time.Hour).UnixMilli()
 	binding := connectors.OAuthDeliveryBinding{GrantID: "grant", ProviderID: "fixture", AccountID: "account", ConnectionGeneration: "generation", Resource: "https://conductor.example/connections", ConsumerClientID: "conductor", OwnerSubject: "owner", Scopes: []string{"read"}, CredentialVersion: 1, ConsentExpiresAtUnixMS: expires}
-	var calls atomic.Int32
+	var calls, providerCalls atomic.Int32
 	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		if r.Header.Get("Authorization") != "Bearer "+humanToken {
-			http.Error(w, "wrong token", http.StatusUnauthorized)
+		call := calls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) != 0 || r.Method != http.MethodPost || r.URL.RequestURI() != "/auth/v1/connection-grants/grant/credential" || r.Header.Get("Authorization") != "Bearer "+humanToken {
+			t.Errorf("unexpected authority request: method=%s path=%s body length=%d error=%v", r.Method, r.URL.RequestURI(), len(body), err)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		for _, header := range []string{"Cookie", "Origin", "X-CSRF-Token", "If-Match"} {
+			if len(r.Header.Values(header)) != 0 {
+				t.Errorf("authority request contains %s", header)
+			}
+		}
+		if call == 2 {
+			http.Error(w, "rejected", http.StatusForbidden)
+			return
+		}
+		if call == 3 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack authority connection: %v", err)
+				return
+			}
+			_ = conn.Close()
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"kind": "oauth2", "access_token": "upstream-secret", "token_type": "Bearer", "grant_id": binding.GrantID, "provider_id": binding.ProviderID, "connection_generation": binding.ConnectionGeneration, "credential_version": 1, "account_id": binding.AccountID, "scopes": binding.Scopes, "token_expires_at_unix_ms": expires - 1, "consent_expires_at_unix_ms": expires})
 	}))
 	defer authority.Close()
 	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
 		if r.Header.Get("Authorization") != "Bearer upstream-secret" {
 			http.Error(w, "wrong token", http.StatusUnauthorized)
 			return
@@ -267,16 +289,23 @@ func TestCredentialProviderV2HTTPUsesRequestHumanToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{executions: service, registry: registry, serviceToken: "service"}
-	req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(`{"execution_request_id":"v2","workspace_id":"ws","handler":"connector.credentials.invoke","handler_version":"2","operation":"read","connection_id":"conn","credential_revision":1,"actor":{"type":"service","id":"caller"},"idempotency_key":"v2","input":{}}`))
-	req.Header.Set("Authorization", "Bearer service")
-	req.Header.Set("X-Conductor-Human-Authorization", "Bearer "+humanToken)
-	w := httptest.NewRecorder()
-	s.ServeHTTP(w, req)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"succeeded"`) || calls.Load() != 1 {
-		t.Fatalf("unexpected execution status=%d body=%s calls=%d", w.Code, w.Body.String(), calls.Load())
-	}
-	if strings.Contains(w.Body.String(), humanToken) || strings.Contains(w.Body.String(), "upstream-secret") {
-		t.Fatal("credential leaked in response")
+	for i, status := range []string{"succeeded", "failed", "failed"} {
+		id := fmt.Sprintf("v2-%d", i)
+		body := fmt.Sprintf(`{"execution_request_id":%q,"workspace_id":"ws","handler":"connector.credentials.invoke","handler_version":"2","operation":"read","connection_id":"conn","credential_revision":1,"actor":{"type":"service","id":"caller"},"idempotency_key":%q,"input":{}}`, id, id)
+		req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer service")
+		req.Header.Set("X-Conductor-Human-Authorization", "Bearer "+humanToken)
+		for _, header := range []string{"Cookie", "Origin", "X-CSRF-Token", "If-Match"} {
+			req.Header.Set(header, "must-not-forward")
+		}
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"`+status+`"`) || calls.Load() != int32(i+1) || providerCalls.Load() != 1 {
+			t.Fatalf("unexpected execution status=%d body=%s authority calls=%d provider calls=%d", w.Code, w.Body.String(), calls.Load(), providerCalls.Load())
+		}
+		if strings.Contains(w.Body.String(), humanToken) || strings.Contains(w.Body.String(), "upstream-secret") {
+			t.Fatal("credential leaked in response")
+		}
 	}
 }
 

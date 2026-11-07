@@ -44,6 +44,10 @@ func loadCredentialProviderHandler(path, serviceToken string, registry *handlers
 	if err != nil {
 		return err
 	}
+	v3, err := connectors.NewCredentialProviderHandlerV3(config, authority, provider)
+	if err != nil {
+		return err
+	}
 	fileBacked := 0
 	for _, binding := range config.Bindings {
 		if binding.TokenFile != "" {
@@ -62,5 +66,8 @@ func loadCredentialProviderHandler(path, serviceToken string, registry *handlers
 			return err
 		}
 	}
-	return registry.Register(v2)
+	if err := registry.Register(v2); err != nil {
+		return err
+	}
+	return registry.Register(v3)
 }
