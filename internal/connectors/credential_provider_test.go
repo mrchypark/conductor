@@ -202,7 +202,7 @@ func TestCredentialProviderVersionsShareOAuthVersionGuard(t *testing.T) {
 			var authorityCalls, providerCalls atomic.Int32
 			authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				version := binding.CredentialVersion
-				if authorityCalls.Add(1) == 1 {
+				if authorityCalls.Add(1) <= 2 {
 					version++
 				}
 				writeOAuthDelivery(w, binding, oauthDeliverySecret, version)
@@ -227,7 +227,10 @@ func TestCredentialProviderVersionsShareOAuthVersionGuard(t *testing.T) {
 			if _, err := high.Execute(ctx, request); err != nil {
 				t.Fatalf("newer credential: %v", err)
 			}
-			if _, err := low.Execute(ctx, request); err == nil || authorityCalls.Load() != 2 || providerCalls.Load() != 1 {
+			if _, err := low.Execute(ctx, request); err != nil || authorityCalls.Load() != 2 || providerCalls.Load() != 2 {
+				t.Fatalf("same credential version: err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
+			}
+			if _, err := low.Execute(ctx, request); err == nil || authorityCalls.Load() != 3 || providerCalls.Load() != 2 {
 				t.Fatalf("older credential: err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
 			}
 		})
