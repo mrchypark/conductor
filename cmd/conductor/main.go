@@ -236,8 +236,8 @@ func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("event %q: %v", event.Name, err))
 			return
 		}
-		if request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2" {
-			writeError(w, http.StatusBadRequest, "credential invocation version 2 requires synchronous execution")
+		if request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3") {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("credential invocation version %s requires synchronous execution", request.HandlerVersion))
 			return
 		}
 		requests[i].event = event
@@ -986,14 +986,14 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	humanHeaders := r.Header.Values("X-Conductor-Human-Authorization")
-	isHumanExecution := request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2"
+	isHumanExecution := request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3")
 	if isHumanExecution {
 		if s.serviceToken == "" || len(r.Header.Values("Authorization")) != 1 {
 			writeError(w, http.StatusUnauthorized, "service authentication is required")
 			return
 		}
 		if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
-			writeError(w, http.StatusBadRequest, "credential invocation version 2 requires synchronous execution")
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("credential invocation version %s requires synchronous execution", request.HandlerVersion))
 			return
 		}
 		var fields map[string]json.RawMessage
@@ -1003,7 +1003,7 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		}
 		for key := range fields {
 			if strings.EqualFold(key, "retry") || strings.EqualFold(key, "retry_policy") {
-				writeError(w, http.StatusBadRequest, "credential invocation version 2 does not accept a retry policy")
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("credential invocation version %s does not accept a retry policy", request.HandlerVersion))
 				return
 			}
 		}
@@ -1031,7 +1031,7 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		}
 		r = r.WithContext(ampconnectors.WithHumanToken(r.Context(), token))
 	} else if len(humanHeaders) != 0 {
-		writeError(w, http.StatusBadRequest, "human authorization is only accepted for credential invocation version 2")
+		writeError(w, http.StatusBadRequest, "human authorization is only accepted for credential invocation versions 2 and 3")
 		return
 	}
 	if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {

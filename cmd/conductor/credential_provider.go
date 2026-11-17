@@ -40,7 +40,7 @@ func loadCredentialProviderHandler(path, serviceToken string, registry *handlers
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return errors.New("external credential provider configuration must contain one JSON object")
 	}
-	v2, err := connectors.NewCredentialProviderHandlerV2(config, authority, provider)
+	v2, v3, err := connectors.NewCredentialProviderHandlers(config, authority, provider)
 	if err != nil {
 		return err
 	}
@@ -62,5 +62,8 @@ func loadCredentialProviderHandler(path, serviceToken string, registry *handlers
 			return err
 		}
 	}
-	return registry.Register(v2)
+	if err := registry.Register(v2); err != nil {
+		return err
+	}
+	return registry.Register(v3)
 }

@@ -88,8 +88,15 @@ func TestCredentialProviderV2ContextToken(t *testing.T) {
 				}
 			}))
 			defer authority.Close()
-			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				providerCalls.Add(1)
+				want := deliveryKey
+				if kind == "oauth" {
+					want = "Bearer " + oauthDeliverySecret
+				}
+				if r.Header.Get("Authorization") != want {
+					t.Error("provider did not receive the delivered credential")
+				}
 				_, _ = w.Write([]byte(`{}`))
 			}))
 			defer provider.Close()
@@ -129,6 +136,168 @@ func TestCredentialProviderV2ContextToken(t *testing.T) {
 			}
 			if authorityCalls.Load() != 2 || providerCalls.Load() != 2 {
 				t.Fatalf("calls authority=%d provider=%d", authorityCalls.Load(), providerCalls.Load())
+			}
+		})
+	}
+}
+
+func TestCredentialProviderV3ProviderIdentity(t *testing.T) {
+	binding := oauthBinding(time.Now())
+	var authorityCalls, providerCalls atomic.Int32
+	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorityCalls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer human-token" {
+			t.Error("wrong human authorization")
+		}
+		writeOAuthDelivery(w, binding, oauthDeliverySecret, binding.CredentialVersion)
+	}))
+	defer authority.Close()
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		if r.Method != http.MethodGet || r.URL.Path != "/user" || r.Header.Get("Authorization") != "Bearer "+oauthDeliverySecret {
+			t.Error("wrong provider request or authorization")
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer provider.Close()
+	unsupported := binding
+	unsupported.ProviderID = "unknown-provider-for-test"
+	config := CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{
+		{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "read", OAuth: &binding},
+		{ConnectionID: "unsupported", WorkspaceID: "workspace", Revision: 1, OperationKey: "read", OAuth: &unsupported},
+	}}
+	for _, constructor := range []struct {
+		version    string
+		newHandler func(CredentialProviderConfig, *http.Client, *http.Client) (handlers.Handler, error)
+	}{{"2", NewCredentialProviderHandlerV2}, {"3", NewCredentialProviderHandlerV3}} {
+		if constructor.version == "2" {
+			binding.ProviderID = unsupported.ProviderID
+		} else {
+			binding.ProviderID = "github"
+		}
+		handler, err := constructor.newHandler(config, authority.Client(), rewriteGitHubClient(provider))
+		if err != nil || handler.Manifest().Version != constructor.version {
+			t.Fatalf("version %s: handler=%v err=%v", constructor.version, handler, err)
+		}
+		result, err := handler.Execute(WithHumanToken(context.Background(), "human-token"), handlers.Request{ConnectionID: "connection", WorkspaceID: "workspace", CredentialRevision: 1, OperationKey: "read"})
+		if err != nil || string(result.Output) != `{"ok":true}` {
+			t.Fatalf("version %s: output=%s err=%v", constructor.version, result.Output, err)
+		}
+		if constructor.version == "3" {
+			_, err = handler.Execute(WithHumanToken(context.Background(), "human-token"), handlers.Request{ConnectionID: "unsupported", WorkspaceID: "workspace", CredentialRevision: 1, OperationKey: "read"})
+			if err == nil || authorityCalls.Load() != 2 || providerCalls.Load() != 2 {
+				t.Fatalf("unsupported provider: err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
+			}
+		}
+	}
+	if authorityCalls.Load() != 2 || providerCalls.Load() != 2 {
+		t.Fatalf("authority=%d provider=%d", authorityCalls.Load(), providerCalls.Load())
+	}
+}
+
+func TestCredentialProviderVersionsShareOAuthVersionGuard(t *testing.T) {
+	for _, first := range []string{"2", "3"} {
+		t.Run(first, func(t *testing.T) {
+			binding := oauthBinding(time.Now())
+			var authorityCalls, providerCalls atomic.Int32
+			authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				version := binding.CredentialVersion
+				if authorityCalls.Add(1) <= 2 {
+					version++
+				}
+				writeOAuthDelivery(w, binding, oauthDeliverySecret, version)
+			}))
+			defer authority.Close()
+			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				providerCalls.Add(1)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer provider.Close()
+			config := CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "read", OAuth: &binding}}}
+			v2, v3, err := NewCredentialProviderHandlers(config, authority.Client(), rewriteGitHubClient(provider))
+			if err != nil {
+				t.Fatal(err)
+			}
+			high, low := v2, v3
+			if first == "3" {
+				high, low = v3, v2
+			}
+			ctx := WithHumanToken(context.Background(), "human-token")
+			request := handlers.Request{ConnectionID: "connection", WorkspaceID: "workspace", CredentialRevision: 1, OperationKey: "read"}
+			if _, err := high.Execute(ctx, request); err != nil {
+				t.Fatalf("newer credential: %v", err)
+			}
+			if _, err := low.Execute(ctx, request); err != nil || authorityCalls.Load() != 2 || providerCalls.Load() != 2 {
+				t.Fatalf("same credential version: err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
+			}
+			if _, err := low.Execute(ctx, request); err == nil || authorityCalls.Load() != 3 || providerCalls.Load() != 2 {
+				t.Fatalf("older credential: err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
+			}
+		})
+	}
+}
+
+func TestCredentialProviderV3RejectsMismatchedOAuthDelivery(t *testing.T) {
+	binding := oauthBinding(time.Now())
+	var authorityCalls, providerCalls atomic.Int64
+	authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorityCalls.Add(1)
+		delivery := oauthDeliveryMap(binding, oauthDeliverySecret, binding.CredentialVersion)
+		delivery["account_id"] = "wrong-account"
+		writeJSON(w, delivery)
+	}))
+	defer authority.Close()
+	handler, err := NewCredentialProviderHandlerV3(CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "read", OAuth: &binding}}}, authority.Client(), noNetworkClient(&providerCalls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = handler.Execute(WithHumanToken(context.Background(), "human-token"), handlers.Request{ConnectionID: "connection", WorkspaceID: "workspace", CredentialRevision: 1, OperationKey: "read"})
+	if err == nil || strings.Contains(err.Error(), oauthDeliverySecret) || authorityCalls.Load() != 1 || providerCalls.Load() != 0 {
+		t.Fatalf("err=%v authority=%d provider=%d", err, authorityCalls.Load(), providerCalls.Load())
+	}
+}
+
+func TestCredentialProviderV3OAuthDoesNotRetryOrFollowRedirects(t *testing.T) {
+	for _, scenario := range []string{"authority-conflict", "authority-redirect", "provider-redirect"} {
+		t.Run(scenario, func(t *testing.T) {
+			binding := oauthBinding(time.Now())
+			var authorityCalls, providerCalls, redirectCalls atomic.Int32
+			redirect := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { redirectCalls.Add(1) }))
+			defer redirect.Close()
+			authority := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				authorityCalls.Add(1)
+				if r.Header.Get("Authorization") != "Bearer human-token" {
+					t.Error("wrong human authorization")
+				}
+				switch scenario {
+				case "authority-conflict":
+					w.WriteHeader(http.StatusConflict)
+				case "authority-redirect":
+					http.Redirect(w, r, redirect.URL, http.StatusTemporaryRedirect)
+				default:
+					writeOAuthDelivery(w, binding, oauthDeliverySecret, binding.CredentialVersion)
+				}
+			}))
+			defer authority.Close()
+			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				providerCalls.Add(1)
+				if r.Header.Get("Authorization") != "Bearer "+oauthDeliverySecret {
+					t.Error("wrong provider authorization")
+				}
+				http.Redirect(w, r, redirect.URL, http.StatusTemporaryRedirect)
+			}))
+			defer provider.Close()
+			handler, err := NewCredentialProviderHandlerV3(CredentialProviderConfig{Issuer: authority.URL, Bindings: []CredentialProviderBinding{{ConnectionID: "connection", WorkspaceID: "workspace", Revision: 1, OperationKey: "read", OAuth: &binding}}}, authority.Client(), rewriteGitHubClient(provider))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = handler.Execute(WithHumanToken(context.Background(), "human-token"), handlers.Request{ConnectionID: "connection", WorkspaceID: "workspace", CredentialRevision: 1, OperationKey: "read"})
+			wantProvider := int32(0)
+			if scenario == "provider-redirect" {
+				wantProvider = 1
+			}
+			if err == nil || strings.Contains(err.Error(), oauthDeliverySecret) || authorityCalls.Load() != 1 || providerCalls.Load() != wantProvider || redirectCalls.Load() != 0 {
+				t.Fatalf("err=%v authority=%d provider=%d redirect=%d", err, authorityCalls.Load(), providerCalls.Load(), redirectCalls.Load())
 			}
 		})
 	}

@@ -87,7 +87,7 @@ cannot choose URLs, methods, headers, or credential files through input.
 
 ## Submit work
 
-### Request-scoped human authorization (version 2)
+### Request-scoped human authorization (versions 2 and 3)
 
 `connector.credentials.invoke@2` accepts the human access token for each request
 instead of reading it from a token file. Configure `CONDUCTOR_SERVICE_TOKEN` and
@@ -99,27 +99,36 @@ The human token must belong to the requesting user and be intended for the
 credential provider's resource and credential-use scope. The credential provider
 validates it; the service token, actor, and workspace are not substitutes.
 
-Version 2 runs synchronously only. Do not use `Prefer: respond-async` or submit
-it through `/v1/events` or worker routes, and omit `retry` and `retry_policy`.
+Version 3 uses the same request and header contract with `handler_version` set to
+`3`. For OAuth bindings it sends the reviewed, query-free HTTPS GET through AMP's
+generic connector using the authenticated delivery client. Its `provider_id` must
+also identify a provider in AMP's catalog; an unknown provider fails that version 3
+invocation before contacting the credential provider or SaaS, while version 2
+remains available. The reviewed endpoint determines the destination. API-key
+bindings use the same fixed Gowid delivery as version 2. Version 3 does not add
+arbitrary operations or destinations.
+
+Versions 2 and 3 run synchronously only. Do not use `Prefer: respond-async` or submit
+them through `/v1/events` or worker routes, and omit `retry` and `retry_policy`.
 The human authorization header is
 rejected on other routes and for other handlers. Send it only over TLS, and prevent
 proxies and request logging from recording it. It is passed in request context,
 not in execution input or a durable queue; a retry requires a new authenticated
 request with current human authorization.
-Conductor rejects a version 2 request if its decoded execution fields contain
+Conductor rejects a version 2 or 3 request if its decoded execution fields contain
 the human token, including as part of another value. Use the dedicated header
 only; do not copy the token into actor, identifiers, or other request fields.
 
 Execution results and events are available to service-authenticated callers.
-Operable, the trusted caller, must authorize each user's access to those reads externally;
+The trusted caller must authorize each user's access to those reads externally;
 Conductor does not bind result reads to the human token used for submission.
 
-After a restart, abandoned version 2 executions are marked failed with an
+After a restart, abandoned version 2 or 3 executions are marked failed with an
 unknown outcome after their lease expires, even when no local worker is configured.
 They are not replayed because their human token is not retained.
 
-The same reviewed bindings are used for both versions. Omit `token_file` from
-every binding to register only version 2; configure it for every binding to
+The same reviewed bindings are used for all three versions. Omit `token_file` from
+every binding to register versions 2 and 3; configure it for every binding to
 also register version 1. Mixed file-backed and file-free bindings are rejected.
 
 ### File-backed authorization (version 1)

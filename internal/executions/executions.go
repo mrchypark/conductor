@@ -284,8 +284,8 @@ func NewService(store *storage.Store, registry *handlers.Registry) (*Service, er
 func (s *Service) SetCallbackTarget(url string) { s.store.SetCallbackTarget(url) }
 
 func (s *Service) Submit(ctx context.Context, request ExecutionRequest) (Execution, error) {
-	if request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2" {
-		return Execution{}, errors.New("connector.credentials.invoke version 2 requires synchronous execution")
+	if request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3") {
+		return Execution{}, fmt.Errorf("connector.credentials.invoke version %s requires synchronous execution", request.HandlerVersion)
 	}
 	request = normalizeRetryBudget(request)
 	if err := validate(request); err != nil {
@@ -429,14 +429,14 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 // SubmitAndExecute stores a request once, leases it, executes its pinned handler
 // with the requested retry policy, and returns the existing execution for duplicates.
 func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest) (Execution, error) {
-	inlineOnly := request.HandlerKey == "connector.credentials.invoke" && request.HandlerVersion == "2"
+	inlineOnly := request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3")
 	if inlineOnly && (len(request.SubjectRef) > 0 || len(request.InputRef) > 0) {
-		return Execution{}, errors.New("credential invocation version 2 does not accept subject_ref or input_ref")
+		return Execution{}, fmt.Errorf("credential invocation version %s does not accept subject_ref or input_ref", request.HandlerVersion)
 	}
 	if inlineOnly && len(bytes.TrimSpace(request.Input)) > 0 {
 		var input map[string]json.RawMessage
 		if err := json.Unmarshal(request.Input, &input); err != nil || input == nil || len(input) != 0 {
-			return Execution{}, errors.New("credential invocation version 2 input must be an empty object")
+			return Execution{}, fmt.Errorf("credential invocation version %s input must be an empty object", request.HandlerVersion)
 		}
 	}
 	request = normalizeRetryBudget(request)
@@ -456,7 +456,7 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	}
 	if !created {
 		if inlineOnly {
-			return Execution{}, errors.New("idempotency_conflict: credential invocation version 2 requires a new execution request")
+			return Execution{}, fmt.Errorf("idempotency_conflict: credential invocation version %s requires a new execution request", request.HandlerVersion)
 		}
 		if err := s.checkIdempotency(ctx, request); err != nil {
 			return Execution{}, err
