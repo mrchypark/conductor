@@ -120,7 +120,7 @@ the human token, including as part of another value. Use the dedicated header
 only; do not copy the token into actor, identifiers, or other request fields.
 
 Execution results and events are available to service-authenticated callers.
-Operable, the trusted caller, must authorize each user's access to those reads externally;
+The trusted caller must authorize each user's access to those reads externally;
 Conductor does not bind result reads to the human token used for submission.
 
 After a restart, abandoned version 2 or 3 executions are marked failed with an
