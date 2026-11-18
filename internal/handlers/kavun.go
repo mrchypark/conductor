@@ -106,8 +106,17 @@ func NewKavunHandler(spec KavunSpec) (*KavunHandler, error) {
 	cacheMetadataValid := spec.SourceHash != "" && spec.BytecodeSourceHash == spec.SourceHash
 	if len(spec.Bytecode) > 0 && cacheMetadataValid && spec.BytecodeHash == hashBytes(spec.Bytecode) && spec.RuntimeABI == runtimeABI {
 		program, _ = decodeKavunProgram(spec.Bytecode)
-		if program != nil && validateKavunBytecode(program.bytecode, modules) != nil {
-			program = nil
+		if program != nil {
+			maxGlobal, err := validateKavunBytecode(program.bytecode, modules)
+			if err != nil {
+				program = nil
+			} else if maxGlobal+1 > len(program.globals) {
+				globals := make([]core.Value, maxGlobal+1)
+				for i := range globals {
+					globals[i] = core.Undefined
+				}
+				program.globals = globals
+			}
 		}
 		bytecodeNeedsRefresh = program == nil
 	}
@@ -207,14 +216,15 @@ func decodeKavunProgram(encoded []byte) (*kavunProgram, error) {
 	return &kavunProgram{bytecode: &bytecode, bindings: map[string]int{"input": 0, "output": 1}, globals: []core.Value{core.Undefined, core.Undefined}}, nil
 }
 
-func validateKavunBytecode(bytecode *vm.Bytecode, modules []string) error {
+func validateKavunBytecode(bytecode *vm.Bytecode, modules []string) (int, error) {
 	if bytecode == nil || bytecode.MainFunction == nil {
-		return errors.New("kavun bytecode has no main function")
+		return 0, errors.New("kavun bytecode has no main function")
 	}
 	allowed := make(map[string]bool, len(modules))
 	for _, module := range modules {
 		allowed[module] = true
 	}
+	maxGlobal := 1
 	visited := make(map[int]bool)
 	var scan func(*core.CompiledFunction) error
 	scan = func(function *core.CompiledFunction) error {
@@ -231,6 +241,14 @@ func validateKavunBytecode(bytecode *vm.Bytecode, modules []string) error {
 				if !ok || !allowed[name] {
 					return fmt.Errorf("kavun bytecode imports disallowed module %q", name)
 				}
+			case bc.LoadGlobal, bc.StoreGlobal, bc.StoreIndexedGlobal:
+				index := int(instruction.Op3)
+				if index < 0 || index > maxKavunStack {
+					return fmt.Errorf("kavun bytecode references invalid global %d", index)
+				}
+				if index > maxGlobal {
+					maxGlobal = index
+				}
 			case bc.LoadStaticCompiledFunction:
 				index := int(instruction.Op3)
 				if index < 0 || index >= len(bytecode.Static.CompiledFunctions) {
@@ -246,7 +264,10 @@ func validateKavunBytecode(bytecode *vm.Bytecode, modules []string) error {
 		}
 		return nil
 	}
-	return scan(bytecode.MainFunction)
+	if err := scan(bytecode.MainFunction); err != nil {
+		return 0, err
+	}
+	return maxGlobal, nil
 }
 
 func (p *kavunProgram) run(ctx context.Context, input core.Value, maxFrames, maxStack int) (core.Value, error) {
