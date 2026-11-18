@@ -10,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mrchypark/conductor/internal/callbacks"
@@ -39,6 +41,9 @@ func loadDynamicHandlers(ctx context.Context, store *storage.Store, registry *ha
 		var manifest handlers.Manifest
 		if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
 			return fmt.Errorf("dynamic handler %s@%s manifest: %w", record.HandlerKey, record.Version, err)
+		}
+		if manifest.Key != record.HandlerKey || manifest.Version != record.Version {
+			return fmt.Errorf("dynamic handler %s@%s manifest identity mismatch", record.HandlerKey, record.Version)
 		}
 		handler, err := handlers.NewKavunHandler(handlers.KavunSpec{
 			Manifest: manifest, Source: record.Source, AllowedModules: record.AllowedModules,
@@ -212,8 +217,34 @@ func main() {
 	srv.oauthStore = connectionStore
 	srv.wasmRuntime = wasmRuntime
 	srv.wasmFetch = wasmFetch
-	if err := http.ListenAndServe(*addr, srv); err != nil {
-		log.Fatal(err)
+	httpServer := &http.Server{
+		Addr:              *addr,
+		Handler:           srv,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatal(err)
+		}
+	case <-signalCtx.Done():
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+		cancelShutdown()
 	}
 }
 

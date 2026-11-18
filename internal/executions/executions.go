@@ -639,9 +639,6 @@ func (s *Service) waitForTerminal(ctx context.Context, id string) (Execution, er
 		if err != nil {
 			return Execution{}, err
 		}
-		if execution.Status == "queued" {
-			return execution, nil
-		}
 		switch execution.Status {
 		case "succeeded", "failed", "timed_out", "cancelled":
 			return execution, nil

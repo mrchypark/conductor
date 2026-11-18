@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"os"
@@ -34,7 +34,7 @@ func (s *server) oauthBegin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input connections.BeginInput
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
+	if err := decodeBody(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid oauth request")
 		return
 	}
@@ -72,9 +72,12 @@ func (s *server) oauthComplete(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		input.Provider, input.ClientID, input.RedirectURL = query.Get("provider"), query.Get("client_id"), query.Get("redirect_url")
 		input.AttemptID, input.State, input.Code, input.WorkspaceID = query.Get("attempt_id"), query.Get("state"), query.Get("code"), query.Get("workspace_id")
-	} else if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&input); err != nil {
+	} else if err := decodeBody(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid oauth callback")
 		return
+	}
+	if s.serviceToken != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.serviceToken)) != 1 {
+		input.Metadata = nil
 	}
 	if input.Provider == "" {
 		input.Provider = providerFromPath

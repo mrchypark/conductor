@@ -151,14 +151,28 @@ func (s *Store) ScheduleRetry(ctx context.Context, id string, a int, run time.Ti
 	return nil
 }
 func (s *Store) RetryExecutionWithLease(ctx context.Context, lease string, token int64, id string, a int, class, msg string, run time.Time) error {
-	l, e := s.ActiveLease(ctx, id)
-	if e != nil || l.ID != lease || l.FencingToken != token || l.AttemptNumber != a {
-		return errors.New("lease is stale or expired")
+	if a < 1 {
+		return errors.New("attempt number must be positive")
 	}
-	if e = s.RecordAttempt(ctx, id, a, class, msg); e != nil {
+	t := now()
+	guard := `EXISTS(SELECT 1 FROM executions WHERE id=? AND status='running') AND EXISTS(SELECT 1 FROM leases WHERE lease_id=? AND execution_id=? AND fencing_token=? AND attempt_number=? AND status='active' AND expires_at>?)`
+	_, e := s.db.Mutate(ctx, fmt.Sprintf("retry-leased %s %d %s", id, a, lease),
+		stm(`INSERT OR IGNORE INTO attempts(id,execution_id,attempt_number,status,error_class,error_message,started_at,finished_at) SELECT ?,?,?,'failed',?,?,?,? WHERE `+guard, fmt.Sprintf("%s:%d", id, a), id, a, class, msg, t, t, id, lease, id, token, a, t),
+		stm(`INSERT INTO retry_timers(id,execution_id,attempt_number,run_at,status) SELECT ?,?,?,?,'scheduled' WHERE `+guard+` ON CONFLICT(execution_id,attempt_number) DO UPDATE SET run_at=excluded.run_at,status='scheduled'`, fmt.Sprintf("retry_%s_%d", id, a), id, a, ft(run), id, lease, id, token, a, t),
+		stm(`UPDATE executions SET status='retry_wait',updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM leases WHERE lease_id=? AND execution_id=? AND fencing_token=? AND attempt_number=? AND status='active' AND expires_at>?)`, t, id, lease, id, token, a, t),
+		stm(`INSERT OR IGNORE INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT ?,?,'execution.retrying',?,'{}',? WHERE EXISTS(SELECT 1 FROM executions WHERE id=? AND status='retry_wait')`, fmt.Sprintf("event_%s:retry:%d", id, a), id, a, t, id),
+	)
+	if e != nil {
 		return e
 	}
-	return s.ScheduleRetry(ctx, id, a, run)
+	x, e := s.GetExecution(ctx, id)
+	if e != nil {
+		return e
+	}
+	if x.Status != "retry_wait" {
+		return errors.New("lease is stale or expired")
+	}
+	return nil
 }
 
 func (s *Store) RecoverExpiredLeases(ctx context.Context, n time.Time) error {
@@ -175,18 +189,19 @@ func (s *Store) recoverExpiredLeases(ctx context.Context, n time.Time, inlineOnl
 	if e != nil {
 		return e
 	}
+	var firstErr error
 	for _, row := range pending {
 		id := str(row[0])
 		lease, err := s.AcquireInlineLease(ctx, id, time.Minute)
 		if err != nil {
 			current, getErr := s.GetExecution(ctx, id)
-			if getErr != nil || current.Status == "inline_pending" {
-				return err
+			if (getErr != nil || current.Status == "inline_pending") && firstErr == nil {
+				firstErr = err
 			}
 			continue
 		}
-		if err := s.CompleteExecutionWithLease(ctx, lease.ID, lease.FencingToken, id, "failed", nil, "outcome_unknown", "inline execution was interrupted before its outcome was recorded", false, 1); err != nil {
-			return err
+		if err := s.CompleteExecutionWithLease(ctx, lease.ID, lease.FencingToken, id, "failed", nil, "outcome_unknown", "inline execution was interrupted before its outcome was recorded", false, 1); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	query := `SELECT e.id,l.lease_id,l.fencing_token,l.attempt_number,CASE WHEN e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3') THEN 1 ELSE r.max_attempts END FROM executions e JOIN leases l ON l.execution_id=e.id JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status='running' AND l.status='active' AND l.expires_at<=?`
@@ -209,9 +224,9 @@ func (s *Store) recoverExpiredLeases(ctx context.Context, n time.Time, inlineOnl
 		} else {
 			_, e = s.db.Mutate(ctx, "recover "+lease, stm(`UPDATE leases SET status='expired',updated_at=? WHERE lease_id=? AND fencing_token=? AND status='active' AND expires_at<=?`, ft(n), lease, token, ft(n)), stm(`UPDATE executions SET status='queued',updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM leases WHERE lease_id=? AND status='expired')`, ft(n), id, lease))
 		}
-		if e != nil {
-			return e
+		if e != nil && firstErr == nil {
+			firstErr = e
 		}
 	}
-	return nil
+	return firstErr
 }

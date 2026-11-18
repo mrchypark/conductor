@@ -226,9 +226,9 @@ func decodeDeliveredKey(body []byte) (deliveredAPIKey, error) {
 func containsDeliverySecret(value any, key, token string) bool {
 	switch v := value.(type) {
 	case string:
-		return strings.Contains(v, key) || strings.Contains(v, token)
+		return (key != "" && strings.Contains(v, key)) || (token != "" && strings.Contains(v, token))
 	case json.Number:
-		return strings.Contains(string(v), key) || strings.Contains(string(v), token)
+		return (key != "" && strings.Contains(string(v), key)) || (token != "" && strings.Contains(string(v), token))
 	case map[string]any:
 		for name, item := range v {
 			if containsDeliverySecret(name, key, token) || containsDeliverySecret(item, key, token) {

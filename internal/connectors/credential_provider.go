@@ -1,6 +1,7 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -133,7 +134,13 @@ func newCredentialProviderHandler(config CredentialProviderConfig, authorityClie
 				}
 				delivery.invoke = func(ctx context.Context) ([]byte, error) {
 					_, body, err := conn.HTTPClient().Get(ctx, endpoint)
-					return body, err
+					if err != nil {
+						return nil, err
+					}
+					if int64(len(body)) > 1<<20 {
+						return nil, errors.New("credential provider response exceeds size limit")
+					}
+					return scrubDeliveryResponse(ctx, body, source)
 				}
 				deliveries[binding.ConnectionID] = delivery
 				continue
@@ -148,7 +155,11 @@ func newCredentialProviderHandler(config CredentialProviderConfig, authorityClie
 					return nil, err
 				}
 				defer response.Body.Close()
-				return readDeliveryBody(response.Body, 1<<20)
+				body, err := readDeliveryBody(response.Body, 1<<20)
+				if err != nil {
+					return nil, err
+				}
+				return scrubDeliveryResponse(ctx, body, source)
 			}
 		}
 		deliveries[binding.ConnectionID] = delivery
@@ -201,4 +212,30 @@ func readCredentialProviderToken(ctx context.Context, path string) (string, erro
 		return "", errors.New("token unavailable")
 	}
 	return token, nil
+}
+
+func scrubDeliveryResponse(ctx context.Context, body []byte, source func(context.Context) (string, error)) ([]byte, error) {
+	var decoded any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if !json.Valid(body) || decoder.Decode(&decoded) != nil {
+		return nil, errors.New("delivery provider response invalid")
+	}
+	var token string
+	if source != nil {
+		if t, err := source(ctx); err == nil {
+			token = t
+		}
+	}
+	if token != "" && containsDeliverySecret(decoded, "", token) {
+		return nil, errors.New("delivery provider response contains credentials")
+	}
+	clean, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, errors.New("delivery provider response invalid")
+	}
+	if token != "" && bytes.Contains(clean, []byte(token)) {
+		return nil, errors.New("delivery provider response contains credentials")
+	}
+	return clean, nil
 }
