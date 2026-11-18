@@ -66,6 +66,12 @@ func (d *DB) Mutate(ctx context.Context, operation string, statements ...Stateme
 		return Receipt{}, err
 	}
 	savepointRetries := 0
+	delay := 10 * time.Millisecond
+	_, hasDeadline := ctx.Deadline()
+	var deadline time.Time
+	if !hasDeadline {
+		deadline = time.Now().Add(15 * time.Second)
+	}
 	for {
 		response, err := d.db.Execute(ctx, req)
 		if err == nil {
@@ -77,15 +83,24 @@ func (d *DB) Mutate(ctx context.Context, operation string, statements ...Stateme
 		if !retryableMutationError(err, savepointRetries) {
 			return Receipt{}, err
 		}
+		if !hasDeadline && !time.Now().Before(deadline) {
+			return Receipt{}, err
+		}
 		if lostRhizaSavepoint(err) {
 			savepointRetries++
 		}
-		timer := time.NewTimer(10 * time.Millisecond)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return Receipt{}, err
 		case <-timer.C:
+		}
+		if delay < 250*time.Millisecond {
+			delay *= 2
+			if delay > 250*time.Millisecond {
+				delay = 250 * time.Millisecond
+			}
 		}
 	}
 }

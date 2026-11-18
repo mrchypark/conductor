@@ -216,7 +216,11 @@ func (h *WASMHandler) Execute(ctx context.Context, req Request) (Result, error) 
 	if !module.Memory().Write(inputPtr, req.Input) {
 		return Result{}, &Error{Class: "wasm_runtime", Message: "input allocation is outside guest memory"}
 	}
-	defer dealloc.Call(context.Background(), uint64(inputPtr), uint64(len(req.Input)))
+	defer func() {
+		if ctx.Err() == nil {
+			_, _ = dealloc.Call(ctx, uint64(inputPtr), uint64(len(req.Input)))
+		}
+	}()
 
 	result, err := invoke.Call(ctx, uint64(inputPtr), uint64(len(req.Input)))
 	if err != nil {
@@ -232,7 +236,11 @@ func (h *WASMHandler) Execute(ctx context.Context, req Request) (Result, error) 
 	}
 	encoded := append([]byte(nil), output...)
 	if outputPtr != inputPtr {
-		defer dealloc.Call(context.Background(), uint64(outputPtr), uint64(outputLen))
+		defer func() {
+			if ctx.Err() == nil {
+				_, _ = dealloc.Call(ctx, uint64(outputPtr), uint64(outputLen))
+			}
+		}()
 	}
 	if !json.Valid(encoded) {
 		return Result{}, &Error{Class: "wasm_runtime", Message: "output must be valid JSON"}

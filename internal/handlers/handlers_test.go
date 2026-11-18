@@ -144,3 +144,48 @@ func TestKavunBytecodeCacheRechecksAllowedModules(t *testing.T) {
 		t.Fatalf("fallback compile failed: output=%s err=%v", result.Output, err)
 	}
 }
+
+func TestKavunBytecodeCacheReloadsGlobalsAndModules(t *testing.T) {
+	source := []byte("json := import(\"json\")\nextra := \"ok\"\noutput = {\"v\": input.v, \"extra\": extra, \"raw\": string(json.encode(input))}")
+	compiled, err := NewKavunHandler(KavunSpec{
+		Manifest:       Manifest{Key: "cache-globals", Version: "1"},
+		Source:         source,
+		AllowedModules: []string{"json"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := compiled.program.bytecode.Encode(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	bytecode := encoded.Bytes()
+	sourceHash := hashBytes(source)
+	reloaded, err := NewKavunHandler(KavunSpec{
+		Manifest:           Manifest{Key: "cache-globals", Version: "1"},
+		Source:             source,
+		AllowedModules:     []string{"json"},
+		Bytecode:           bytecode,
+		BytecodeHash:       hashBytes(bytecode),
+		SourceHash:         sourceHash,
+		BytecodeSourceHash: sourceHash,
+		RuntimeABI:         compiled.runtimeABI,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.BytecodeNeedsRefresh() {
+		t.Fatal("valid cached bytecode was unexpectedly discarded")
+	}
+	result, err := reloaded.Execute(context.Background(), Request{Input: json.RawMessage(`{"v":42}`)})
+	if err != nil {
+		t.Fatalf("cached execution failed: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(result.Output, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["extra"] != "ok" || got["v"] != float64(42) {
+		t.Fatalf("unexpected cached output: %s", result.Output)
+	}
+}

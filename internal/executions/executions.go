@@ -324,29 +324,75 @@ func (s *Service) RunWorker(ctx context.Context, workerID string, poll, leaseTTL
 		leaseTTL = time.Minute
 	}
 	for {
-		if err := s.store.RecoverExpiredLeases(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
-			return err
+		if err := s.store.RecoverExpiredLeases(ctx, time.Now().UTC()); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !waitPoll(ctx, poll) {
+				return ctx.Err()
+			}
+			continue
 		}
 		req, lease, err := s.store.ClaimNext(ctx, workerID, leaseTTL)
-		if errors.Is(err, storage.ErrNotFound) {
-			t := time.NewTimer(poll)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return ctx.Err()
-			case <-t.C:
-				continue
-			}
-		}
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !waitPoll(ctx, poll) {
+				return ctx.Err()
+			}
+			continue
 		}
 		request := fromRecord(req)
-		if err := s.executeClaim(ctx, request, lease); err != nil {
-			_ = s.store.ReleaseLease(context.Background(), lease.ID, lease.FencingToken)
-			return err
+		execErr := s.executeClaim(ctx, request, lease, leaseTTL)
+		releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.store.ReleaseLease(releaseCtx, lease.ID, lease.FencingToken)
+		cancelRelease()
+		if execErr != nil && ctx.Err() != nil {
+			return ctx.Err()
 		}
-		_ = s.store.ReleaseLease(context.Background(), lease.ID, lease.FencingToken)
+	}
+}
+
+func waitPoll(ctx context.Context, poll time.Duration) bool {
+	t := time.NewTimer(poll)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func (s *Service) startLeaseHeartbeat(ctx context.Context, lease storage.LeaseRecord, leaseTTL time.Duration) func() {
+	if leaseTTL < 30*time.Millisecond {
+		return func() {}
+	}
+	interval := leaseTTL / 3
+	if interval > 15*time.Second {
+		interval = 15 * time.Second
+	}
+	hbCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.store.HeartbeatLease(hbCtx, lease.ID, lease.FencingToken, leaseTTL); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
 	}
 }
 
@@ -354,7 +400,9 @@ func fromRecord(r storage.ExecutionRequestRecord) ExecutionRequest {
 	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
 }
 
-func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, lease storage.LeaseRecord) error {
+func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, lease storage.LeaseRecord, leaseTTL time.Duration) error {
+	stopHB := s.startLeaseHeartbeat(ctx, lease, leaseTTL)
+	defer stopHB()
 	handler, err := s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
 	if err != nil {
 		_, err = s.finishLease(ctx, lease, lease.ExecutionID, nil, &handlers.Error{Class: "handler_not_found", Message: err.Error()}, lease.AttemptNumber)
@@ -463,13 +511,9 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 		}
 		return s.waitForTerminal(ctx, executionID)
 	}
-	var handler handlers.Handler
-	var resolveErr error
-	if inlineOnly {
-		handler, resolveErr = s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
-	}
+	handler, resolveErr := s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
 	leaseTTL := request.Timeout
-	if inlineOnly && leaseTTL <= 0 && resolveErr == nil && handler.Manifest().DefaultTimeout > 0 {
+	if leaseTTL <= 0 && resolveErr == nil && handler.Manifest().DefaultTimeout > 0 {
 		seconds := handler.Manifest().DefaultTimeout
 		if int64(seconds) > math.MaxInt64/int64(time.Second) {
 			leaseTTL = time.Duration(math.MaxInt64)
@@ -480,13 +524,11 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	if leaseTTL <= 0 {
 		leaseTTL = time.Minute
 	}
-	if inlineOnly {
-		// Allow time for setup and durable completion after the handler deadline.
-		if leaseTTL > time.Duration(math.MaxInt64)-time.Minute {
-			leaseTTL = time.Duration(math.MaxInt64)
-		} else {
-			leaseTTL += time.Minute
-		}
+	// Allow time for setup, retries, and durable completion after the handler deadline.
+	if leaseTTL > time.Duration(math.MaxInt64)-time.Minute {
+		leaseTTL = time.Duration(math.MaxInt64)
+	} else {
+		leaseTTL += time.Minute
 	}
 	var lease storage.LeaseRecord
 	if inlineOnly {
@@ -497,13 +539,16 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	if err != nil {
 		return Execution{}, err
 	}
+	stopHB := s.startLeaseHeartbeat(ctx, lease, leaseTTL)
+	defer stopHB()
 	if !inlineOnly {
-		defer s.store.ReleaseLease(context.Background(), lease.ID, lease.FencingToken)
+		defer func() {
+			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.store.ReleaseLease(releaseCtx, lease.ID, lease.FencingToken)
+			cancelRelease()
+		}()
 	}
 
-	if !inlineOnly {
-		handler, resolveErr = s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
-	}
 	if resolveErr != nil {
 		return s.finishLease(ctx, lease, executionID, nil, &handlers.Error{Class: "handler_not_found", Message: resolveErr.Error()}, 1)
 	}
@@ -559,7 +604,7 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 			if err := s.store.RecordAttempt(ctx, executionID, attempt, classified.Class, classified.Message); err != nil {
 				return Execution{}, err
 			}
-			if err := waitBackoff(executionContext, request.Retry.Backoff, attempt); err != nil {
+			if err := waitBackoff(executionContext, request.Retry.Backoff, request.Retry.BackoffMode, attempt); err != nil {
 				return s.finishLease(ctx, lease, executionID, nil, classify(err), attempt)
 			}
 			continue
@@ -670,14 +715,10 @@ func (s *Service) Cancel(ctx context.Context, id string) (Execution, error) {
 	if e.Status == "succeeded" || e.Status == "failed" || e.Status == "timed_out" || e.Status == "cancelled" {
 		return e, nil
 	}
-	lease, err := s.store.ActiveLease(ctx, id)
-	if errors.Is(err, storage.ErrNotFound) {
-		lease, err = s.store.AcquireLease(ctx, id, "cancel:"+id, time.Minute, 1)
-	}
-	if err != nil {
+	if err := s.store.CancelExecution(ctx, id); err != nil {
 		return Execution{}, err
 	}
-	return s.finishLease(ctx, lease, id, nil, &handlers.Error{Class: "cancelled", Message: "execution cancelled"}, lease.AttemptNumber)
+	return s.Get(ctx, id)
 }
 
 func (s *Service) Events(ctx context.Context, id string) ([]storage.ExecutionEventRecord, error) {
@@ -740,13 +781,15 @@ func classify(err error) *handlers.Error {
 	return &handlers.Error{Class: "handler_error", Message: err.Error()}
 }
 
-func waitBackoff(ctx context.Context, base time.Duration, attempt int) error {
+func waitBackoff(ctx context.Context, base time.Duration, mode string, attempt int) error {
 	if base <= 0 {
-		return nil
+		base = time.Second
 	}
 	delay := base
-	for i := 1; i < attempt && delay <= time.Duration(math.MaxInt64/2); i++ {
-		delay *= 2
+	if mode == "exponential" {
+		for i := 1; i < attempt && delay <= time.Duration(math.MaxInt64/2); i++ {
+			delay *= 2
+		}
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
