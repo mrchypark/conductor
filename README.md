@@ -81,18 +81,19 @@ volume and port 8080 for HTTP. The named volume
 preserves data when the container is removed; deleting the volume deletes that
 stored state. The curl example above works with this container too.
 
-The planned main-branch publication target is
-`ghcr.io/mrchypark/conductor` for **linux/amd64**, with `latest` and a tag containing
-the **full Git commit SHA**. Publication follows Go formatting, vet, tests, race
+The planned publication target is
+`ghcr.io/mrchypark/conductor` for **linux/amd64**, tagged with the **full Git commit SHA**
+on `main` pushes and with the **version tag** (such as `v0.1.1`) on `v*` release tag pushes
+(no `latest` tag is published). Publication follows Go formatting, vet, tests, race
 checks, and Docker build/smoke checks. Availability depends on a successful publish;
 these tags are not a claim that an image has already been released.
 
-Once published, replace `conductor:local` in the run command with
-`ghcr.io/mrchypark/conductor:latest`, or pin a published full SHA:
+Once published, replace `conductor:local` in the run command with a published version tag
+or full commit SHA:
 
 ```sh
-CONDUCTOR_IMAGE_SHA=replace-with-a-published-full-commit-sha
-docker pull --platform linux/amd64 "ghcr.io/mrchypark/conductor:$CONDUCTOR_IMAGE_SHA"
+CONDUCTOR_IMAGE_TAG=v0.1.1
+docker pull --platform linux/amd64 "ghcr.io/mrchypark/conductor:$CONDUCTOR_IMAGE_TAG"
 ```
 
 ## Configuration and security
