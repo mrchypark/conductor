@@ -5,12 +5,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/mrchypark/conductor/internal/storage"
 )
+
+var defaultCallbackClient = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
 
 type Delivery struct {
 	Store  *storage.Store
@@ -25,7 +33,7 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 	}
 	client := d.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultCallbackClient
 	}
 	now := time.Now
 	if d.Now != nil {
@@ -38,12 +46,13 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var firstErr error
 	for _, item := range items {
 		requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, item.TargetURL, bytes.NewReader(item.Payload))
 		if err != nil {
 			cancel()
-			_ = d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, "failed", err.Error(), now())
+			_ = d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, "failed", err.Error(), now().UTC())
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -52,13 +61,14 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 			req.Header.Set("Authorization", "Bearer "+d.Token)
 		}
 		resp, callErr := client.Do(req)
-		cancel()
 		if callErr == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 		}
+		cancel()
 		if callErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			if err := d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, "delivered", "", now()); err != nil {
-				return err
+			if err := d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, "delivered", "", now().UTC()); err != nil && firstErr == nil {
+				firstErr = err
 			}
 			continue
 		}
@@ -74,16 +84,9 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 		if callErr == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
 			status = "failed"
 		}
-		if err := d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, status, message, now().UTC().Add(delay)); err != nil {
-			return err
+		if err := d.Store.MarkCallbackDelivery(ctx, item.ID, item.ClaimID, status, message, now().UTC().Add(delay)); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return firstErr
 }

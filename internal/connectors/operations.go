@@ -186,10 +186,10 @@ func rawRequest(ctx context.Context, conn amp.Connector, input invokeInput) (han
 		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "path must be an origin-form relative URL"}
 	}
 	client := conn.JSONHTTPClient()
-	target, joinErr := url.JoinPath(client.HTTPClient.Base, u.EscapedPath())
-	if joinErr != nil {
-		return handlers.Result{}, &handlers.Error{Class: "invalid_input", Message: "invalid connector path"}
+	if client == nil || client.HTTPClient == nil {
+		return handlers.Result{}, &handlers.Error{Class: "unsupported_operation", Message: "connector does not support raw HTTP calls"}
 	}
+	target := strings.TrimRight(client.HTTPClient.Base, "/") + u.EscapedPath()
 	if u.RawQuery != "" {
 		target += "?" + u.RawQuery
 	}

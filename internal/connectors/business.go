@@ -100,9 +100,13 @@ func (c *BusinessClient) Invoke(ctx context.Context, operation string, input any
 		return nil, err
 	}
 	defer resp.Body.Close()
-	out, err := io.ReadAll(resp.Body)
+	const maxBusinessResponseBytes = 10 << 20
+	out, err := io.ReadAll(io.LimitReader(resp.Body, maxBusinessResponseBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(out) > maxBusinessResponseBytes {
+		return nil, errors.New("business response exceeds size limit")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &HTTPError{StatusCode: resp.StatusCode}
