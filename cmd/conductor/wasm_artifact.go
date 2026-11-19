@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content"
+	"oras.land/oras-go/v2/content/memory"
 	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
@@ -30,7 +32,15 @@ type wasmArtifact struct {
 	Size           int64
 }
 
+type wasmPushedArtifact struct {
+	ArtifactRef    string
+	ManifestDigest string
+	BlobDigest     string
+	Size           int64
+}
+
 type wasmArtifactFetcher func(context.Context, string) (wasmArtifact, error)
+type wasmArtifactPusher func(ctx context.Context, workspaceID, handlerKey, version string, wasmBytes []byte) (wasmPushedArtifact, error)
 
 func newOCIWASMFetcher(allowedRegistries, username, password, token string, plainHTTP bool) wasmArtifactFetcher {
 	allowed := make(map[string]bool)
@@ -51,20 +61,9 @@ func newOCIWASMFetcher(allowedRegistries, username, password, token string, plai
 		if err != nil || manifestDigest.Algorithm() != digest.SHA256 {
 			return wasmArtifact{}, errors.New("OCI artifact reference must be pinned by sha256 digest")
 		}
-		repo, err := remote.NewRepository(ref.Registry + "/" + ref.Repository)
+		repo, err := newRemoteOCIRepo(ref.Registry, ref.Repository, username, password, token, plainHTTP)
 		if err != nil {
 			return wasmArtifact{}, err
-		}
-		repo.PlainHTTP = plainHTTP
-		repo.Client = &auth.Client{
-			Client: retry.DefaultClient,
-			Cache:  auth.NewCache(),
-			Credential: func(_ context.Context, hostport string) (auth.Credential, error) {
-				if !strings.EqualFold(hostport, ref.Registry) {
-					return auth.EmptyCredential, nil
-				}
-				return auth.Credential{Username: username, Password: password, AccessToken: token}, nil
-			},
 		}
 		desc, manifestBytes, err := oras.FetchBytes(ctx, repo, manifestDigest.String(), oras.FetchBytesOptions{MaxBytes: 1 << 20})
 		if err != nil {
@@ -104,4 +103,61 @@ func newOCIWASMFetcher(allowedRegistries, username, password, token string, plai
 		}
 		return wasmArtifact{Bytes: wasm, ManifestDigest: manifestDigest.String(), BlobDigest: layer.Digest.String(), Size: layer.Size}, nil
 	}
+}
+
+func newOCIWASMPusher(registryHost, username, password, token string, plainHTTP bool) wasmArtifactPusher {
+	registryHost = strings.TrimSpace(registryHost)
+	if registryHost == "" {
+		return nil
+	}
+	return func(ctx context.Context, workspaceID, handlerKey, version string, wasmBytes []byte) (wasmPushedArtifact, error) {
+		if workspaceID == "" || handlerKey == "" || version == "" || len(wasmBytes) == 0 {
+			return wasmPushedArtifact{}, errors.New("workspace_id, handler_key, version, and wasm bytes are required")
+		}
+		repository := strings.ToLower(workspaceID + "/" + strings.ReplaceAll(handlerKey, ".", "-"))
+		repo, err := newRemoteOCIRepo(registryHost, repository, username, password, token, plainHTTP)
+		if err != nil {
+			return wasmPushedArtifact{}, err
+		}
+		mem := memory.New()
+		layerDesc, err := oras.PushBytes(ctx, mem, wasmLayerType, wasmBytes)
+		if err != nil {
+			return wasmPushedArtifact{}, fmt.Errorf("stage wasm layer: %w", err)
+		}
+		manifestDesc, err := oras.PackManifest(ctx, mem, oras.PackManifestVersion1_1, wasmArtifactType, oras.PackManifestOptions{
+			Layers: []ocispec.Descriptor{layerDesc},
+		})
+		if err != nil {
+			return wasmPushedArtifact{}, fmt.Errorf("pack wasm OCI manifest: %w", err)
+		}
+		if _, err := oras.Copy(ctx, mem, manifestDesc.Digest.String(), repo, manifestDesc.Digest.String(), oras.DefaultCopyOptions); err != nil {
+			return wasmPushedArtifact{}, fmt.Errorf("push wasm OCI artifact: %w", err)
+		}
+		_ = bytes.NewReader(nil)
+		return wasmPushedArtifact{
+			ArtifactRef:    fmt.Sprintf("%s/%s@%s", registryHost, repository, manifestDesc.Digest.String()),
+			ManifestDigest: manifestDesc.Digest.String(),
+			BlobDigest:     layerDesc.Digest.String(),
+			Size:           int64(len(wasmBytes)),
+		}, nil
+	}
+}
+
+func newRemoteOCIRepo(registryHost, repository, username, password, token string, plainHTTP bool) (*remote.Repository, error) {
+	repo, err := remote.NewRepository(registryHost + "/" + repository)
+	if err != nil {
+		return nil, err
+	}
+	repo.PlainHTTP = plainHTTP
+	repo.Client = &auth.Client{
+		Client: retry.DefaultClient,
+		Cache:  auth.NewCache(),
+		Credential: func(_ context.Context, hostport string) (auth.Credential, error) {
+			if !strings.EqualFold(hostport, registryHost) {
+				return auth.EmptyCredential, nil
+			}
+			return auth.Credential{Username: username, Password: password, AccessToken: token}, nil
+		},
+	}
+	return repo, nil
 }

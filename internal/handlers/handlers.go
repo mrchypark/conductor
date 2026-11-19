@@ -38,6 +38,8 @@ type Request struct {
 	OperationKey       string
 	ConnectionID       string
 	CredentialRevision int64
+	CredentialRef      string
+	ExpiresAt          time.Time
 	SubjectRef         json.RawMessage
 	InputRef           json.RawMessage
 	DeadlineAt         time.Time
@@ -72,6 +74,28 @@ func (e *Error) Error() string {
 type Handler interface {
 	Manifest() Manifest
 	Execute(context.Context, Request) (Result, error)
+}
+
+// HostConnectorFunc executes a host-mediated connector call on behalf of a guest.
+type HostConnectorFunc func(ctx context.Context, callInput json.RawMessage) (json.RawMessage, error)
+
+type hostConnectorKey struct{}
+
+// WithHostConnector attaches a host connector proxy callback to ctx.
+func WithHostConnector(ctx context.Context, fn HostConnectorFunc) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, hostConnectorKey{}, fn)
+}
+
+// HostConnectorFromContext retrieves the host connector proxy callback from ctx.
+func HostConnectorFromContext(ctx context.Context) HostConnectorFunc {
+	if ctx == nil {
+		return nil
+	}
+	fn, _ := ctx.Value(hostConnectorKey{}).(HostConnectorFunc)
+	return fn
 }
 
 type Func func(context.Context, Request) (Result, error)
@@ -114,7 +138,15 @@ func NewRegistry() *Registry { return &Registry{handlers: make(map[string]Handle
 
 func key(manifest Manifest) string { return manifest.Key + "@" + manifest.Version }
 
+func scopedKey(workspaceID, handlerKey, version string) string {
+	return workspaceID + ":" + handlerKey + "@" + version
+}
+
 func (r *Registry) Register(h Handler) error {
+	return r.RegisterScoped("", h)
+}
+
+func (r *Registry) RegisterScoped(workspaceID string, h Handler) error {
 	if h == nil {
 		return errors.New("handler is nil")
 	}
@@ -124,20 +156,25 @@ func (r *Registry) Register(h Handler) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	k := key(m)
+	k := scopedKey(workspaceID, m.Key, m.Version)
 	if _, exists := r.handlers[k]; exists {
-		return fmt.Errorf("handler %s already registered", k)
+		return fmt.Errorf("handler %s already registered", key(m))
 	}
 	r.handlers[k] = h
 	return nil
 }
 
-// Unregister removes one handler version. It is used only to roll back a
+// Unregister removes one global handler version. It is used only to roll back a
 // registration when durable definition storage fails.
 func (r *Registry) Unregister(handlerKey, version string) bool {
+	return r.UnregisterScoped("", handlerKey, version)
+}
+
+// UnregisterScoped removes one workspace-scoped handler version.
+func (r *Registry) UnregisterScoped(workspaceID, handlerKey, version string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	k := handlerKey + "@" + version
+	k := scopedKey(workspaceID, handlerKey, version)
 	if _, ok := r.handlers[k]; !ok {
 		return false
 	}
@@ -146,8 +183,19 @@ func (r *Registry) Unregister(handlerKey, version string) bool {
 }
 
 func (r *Registry) Resolve(handlerKey, version string) (Handler, error) {
+	return r.ResolveScoped("", handlerKey, version)
+}
+
+// ResolveScoped resolves a handler for workspaceID, falling back to global ("") built-ins.
+func (r *Registry) ResolveScoped(workspaceID, handlerKey, version string) (Handler, error) {
 	r.mu.RLock()
-	h, ok := r.handlers[handlerKey+"@"+version]
+	if workspaceID != "" {
+		if h, ok := r.handlers[scopedKey(workspaceID, handlerKey, version)]; ok {
+			r.mu.RUnlock()
+			return h, nil
+		}
+	}
+	h, ok := r.handlers[scopedKey("", handlerKey, version)]
 	r.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("%w: %s@%s", ErrNotFound, handlerKey, version)
@@ -156,12 +204,33 @@ func (r *Registry) Resolve(handlerKey, version string) (Handler, error) {
 }
 
 func (r *Registry) Manifests() []Manifest {
+	return r.ManifestsForWorkspace("")
+}
+
+func (r *Registry) ManifestsForWorkspace(workspaceID string) []Manifest {
 	r.mu.RLock()
-	manifests := make([]Manifest, 0, len(r.handlers))
-	for _, h := range r.handlers {
-		manifests = append(manifests, h.Manifest())
+	seen := make(map[string]Manifest)
+	prefix := ":"
+	for k, h := range r.handlers {
+		m := h.Manifest()
+		if len(k) > len(prefix) && k[0] == ':' {
+			seen[key(m)] = m
+		}
+	}
+	if workspaceID != "" {
+		wsPrefix := workspaceID + ":"
+		for k, h := range r.handlers {
+			if len(k) > len(wsPrefix) && k[:len(wsPrefix)] == wsPrefix {
+				m := h.Manifest()
+				seen[key(m)] = m
+			}
+		}
 	}
 	r.mu.RUnlock()
+	manifests := make([]Manifest, 0, len(seen))
+	for _, m := range seen {
+		manifests = append(manifests, m)
+	}
 	sort.Slice(manifests, func(i, j int) bool {
 		return key(manifests[i]) < key(manifests[j])
 	})

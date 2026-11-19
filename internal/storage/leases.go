@@ -63,7 +63,8 @@ func (s *Store) acquireLease(ctx context.Context, executionID, worker string, tt
 	return l, e
 }
 func (s *Store) ClaimNext(ctx context.Context, worker string, ttl time.Duration) (ExecutionRequestRecord, LeaseRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),(SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'),1),e.id FROM executions e WHERE NOT (e.handler_key='connector.credentials.invoke' AND e.handler_version IN('2','3')) AND (e.status='queued' OR(e.status='retry_wait' AND EXISTS(SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND t.run_at<=?))) ORDER BY e.created_at,e.id LIMIT 1`, now())
+	nowStr := now()
+	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,COALESCE((SELECT attempt_number+1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled'),(SELECT attempt_number+1 FROM leases l WHERE l.execution_id=e.id AND l.status='expired'),1),e.id FROM executions e WHERE (e.expires_at='' OR e.expires_at>?) AND (e.status='queued' OR(e.status='retry_wait' AND EXISTS(SELECT 1 FROM retry_timers t WHERE t.execution_id=e.id AND t.status='scheduled' AND t.run_at<=?))) ORDER BY e.priority DESC,e.created_at ASC,e.id ASC LIMIT 1`, nowStr, nowStr)
 	if e != nil {
 		return ExecutionRequestRecord{}, LeaseRecord{}, e
 	}
@@ -177,6 +178,11 @@ func (s *Store) RetryExecutionWithLease(ctx context.Context, lease string, token
 
 func (s *Store) RecoverExpiredLeases(ctx context.Context, n time.Time) error {
 	return s.recoverExpiredLeases(ctx, n, false)
+}
+
+// RecoverExpiredExecutions transitions expired queued/retry_wait executions to timed_out.
+func (s *Store) RecoverExpiredExecutions(ctx context.Context, n time.Time) error {
+	return s.ExpireQueuedExecutions(ctx, n)
 }
 
 // RecoverExpiredInlineLeases recovers only synchronous credential invocations.

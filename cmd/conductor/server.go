@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,7 +8,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mrchypark/conductor/internal/connections"
 	ampconnectors "github.com/mrchypark/conductor/internal/connectors"
 	"github.com/mrchypark/conductor/internal/executions"
 	"github.com/mrchypark/conductor/internal/handlers"
@@ -17,31 +15,30 @@ import (
 )
 
 type server struct {
-	executions   *executions.Service
-	registry     *handlers.Registry
-	catalog      *ampconnectors.Catalog
-	store        *storage.Store
-	serviceToken string
-	oauthStore   *connections.Store
-	wasmRuntime  *handlers.WASMRuntime
-	wasmFetch    wasmArtifactFetcher
+	executions             *executions.Service
+	registry               *handlers.Registry
+	catalog                *ampconnectors.Catalog
+	store                  *storage.Store
+	wasmRuntime            *handlers.WASMRuntime
+	wasmFetch              wasmArtifactFetcher
+	wasmPush               wasmArtifactPusher
+	requireWorkspaceHeader bool
+	allowInsecureCustom    bool
 }
 
 func newServer(service *executions.Service, registry *handlers.Registry, catalog *ampconnectors.Catalog) *server {
-	return &server{executions: service, registry: registry, catalog: catalog, serviceToken: os.Getenv("CONDUCTOR_SERVICE_TOKEN")}
+	return &server{
+		executions:             service,
+		registry:               registry,
+		catalog:                catalog,
+		requireWorkspaceHeader: strings.EqualFold(os.Getenv("CONDUCTOR_REQUIRE_WORKSPACE_HEADER"), "true"),
+		allowInsecureCustom:    strings.EqualFold(os.Getenv("CONDUCTOR_ALLOW_INSECURE_CUSTOM_CONNECTORS"), "true"),
+	}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/v1/handlers/definition" {
+	if strings.HasSuffix(r.URL.Path, "/handlers/definition") {
 		w.Header().Set("Cache-Control", "no-store")
-	}
-	if s.serviceToken != "" && !isOAuthCallbackPath(r.URL.Path) && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.serviceToken)) != 1 {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if len(r.Header.Values("X-Conductor-Human-Authorization")) > 0 && (r.Method != http.MethodPost || r.URL.Path != "/v1/executions") {
-		writeError(w, http.StatusBadRequest, "human authorization is only accepted for synchronous credential executions")
-		return
 	}
 	switch {
 	case r.Method == http.MethodPost && (r.URL.Path == "/v1/worker/poll" || r.URL.Path == "/v1/worker/tasks:poll"):
@@ -52,46 +49,69 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.workerComplete(w, r)
 	case r.Method == http.MethodPost && (r.URL.Path == "/v1/worker/fail" || r.URL.Path == "/v1/worker/tasks:fail"):
 		s.workerFail(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/events":
-		s.ingestEvents(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/executions":
-		s.submitExecution(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/connections":
-		s.registerConnection(w, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/handlers":
-		s.registerHandler(w, r)
-	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel") && strings.HasPrefix(r.URL.Path, "/v1/executions/"):
-		s.cancelExecution(w, r)
-	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/events") && strings.HasPrefix(r.URL.Path, "/v1/executions/"):
-		s.executionEvents(w, r)
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/executions/"):
-		s.getExecution(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/handlers":
-		writeJSON(w, http.StatusOK, s.registry.Manifests())
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/handlers/definition":
-		s.getHandlerDefinition(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/connectors":
-		if s.catalog == nil {
-			writeError(w, http.StatusServiceUnavailable, "connector catalog unavailable")
-			return
-		}
-		writeJSON(w, http.StatusOK, s.catalog.Names())
+		s.listConnectors(w, r, "")
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/connectors/"):
 		provider := strings.TrimPrefix(r.URL.Path, "/v1/connectors/")
-		if provider == "" || strings.Contains(provider, "/") || s.catalog == nil {
-			writeError(w, http.StatusNotFound, "connector not found")
-			return
-		}
-		manifest, err := s.catalog.Manifest(provider)
-		if err != nil {
-			writeError(w, http.StatusNotFound, "connector not found")
-			return
-		}
-		writeJSON(w, http.StatusOK, manifest)
-	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/oauth/") && strings.HasSuffix(r.URL.Path, "/begin"):
-		s.oauthBegin(w, r)
-	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && isOAuthCallbackPath(r.URL.Path):
-		s.oauthComplete(w, r)
+		s.getConnector(w, r, "", provider)
+	case strings.HasPrefix(r.URL.Path, "/v1/workspaces/"):
+		s.serveWorkspace(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "route not found")
+	}
+}
+
+func (s *server) serveWorkspace(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/workspaces/")
+	idx := strings.IndexByte(rest, '/')
+	if idx <= 0 {
+		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
+	workspaceID, subPath := rest[:idx], rest[idx:]
+	if workspaceID == "" || strings.ContainsAny(workspaceID, " \t\r\n") {
+		writeError(w, http.StatusBadRequest, "invalid workspace_id")
+		return
+	}
+	headerWS := r.Header.Get("X-Workspace-Id")
+	if s.requireWorkspaceHeader && headerWS == "" {
+		writeError(w, http.StatusBadRequest, "X-Workspace-Id header is required")
+		return
+	}
+	if headerWS != "" && headerWS != workspaceID {
+		writeError(w, http.StatusBadRequest, "X-Workspace-Id does not match request path")
+		return
+	}
+
+	switch {
+	case r.Method == http.MethodPost && subPath == "/events":
+		s.ingestEvents(w, r, workspaceID)
+	case r.Method == http.MethodPost && subPath == "/executions":
+		s.submitExecution(w, r, workspaceID)
+	case r.Method == http.MethodPost && strings.HasPrefix(subPath, "/executions/") && strings.HasSuffix(subPath, "/cancel"):
+		id := strings.TrimSuffix(strings.TrimPrefix(subPath, "/executions/"), "/cancel")
+		s.cancelExecution(w, r, workspaceID, id)
+	case r.Method == http.MethodGet && strings.HasPrefix(subPath, "/executions/") && strings.HasSuffix(subPath, "/events"):
+		id := strings.TrimSuffix(strings.TrimPrefix(subPath, "/executions/"), "/events")
+		s.executionEvents(w, r, workspaceID, id)
+	case r.Method == http.MethodGet && strings.HasPrefix(subPath, "/executions/"):
+		id := strings.TrimPrefix(subPath, "/executions/")
+		s.getExecution(w, r, workspaceID, id)
+	case r.Method == http.MethodPost && subPath == "/handlers":
+		s.registerHandler(w, r, workspaceID)
+	case r.Method == http.MethodPost && subPath == "/handlers/wasm":
+		s.registerWASMUploadHandler(w, r, workspaceID)
+	case r.Method == http.MethodGet && subPath == "/handlers":
+		writeJSON(w, http.StatusOK, s.registry.ManifestsForWorkspace(workspaceID))
+	case r.Method == http.MethodGet && subPath == "/handlers/definition":
+		s.getHandlerDefinition(w, r, workspaceID)
+	case r.Method == http.MethodGet && subPath == "/connectors":
+		s.listConnectors(w, r, workspaceID)
+	case r.Method == http.MethodPost && subPath == "/connectors":
+		s.registerConnector(w, r, workspaceID)
+	case r.Method == http.MethodGet && strings.HasPrefix(subPath, "/connectors/"):
+		provider := strings.TrimPrefix(subPath, "/connectors/")
+		s.getConnector(w, r, workspaceID, provider)
 	default:
 		writeError(w, http.StatusNotFound, "route not found")
 	}

@@ -4,12 +4,12 @@ go 1.27.1
 
 require (
 	github.com/amp-labs/connectors v0.0.0-20260926000507-12b379106601
-	github.com/jokruger/kavun v0.7.1
 	github.com/mrchypark/gowid-go-sdk v0.1.0
 	github.com/mrchypark/rhiza v0.18.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/tetratelabs/wazero v1.12.0
+	go.starlark.net v0.0.0-20261021141710-4f4267fb140d
 	golang.org/x/oauth2 v0.37.0
 	oras.land/oras-go/v2 v2.6.2
 )
@@ -41,7 +41,6 @@ require (
 	github.com/antchfx/xpath v1.3.8 // indirect
 	github.com/apache/arrow-go/v18 v18.8.0 // indirect
 	github.com/apache/arrow/go/v15 v15.0.2 // indirect
-	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de // indirect
 	github.com/aws/aws-sdk-go-v2 v1.47.1 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.33.6 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.6 // indirect
@@ -94,8 +93,6 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.22 // indirect
 	github.com/googleapis/gax-go/v2 v2.26.2 // indirect
 	github.com/joho/godotenv v1.5.1 // indirect
-	github.com/jokruger/dec128 v1.4.0 // indirect
-	github.com/jokruger/set v1.0.2 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect

@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -15,11 +17,7 @@ import (
 	"github.com/mrchypark/conductor/internal/storage"
 )
 
-func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request) {
-	if s.serviceToken == "" {
-		writeError(w, http.StatusForbidden, "handler definition requires CONDUCTOR_SERVICE_TOKEN")
-		return
-	}
+func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request, workspaceID string) {
 	if len(r.URL.RawQuery) > 3<<20 {
 		writeError(w, http.StatusBadRequest, "invalid handler query")
 		return
@@ -34,9 +32,9 @@ func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key, version := query.Get("handler_key"), query.Get("version")
-	record, err := s.store.GetDynamicHandler(r.Context(), key, version)
+	record, err := s.store.GetStarlarkHandler(r.Context(), workspaceID, key, version)
 	if errors.Is(err, storage.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "stored Kavun source unavailable for handler")
+		writeError(w, http.StatusNotFound, "stored Starlark source unavailable for handler")
 		return
 	}
 	if err != nil {
@@ -50,13 +48,11 @@ func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response, err := json.Marshal(struct {
-		Kind           string            `json:"kind"`
-		Manifest       handlers.Manifest `json:"manifest"`
-		Source         string            `json:"source"`
-		AllowedModules []string          `json:"allowed_modules"`
-		MaxFrames      int               `json:"max_frames"`
-		MaxStack       int               `json:"max_stack"`
-	}{"kavun", manifest, string(record.Source), record.AllowedModules, record.MaxFrames, record.MaxStack})
+		Kind     string            `json:"kind"`
+		Manifest handlers.Manifest `json:"manifest"`
+		Source   string            `json:"source"`
+		MaxSteps int               `json:"max_steps"`
+	}{"starlark", manifest, string(record.Source), record.MaxSteps})
 	if err != nil || len(response) > (6<<20)+4096 {
 		writeError(w, http.StatusInternalServerError, "handler definition exceeds response limit")
 		return
@@ -67,26 +63,17 @@ func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request) {
 }
 
 type handlerRegisterRequest struct {
-	Kind           string            `json:"kind,omitempty"`
-	Manifest       handlers.Manifest `json:"manifest"`
-	Source         string            `json:"source"`
-	AllowedModules []string          `json:"allowed_modules,omitempty"`
-	MaxFrames      int               `json:"max_frames,omitempty"`
-	MaxStack       int               `json:"max_stack,omitempty"`
-	Artifact       string            `json:"artifact,omitempty"`
-	ABI            string            `json:"abi,omitempty"`
+	Kind     string            `json:"kind,omitempty"`
+	Manifest handlers.Manifest `json:"manifest"`
+	Source   string            `json:"source"`
+	MaxSteps int               `json:"max_steps,omitempty"`
+	Artifact string            `json:"artifact,omitempty"`
+	ABI      string            `json:"abi,omitempty"`
 }
 
-// eventBatch is the wire envelope emitted by a workflow service durable outbox.
-// It is intentionally an execution-only adapter: events without the required
-// execution linkage are rejected instead of being interpreted as workflows.
-
-func (s *server) registerHandler(w http.ResponseWriter, r *http.Request) {
-	// Registration changes the executable surface, so it is never enabled on
-	// an unauthenticated server. The global bearer check above authenticates the
-	// request when CONDUCTOR_SERVICE_TOKEN is configured.
-	if s.serviceToken == "" {
-		writeError(w, http.StatusForbidden, "dynamic handler registration requires CONDUCTOR_SERVICE_TOKEN")
+func (s *server) registerHandler(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		s.registerWASMUploadHandler(w, r, workspaceID)
 		return
 	}
 	var input handlerRegisterRequest
@@ -95,44 +82,49 @@ func (s *server) registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if input.Kind == "" {
-		input.Kind = "kavun"
+		input.Kind = "starlark"
 	}
 	switch input.Kind {
-	case "kavun":
-		s.registerKavunHandler(w, r, input)
+	case "starlark":
+		s.registerStarlarkHandler(w, r, workspaceID, input)
 	case "wasm":
-		s.registerWASMHandler(w, r, input)
+		s.registerWASMHandler(w, r, workspaceID, input)
 	default:
-		writeError(w, http.StatusBadRequest, "handler kind must be kavun or wasm")
+		writeError(w, http.StatusBadRequest, "handler kind must be starlark or wasm")
 	}
 }
 
-func (s *server) registerKavunHandler(w http.ResponseWriter, r *http.Request, input handlerRegisterRequest) {
-	handler, err := handlers.NewKavunHandler(handlers.KavunSpec{
-		Manifest: input.Manifest, Source: []byte(input.Source), AllowedModules: input.AllowedModules,
-		MaxFrames: input.MaxFrames, MaxStack: input.MaxStack,
+func (s *server) registerStarlarkHandler(w http.ResponseWriter, r *http.Request, workspaceID string, input handlerRegisterRequest) {
+	handler, err := handlers.NewStarlarkHandler(handlers.StarlarkSpec{
+		Manifest: input.Manifest,
+		Source:   []byte(input.Source),
+		MaxSteps: input.MaxSteps,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.registry.Register(handler); err != nil {
+	if err := s.registry.RegisterScoped(workspaceID, handler); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	if s.store != nil {
 		manifestJSON, marshalErr := json.Marshal(handler.Manifest())
 		hash := sha256.Sum256([]byte(input.Source))
-		created, saveErr := s.store.SaveDynamicHandler(r.Context(), storage.DynamicHandlerRecord{
-			HandlerKey: handler.Manifest().Key, Version: handler.Manifest().Version, ManifestJSON: manifestJSON,
-			Source: []byte(input.Source), AllowedModules: input.AllowedModules, MaxFrames: input.MaxFrames,
-			MaxStack: input.MaxStack, SourceHash: fmt.Sprintf("%x", hash[:]),
+		created, saveErr := s.store.SaveStarlarkHandler(r.Context(), storage.StarlarkHandlerRecord{
+			WorkspaceID:  workspaceID,
+			HandlerKey:   handler.Manifest().Key,
+			Version:      handler.Manifest().Version,
+			ManifestJSON: manifestJSON,
+			Source:       []byte(input.Source),
+			MaxSteps:     input.MaxSteps,
+			SourceHash:   fmt.Sprintf("%x", hash[:]),
 		})
 		if marshalErr != nil || saveErr != nil {
 			if created {
-				_ = s.store.DeleteDynamicHandler(r.Context(), handler.Manifest().Key, handler.Manifest().Version, fmt.Sprintf("%x", hash[:]))
+				_ = s.store.DeleteStarlarkHandler(r.Context(), workspaceID, handler.Manifest().Key, handler.Manifest().Version, fmt.Sprintf("%x", hash[:]))
 			}
-			s.registry.Unregister(handler.Manifest().Key, handler.Manifest().Version)
+			s.registry.UnregisterScoped(workspaceID, handler.Manifest().Key, handler.Manifest().Version)
 			if marshalErr != nil {
 				writeError(w, http.StatusInternalServerError, "failed to encode handler manifest")
 			} else {
@@ -140,30 +132,73 @@ func (s *server) registerKavunHandler(w http.ResponseWriter, r *http.Request, in
 			}
 			return
 		}
-		bytecode, bytecodeHash, runtimeABI, encodeErr := handler.Bytecode()
-		if encodeErr != nil || s.store.SaveDynamicHandlerBytecode(r.Context(), handler.Manifest().Key, handler.Manifest().Version, bytecode, bytecodeHash, fmt.Sprintf("%x", hash[:]), runtimeABI) != nil {
-			if created {
-				_ = s.store.DeleteDynamicHandler(r.Context(), handler.Manifest().Key, handler.Manifest().Version, fmt.Sprintf("%x", hash[:]))
-			}
-			s.registry.Unregister(handler.Manifest().Key, handler.Manifest().Version)
-			if encodeErr != nil {
-				writeError(w, http.StatusInternalServerError, "failed to encode handler bytecode")
-			} else {
-				writeError(w, http.StatusInternalServerError, "failed to store handler bytecode")
-			}
-			return
-		}
 	}
 	writeJSON(w, http.StatusCreated, handler.Manifest())
 }
 
-func (s *server) registerWASMHandler(w http.ResponseWriter, r *http.Request, input handlerRegisterRequest) {
+func (s *server) registerWASMUploadHandler(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	if s.wasmRuntime == nil || s.wasmPush == nil {
+		writeError(w, http.StatusServiceUnavailable, "wasm upload runtime or OCI registry is not configured")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, int64(handlers.MaxWASMArtifactBytes+(1<<20)))
+	if err := r.ParseMultipartForm(int64(handlers.MaxWASMArtifactBytes + (1 << 20))); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid multipart wasm upload")
+		return
+	}
+	manifestRaw := r.FormValue("manifest")
+	if manifestRaw == "" {
+		writeError(w, http.StatusBadRequest, "manifest form field is required")
+		return
+	}
+	var manifest handlers.Manifest
+	if err := json.Unmarshal([]byte(manifestRaw), &manifest); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid manifest JSON")
+		return
+	}
+	abi := r.FormValue("abi")
+	if abi == "" {
+		abi = handlers.WASMRuntimeABI
+	}
+	file, _, err := r.FormFile("wasm")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "wasm file part is required")
+		return
+	}
+	defer file.Close()
+	wasmBytes, err := io.ReadAll(io.LimitReader(file, int64(handlers.MaxWASMArtifactBytes+1)))
+	if err != nil || len(wasmBytes) > handlers.MaxWASMArtifactBytes {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("wasm file exceeds %d bytes", handlers.MaxWASMArtifactBytes))
+		return
+	}
+	// Pre-compile and validate ABI in memory BEFORE pushing to OCI registry.
+	compiled, err := s.wasmRuntime.ValidateAndCompile(r.Context(), wasmBytes, abi)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = compiled.Close(context.Background())
+
+	pushCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	pushed, err := s.wasmPush(pushCtx, workspaceID, manifest.Key, manifest.Version, wasmBytes)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.finalizeWASMRegistration(w, r, workspaceID, manifest, abi, pushed.ArtifactRef, pushed.ManifestDigest, pushed.BlobDigest, pushed.Size, wasmBytes)
+}
+
+func (s *server) registerWASMHandler(w http.ResponseWriter, r *http.Request, workspaceID string, input handlerRegisterRequest) {
 	if s.wasmRuntime == nil || s.wasmFetch == nil {
 		writeError(w, http.StatusServiceUnavailable, "wasm runtime is not configured")
 		return
 	}
-	if input.ABI != handlers.WASMRuntimeABI {
-		writeError(w, http.StatusBadRequest, "abi must be "+handlers.WASMRuntimeABI)
+	if input.ABI == "" {
+		input.ABI = handlers.WASMRuntimeABI
+	}
+	if input.ABI != handlers.WASMRuntimeABI && input.ABI != handlers.WASMRuntimeABIV2 {
+		writeError(w, http.StatusBadRequest, "abi must be "+handlers.WASMRuntimeABI+" or "+handlers.WASMRuntimeABIV2)
 		return
 	}
 	if input.Artifact == "" {
@@ -177,22 +212,29 @@ func (s *server) registerWASMHandler(w http.ResponseWriter, r *http.Request, inp
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.finalizeWASMRegistration(w, r, workspaceID, input.Manifest, input.ABI, input.Artifact, artifact.ManifestDigest, artifact.BlobDigest, artifact.Size, artifact.Bytes)
+}
+
+func (s *server) finalizeWASMRegistration(w http.ResponseWriter, r *http.Request, workspaceID string, manifest handlers.Manifest, abi, artifactRef, manifestDigest, blobDigest string, size int64, wasmBytes []byte) {
 	load := func(ctx context.Context) ([]byte, error) {
-		fetched, err := s.wasmFetch(ctx, input.Artifact)
+		if s.wasmFetch == nil {
+			return nil, errors.New("wasm artifact fetcher is unavailable")
+		}
+		fetched, err := s.wasmFetch(ctx, artifactRef)
 		if err != nil {
 			return nil, err
 		}
-		if fetched.ManifestDigest != artifact.ManifestDigest || fetched.BlobDigest != artifact.BlobDigest || fetched.Size != artifact.Size {
+		if fetched.ManifestDigest != manifestDigest || fetched.BlobDigest != blobDigest || fetched.Size != size {
 			return nil, &handlers.Error{Class: "wasm_invalid", Message: "wasm artifact identity changed"}
 		}
 		return fetched.Bytes, nil
 	}
-	handler, err := s.wasmRuntime.NewHandler(fetchCtx, handlers.WASMSpec{Manifest: input.Manifest, Load: load}, artifact.Bytes)
+	handler, err := s.wasmRuntime.NewHandler(r.Context(), handlers.WASMSpec{Manifest: manifest, ABI: abi, Load: load}, wasmBytes)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.registry.Register(handler); err != nil {
+	if err := s.registry.RegisterScoped(workspaceID, handler); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -201,16 +243,16 @@ func (s *server) registerWASMHandler(w http.ResponseWriter, r *http.Request, inp
 	var saveErr error
 	if s.store != nil && marshalErr == nil {
 		created, saveErr = s.store.SaveWASMHandler(r.Context(), storage.WASMHandlerRecord{
-			HandlerKey: handler.Manifest().Key, Version: handler.Manifest().Version, ManifestJSON: manifestJSON,
-			ArtifactRef: input.Artifact, ManifestDigest: artifact.ManifestDigest, BlobDigest: artifact.BlobDigest,
-			ArtifactSize: artifact.Size, RuntimeABI: handlers.WASMRuntimeABI,
+			WorkspaceID: workspaceID, HandlerKey: handler.Manifest().Key, Version: handler.Manifest().Version, ManifestJSON: manifestJSON,
+			ArtifactRef: artifactRef, ManifestDigest: manifestDigest, BlobDigest: blobDigest,
+			ArtifactSize: size, RuntimeABI: abi,
 		})
 	}
 	if marshalErr != nil || saveErr != nil {
 		if created {
-			_ = s.store.DeleteWASMHandler(r.Context(), handler.Manifest().Key, handler.Manifest().Version, artifact.ManifestDigest)
+			_ = s.store.DeleteWASMHandler(r.Context(), workspaceID, handler.Manifest().Key, handler.Manifest().Version, manifestDigest)
 		}
-		s.registry.Unregister(handler.Manifest().Key, handler.Manifest().Version)
+		s.registry.UnregisterScoped(workspaceID, handler.Manifest().Key, handler.Manifest().Version)
 		if marshalErr != nil {
 			writeError(w, http.StatusInternalServerError, "failed to encode handler manifest")
 		} else {
@@ -218,5 +260,14 @@ func (s *server) registerWASMHandler(w http.ResponseWriter, r *http.Request, inp
 		}
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"kind": "wasm", "manifest": handler.Manifest(), "artifact": input.Artifact, "manifest_digest": artifact.ManifestDigest, "blob_digest": artifact.BlobDigest, "artifact_size": artifact.Size, "abi": handlers.WASMRuntimeABI})
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"kind":            "wasm",
+		"workspace_id":    workspaceID,
+		"manifest":        handler.Manifest(),
+		"artifact":        artifactRef,
+		"manifest_digest": manifestDigest,
+		"blob_digest":     blobDigest,
+		"artifact_size":   size,
+		"abi":             abi,
+	})
 }

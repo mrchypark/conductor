@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,7 +17,6 @@ import (
 	"time"
 
 	"github.com/mrchypark/conductor/internal/callbacks"
-	"github.com/mrchypark/conductor/internal/connections"
 	ampconnectors "github.com/mrchypark/conductor/internal/connectors"
 	"github.com/mrchypark/conductor/internal/executions"
 	"github.com/mrchypark/conductor/internal/handlers"
@@ -47,7 +47,7 @@ func TestExecutionHTTPVerticalSlice(t *testing.T) {
 	h := newServer(service, registry, nil)
 
 	request := `{"execution_request_id":"er-http","handler":"payload.echo","handler_version":"1","operation":"echo","input":{"ok":true}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(request))
+	req := httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/executions", strings.NewReader(request))
 	recorder := httptest.NewRecorder()
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -61,7 +61,7 @@ func TestExecutionHTTPVerticalSlice(t *testing.T) {
 		t.Fatalf("unexpected execution: %#v", execution)
 	}
 
-	get := httptest.NewRequest(http.MethodGet, "/v1/executions/exec_er-http", nil)
+	get := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-1/executions/exec_er-http", nil)
 	getRecorder := httptest.NewRecorder()
 	h.ServeHTTP(getRecorder, get)
 	if getRecorder.Code != http.StatusOK {
@@ -90,7 +90,7 @@ func TestExecutionHTTPRejectsTrailingJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	newServer(service, registry, nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/executions", strings.NewReader(`{"execution_request_id":"er-trailing","handler":"payload.echo","handler_version":"1"} {}`)))
+	newServer(service, registry, nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/executions", strings.NewReader(`{"execution_request_id":"er-trailing","handler":"payload.echo","handler_version":"1"} {}`)))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected trailing JSON to be rejected, got %d: %s", recorder.Code, recorder.Body.String())
 	}
@@ -120,7 +120,7 @@ func TestWorkflowEventEnvelopeQueuesLinkedExecution(t *testing.T) {
 	body := `{"events":[{"id":"evt-1","name":"demo.run","idempotency_key":"execution-dispatch:er-event","data":{"hello":"world","subject_ref":{"type":"task","id":"task-1"},"_execution":{"workspace_id":"ws-1","execution_request_id":"er-event","task_id":"task-1"}}}]}`
 	post := func() map[string]any {
 		recorder := httptest.NewRecorder()
-		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(body)))
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/events", strings.NewReader(body)))
 		if recorder.Code != http.StatusAccepted {
 			t.Fatalf("unexpected event status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
@@ -160,7 +160,7 @@ func TestWorkflowEventEnvelopeRequiresExecutionLinkage(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	newServer(service, handlers.NewRegistry(), nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(`{"events":[{"name":"business.ready","data":{}}]}`)))
+	newServer(service, handlers.NewRegistry(), nil).ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/events", strings.NewReader(`{"events":[{"name":"business.ready","data":{}}]}`)))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected unlinked event rejection, got %d: %s", recorder.Code, recorder.Body.String())
 	}
@@ -259,7 +259,7 @@ func TestWorkflowFunctionBindingNativeAndConnectorShareExecutionContract(t *test
 	h := newServer(service, registry, catalog)
 	submitEvent := func(body string, requestID string) {
 		recorder := httptest.NewRecorder()
-		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/events", strings.NewReader(body)))
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-contract/events", strings.NewReader(body)))
 		if recorder.Code != http.StatusAccepted {
 			t.Fatalf("canonical Workflow event was not accepted: status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
@@ -390,15 +390,8 @@ func TestDynamicKavunHandlerRegistrationRequiresServiceToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestBody := `{"manifest":{"handler_key":"transform.kavun","version":"1"},"source":"output = input"}`
-	unauthenticated := httptest.NewRecorder()
-	newServer(service, registry, nil).ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodPost, "/v1/handlers", strings.NewReader(requestBody)))
-	if unauthenticated.Code != http.StatusForbidden {
-		t.Fatalf("expected registration to be forbidden, got %d: %s", unauthenticated.Code, unauthenticated.Body.String())
-	}
-
+	requestBody := `{"manifest":{"handler_key":"transform.starlark","version":"1"},"source":"def run(input):\n    return input\n"}`
 	h := newServer(service, registry, nil)
-	h.serviceToken = "secret"
 	h.store = store
 	builtin, err := handlers.NewFuncHandler(handlers.Manifest{Key: "built/in@key", Version: "v 1"}, func(context.Context, handlers.Request) (handlers.Result, error) { return handlers.Result{}, nil })
 	if err != nil {
@@ -408,28 +401,26 @@ func TestDynamicKavunHandlerRegistrationRequiresServiceToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	registered := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/handlers", strings.NewReader(requestBody))
-	req.Header.Set("Authorization", "Bearer secret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/handlers", strings.NewReader(requestBody))
 	h.ServeHTTP(registered, req)
 	if registered.Code != http.StatusCreated {
 		t.Fatalf("expected registration success, got %d: %s", registered.Code, registered.Body.String())
 	}
 	for _, tc := range []struct {
-		name, target, token string
-		status              int
+		name, target string
+		status       int
 	}{
-		{"stored", "/v1/handlers/definition?handler_key=transform.kavun&version=1", "secret", 200},
-		{"unauthorized", "/v1/handlers/definition?handler_key=transform.kavun&version=1", "wrong", 401},
-		{"missing", "/v1/handlers/definition?handler_key=missing&version=1", "secret", 404},
-		{"builtin", "/v1/handlers/definition?handler_key=built%2Fin%40key&version=v+1", "secret", 404},
-		{"duplicate", "/v1/handlers/definition?handler_key=x&handler_key=y&version=1", "secret", 400},
-		{"missing version", "/v1/handlers/definition?handler_key=x", "secret", 400},
-		{"invalid escape", "/v1/handlers/definition?handler_key=x%zz&version=1", "secret", 400},
-		{"extra", "/v1/handlers/definition?handler_key=x&version=1&other=y", "secret", 400},
+		{"stored", "/v1/workspaces/ws-1/handlers/definition?handler_key=transform.starlark&version=1", 200},
+		{"other workspace", "/v1/workspaces/ws-2/handlers/definition?handler_key=transform.starlark&version=1", 404},
+		{"missing", "/v1/workspaces/ws-1/handlers/definition?handler_key=missing&version=1", 404},
+		{"builtin", "/v1/workspaces/ws-1/handlers/definition?handler_key=built%2Fin%40key&version=v+1", 404},
+		{"duplicate", "/v1/workspaces/ws-1/handlers/definition?handler_key=x&handler_key=y&version=1", 400},
+		{"missing version", "/v1/workspaces/ws-1/handlers/definition?handler_key=x", 400},
+		{"invalid escape", "/v1/workspaces/ws-1/handlers/definition?handler_key=x%zz&version=1", 400},
+		{"extra", "/v1/workspaces/ws-1/handlers/definition?handler_key=x&version=1&other=y", 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, tc.target, nil)
-			request.Header.Set("Authorization", "Bearer "+tc.token)
 			response := httptest.NewRecorder()
 			h.ServeHTTP(response, request)
 			if response.Code != tc.status || response.Header().Get("Cache-Control") != "no-store" {
@@ -437,40 +428,32 @@ func TestDynamicKavunHandlerRegistrationRequiresServiceToken(t *testing.T) {
 			}
 			if tc.status == 200 {
 				var definition map[string]json.RawMessage
-				if err := json.Unmarshal(response.Body.Bytes(), &definition); err != nil || string(definition["source"]) != `"output = input"` || string(definition["kind"]) != `"kavun"` || definition["manifest"] == nil || definition["allowed_modules"] == nil || definition["max_frames"] == nil || definition["max_stack"] == nil || len(definition) != 6 {
+				if err := json.Unmarshal(response.Body.Bytes(), &definition); err != nil || string(definition["kind"]) != `"starlark"` || definition["manifest"] == nil || definition["source"] == nil || definition["max_steps"] == nil || len(definition) != 4 {
 					t.Fatalf("unexpected definition: %s, err=%v", response.Body.String(), err)
 				}
 			}
 		})
 	}
-	disabled := newServer(service, registry, nil)
-	response := httptest.NewRecorder()
-	disabled.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=x&version=1", nil))
-	if response.Code != http.StatusForbidden {
-		t.Fatalf("expected disabled definition access, got %d", response.Code)
-	}
 	unavailable := newServer(service, registry, nil)
-	unavailable.serviceToken = "secret"
-	request := httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=x&version=1", nil)
-	request.Header.Set("Authorization", "Bearer secret")
-	response = httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-1/handlers/definition?handler_key=x&version=1", nil)
+	response := httptest.NewRecorder()
 	unavailable.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected unavailable store, got %d", response.Code)
 	}
-	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "kavun-http", HandlerKey: "transform.kavun", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
+	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{WorkspaceID: "ws-1", ExecutionRequestID: "starlark-http", HandlerKey: "transform.starlark", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
 	if err != nil || execution.Status != "succeeded" || string(execution.Output) != `{"ok":true}` {
 		t.Fatalf("unexpected dynamic execution: %#v err=%v", execution, err)
 	}
 	restored := handlers.NewRegistry()
-	if err := loadDynamicHandlers(context.Background(), store, restored); err != nil {
+	if err := loadStarlarkHandlers(context.Background(), store, restored); err != nil {
 		t.Fatal(err)
 	}
 	restoredService, err := executions.NewService(store, restored)
 	if err != nil {
 		t.Fatal(err)
 	}
-	restoredExecution, err := restoredService.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "kavun-restored", HandlerKey: "transform.kavun", HandlerVersion: "1", Input: json.RawMessage(`{"restored":true}`)})
+	restoredExecution, err := restoredService.SubmitAndExecute(context.Background(), executions.ExecutionRequest{WorkspaceID: "ws-1", ExecutionRequestID: "starlark-restored", HandlerKey: "transform.starlark", HandlerVersion: "1", Input: json.RawMessage(`{"restored":true}`)})
 	if err != nil || restoredExecution.Status != "succeeded" || string(restoredExecution.Output) != `{"restored":true}` {
 		t.Fatalf("unexpected restored dynamic execution: %#v err=%v", restoredExecution, err)
 	}
@@ -488,7 +471,7 @@ func TestHandlerDefinitionEscapedIdentifiersAndIntegrity(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := newServer(service, registry, nil)
-	h.serviceToken, h.store = "secret", store
+	h.store = store
 	key := strings.Repeat("k", 2048) + "/@?&+\n"
 	version := "v/1 &+\n"
 	escapeHeavy := strings.Repeat("<", 8000)
@@ -496,50 +479,47 @@ func TestHandlerDefinitionEscapedIdentifiersAndIntegrity(t *testing.T) {
 	if err != nil || !bytes.Contains(manifestJSON, []byte(`\u003c`)) || len(manifestJSON) <= len(escapeHeavy)*5 {
 		t.Fatalf("manifest escaping: size=%d err=%v", len(manifestJSON), err)
 	}
+	src := "def run(input):\n    return input\n"
 	var body bytes.Buffer
 	encoder := json.NewEncoder(&body)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(handlerRegisterRequest{Manifest: handlers.Manifest{Key: key, Version: version, ResourceClass: escapeHeavy}, Source: "output = input"}); err != nil {
+	if err := encoder.Encode(handlerRegisterRequest{Manifest: handlers.Manifest{Key: key, Version: version, ResourceClass: escapeHeavy}, Source: src}); err != nil {
 		t.Fatal(err)
 	}
-	request := httptest.NewRequest(http.MethodPost, "/v1/handlers", &body)
-	request.Header.Set("Authorization", "Bearer secret")
+	request := httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/handlers", &body)
 	response := httptest.NewRecorder()
 	h.ServeHTTP(response, request)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("registration: %d %s", response.Code, response.Body.String())
 	}
 	values := url.Values{"handler_key": {key}, "version": {version}}
-	request = httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?"+values.Encode(), nil)
-	request.Header.Set("Authorization", "Bearer secret")
+	request = httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-1/handlers/definition?"+values.Encode(), nil)
 	response = httptest.NewRecorder()
 	h.ServeHTTP(response, request)
 	var definition handlerRegisterRequest
-	if err := json.Unmarshal(response.Body.Bytes(), &definition); response.Code != http.StatusOK || err != nil || definition.Manifest.Key != key || definition.Manifest.Version != version || definition.Manifest.ResourceClass != escapeHeavy || definition.Source != "output = input" {
+	if err := json.Unmarshal(response.Body.Bytes(), &definition); response.Code != http.StatusOK || err != nil || definition.Manifest.Key != key || definition.Manifest.Version != version || definition.Manifest.ResourceClass != escapeHeavy || definition.Source != src {
 		t.Fatalf("definition status=%d err=%v", response.Code, err)
 	}
 	manifest, _ := json.Marshal(handlers.Manifest{Key: "corrupt", Version: "1"})
 	hash := sha256.Sum256([]byte("different source"))
-	if _, err := store.SaveDynamicHandler(context.Background(), storage.DynamicHandlerRecord{HandlerKey: "corrupt", Version: "1", ManifestJSON: manifest, Source: []byte("output = input"), SourceHash: fmt.Sprintf("%x", hash[:])}); err != nil {
+	if _, err := store.SaveStarlarkHandler(context.Background(), storage.StarlarkHandlerRecord{WorkspaceID: "ws-1", HandlerKey: "corrupt", Version: "1", ManifestJSON: manifest, Source: []byte(src), SourceHash: fmt.Sprintf("%x", hash[:])}); err != nil {
 		t.Fatal(err)
 	}
-	request = httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=corrupt&version=1", nil)
-	request.Header.Set("Authorization", "Bearer secret")
+	request = httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-1/handlers/definition?handler_key=corrupt&version=1", nil)
 	response = httptest.NewRecorder()
 	h.ServeHTTP(response, request)
-	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "output = input") {
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "def run") {
 		t.Fatalf("corrupt definition: %d %s", response.Code, response.Body.String())
 	}
 }
 
 func TestHandlerDefinitionRealServerRequestTargetLimit(t *testing.T) {
-	server := httptest.NewServer(&server{serviceToken: "secret"})
+	server := httptest.NewServer(&server{})
 	defer server.Close()
-	valid, err := http.NewRequest(http.MethodGet, server.URL+"/v1/handlers/definition?handler_key="+strings.Repeat("x", 2048)+"%2F%40%0A&version=1", nil)
+	valid, err := http.NewRequest(http.MethodGet, server.URL+"/v1/workspaces/ws-1/handlers/definition?handler_key="+strings.Repeat("x", 2048)+"%2F%40%0A&version=1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	valid.Header.Set("Authorization", "Bearer secret")
 	accepted, err := server.Client().Do(valid)
 	if err != nil {
 		t.Fatal(err)
@@ -548,11 +528,10 @@ func TestHandlerDefinitionRealServerRequestTargetLimit(t *testing.T) {
 	if accepted.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("valid request status=%d, want %d", accepted.StatusCode, http.StatusServiceUnavailable)
 	}
-	request, err := http.NewRequest(http.MethodGet, server.URL+"/v1/handlers/definition?handler_key="+strings.Repeat("x", http.DefaultMaxHeaderBytes+8192)+"&version=1", nil)
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/v1/workspaces/ws-1/handlers/definition?handler_key="+strings.Repeat("x", http.DefaultMaxHeaderBytes+8192)+"&version=1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("Authorization", "Bearer secret")
 	response, err := server.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -563,7 +542,7 @@ func TestHandlerDefinitionRealServerRequestTargetLimit(t *testing.T) {
 	}
 }
 
-func TestWASMHandlerRegistrationPersistsMetadataAndReloadsLazily(t *testing.T) {
+func TestWASMHandlerMultipartUploadAndLazyRestore(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
 		t.Fatal(err)
@@ -573,7 +552,17 @@ func TestWASMHandlerRegistrationPersistsMetadataAndReloadsLazily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pushed := 0
 	fetched := 0
+	push := func(_ context.Context, workspaceID, key, version string, b []byte) (wasmPushedArtifact, error) {
+		pushed++
+		return wasmPushedArtifact{
+			ArtifactRef:    "registry.example/" + workspaceID + "/transform@sha256:manifest",
+			ManifestDigest: "sha256:manifest",
+			BlobDigest:     "sha256:blob",
+			Size:           int64(len(b)),
+		}, nil
+	}
 	fetch := func(context.Context, string) (wasmArtifact, error) {
 		fetched++
 		return wasmArtifact{Bytes: wasm, ManifestDigest: "sha256:manifest", BlobDigest: "sha256:blob", Size: int64(len(wasm))}, nil
@@ -583,28 +572,44 @@ func TestWASMHandlerRegistrationPersistsMetadataAndReloadsLazily(t *testing.T) {
 	registry := handlers.NewRegistry()
 	service, _ := executions.NewService(store, registry)
 	h := newServer(service, registry, nil)
-	h.serviceToken, h.store, h.wasmRuntime, h.wasmFetch = "secret", store, runtime, fetch
-	body := `{"kind":"wasm","manifest":{"handler_key":"transform.wasm","version":"1"},"artifact":"registry.example/functions/transform@sha256:manifest","abi":"conductor:function/v1"}`
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/v1/handlers", strings.NewReader(body))
-	request.Header.Set("Authorization", "Bearer secret")
-	h.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("register status=%d body=%s", recorder.Code, recorder.Body.String())
+	h.store, h.wasmRuntime, h.wasmFetch, h.wasmPush = store, runtime, fetch, push
+
+	buildMultipart := func(manifestJSON, abi string, wasmData []byte) (*bytes.Buffer, string) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("manifest", manifestJSON)
+		if abi != "" {
+			_ = mw.WriteField("abi", abi)
+		}
+		fw, _ := mw.CreateFormFile("wasm", "handler.wasm")
+		_, _ = fw.Write(wasmData)
+		_ = mw.Close()
+		return &buf, mw.FormDataContentType()
 	}
-	detail := httptest.NewRecorder()
-	detailRequest := httptest.NewRequest(http.MethodGet, "/v1/handlers/definition?handler_key=transform.wasm&version=1", nil)
-	detailRequest.Header.Set("Authorization", "Bearer secret")
-	h.ServeHTTP(detail, detailRequest)
-	if detail.Code != http.StatusNotFound {
-		t.Fatalf("WASM definition: %d %s", detail.Code, detail.Body.String())
+
+	// Invalid WASM must fail pre-validation BEFORE pushing to OCI.
+	badBuf, badCT := buildMultipart(`{"handler_key":"bad.wasm","version":"1"}`, "conductor:function/v1", []byte("not wasm"))
+	badReq := httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/handlers/wasm", badBuf)
+	badReq.Header.Set("Content-Type", badCT)
+	badRec := httptest.NewRecorder()
+	h.ServeHTTP(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest || pushed != 0 {
+		t.Fatalf("expected 400 and 0 OCI pushes for invalid wasm, got code=%d pushed=%d body=%s", badRec.Code, pushed, badRec.Body.String())
 	}
-	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{ExecutionRequestID: "wasm-http", HandlerKey: "transform.wasm", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
+
+	// Valid WASM upload succeeds and pushes once.
+	okBuf, okCT := buildMultipart(`{"handler_key":"transform.wasm","version":"1"}`, "conductor:function/v1", wasm)
+	okReq := httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/handlers/wasm", okBuf)
+	okReq.Header.Set("Content-Type", okCT)
+	okRec := httptest.NewRecorder()
+	h.ServeHTTP(okRec, okReq)
+	if okRec.Code != http.StatusCreated || pushed != 1 {
+		t.Fatalf("register status=%d pushed=%d body=%s", okRec.Code, pushed, okRec.Body.String())
+	}
+
+	execution, err := service.SubmitAndExecute(context.Background(), executions.ExecutionRequest{WorkspaceID: "ws-1", ExecutionRequestID: "wasm-http", HandlerKey: "transform.wasm", HandlerVersion: "1", Input: json.RawMessage(`{"ok":true}`)})
 	if err != nil || execution.Status != "succeeded" || string(execution.Output) != `{"ok":true}` {
 		t.Fatalf("unexpected wasm execution: %#v err=%v", execution, err)
-	}
-	if fetched != 1 {
-		t.Fatalf("eager registration fetches=%d, want 1", fetched)
 	}
 
 	restoredRuntime := handlers.NewWASMRuntime(context.Background())
@@ -613,15 +618,15 @@ func TestWASMHandlerRegistrationPersistsMetadataAndReloadsLazily(t *testing.T) {
 	if err := loadWASMHandlers(context.Background(), store, restored, restoredRuntime, fetch); err != nil {
 		t.Fatal(err)
 	}
-	if fetched != 1 {
+	if fetched != 0 {
 		t.Fatalf("startup unexpectedly fetched artifact: %d", fetched)
 	}
-	restoredHandler, err := restored.Resolve("transform.wasm", "1")
+	restoredHandler, err := restored.ResolveScoped("ws-1", "transform.wasm", "1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	result, err := restoredHandler.Execute(context.Background(), handlers.Request{Input: json.RawMessage(`{"restored":true}`)})
-	if err != nil || string(result.Output) != `{"restored":true}` || fetched != 2 {
+	if err != nil || string(result.Output) != `{"restored":true}` || fetched != 1 {
 		t.Fatalf("lazy restored output=%s fetches=%d err=%v", result.Output, fetched, err)
 	}
 }
@@ -637,96 +642,52 @@ func TestOCIWASMFetcherRequiresAllowlistedDigestReference(t *testing.T) {
 	}
 }
 
-func TestOAuthProviderCallbackIsReachableWithServiceAuthEnabled(t *testing.T) {
+func TestWorkspaceHeaderAndCustomConnectorHTTP(t *testing.T) {
 	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	service, err := executions.NewService(store, handlers.NewRegistry())
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := newServer(service, handlers.NewRegistry(), nil)
-	h.serviceToken = "secret"
-	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/oauth/google/callback?state=s&code=c", nil))
-	if recorder.Code == http.StatusUnauthorized {
-		t.Fatalf("provider callback was blocked by service auth: %s", recorder.Body.String())
-	}
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected callback dependency error, got %d: %s", recorder.Code, recorder.Body.String())
-	}
-}
-
-func TestConnectionHTTPStoresEncryptedCredential(t *testing.T) {
-	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	oauthStore, err := connections.NewStore(context.Background(), store.Persistence(), []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	service, err := executions.NewService(store, handlers.NewRegistry())
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := newServer(service, handlers.NewRegistry(), nil)
-	h.serviceToken = "secret"
-	h.oauthStore = oauthStore
-	recorder := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/connections", strings.NewReader(`{"connection_id":"conn-api","workspace_id":"ws","provider":"slack","api_key":"api-secret","metadata":{"module":"web"}}`))
-	req.Header.Set("Authorization", "Bearer secret")
-	h.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("unexpected status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	connection, err := oauthStore.LoadConnection(context.Background(), "conn-api")
-	if err != nil || connection.Metadata["api_key"] != "api-secret" {
-		t.Fatalf("unexpected connection=%+v err=%v", connection, err)
-	}
-	recorder = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/v1/connections", strings.NewReader(`{"connection_id":"conn-oauth","workspace_id":"ws","provider":"slack","oauth_access_token":"xoxb-secret","scopes":["channels:read"]}`))
-	req.Header.Set("Authorization", "Bearer secret")
-	h.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("unexpected OAuth status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	connection, err = oauthStore.LoadConnection(context.Background(), "conn-oauth")
-	if err != nil || connection.Token == nil || connection.Token.AccessToken != "xoxb-secret" {
-		t.Fatalf("unexpected OAuth connection=%+v err=%v", connection, err)
-	}
-}
-
-func TestConnectorCredentialsResolverEnforcesConnectionScope(t *testing.T) {
-	store, err := storage.Open(context.Background(), "file:"+t.TempDir()+"/conductor.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	connectionStore, err := connections.NewStore(context.Background(), store.Persistence(), []byte("01234567890123456789012345678901"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := connectionStore.SaveConnection(context.Background(), "conn-scope", "ws-owner", "slack", nil, nil, map[string]string{"api_key": "secret"}, time.Now().UTC()); err != nil {
-		t.Fatal(err)
-	}
 	catalog, err := ampconnectors.LoadCatalog()
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := connectorCredentialsResolver(connectionStore, catalog)
-	if _, err := resolver(context.Background(), "conn-scope", "slack", "ws-other", 0); err == nil || err.Error() != "connection scope mismatch" {
-		t.Fatalf("workspace scope mismatch was accepted: %v", err)
+	service, err := executions.NewService(store, handlers.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := resolver(context.Background(), "conn-scope", "salesforce", "ws-owner", 0); err == nil || err.Error() != "connection scope mismatch" {
-		t.Fatalf("provider scope mismatch was accepted: %v", err)
+	h := newServer(service, handlers.NewRegistry(), catalog)
+	h.store = store
+	h.requireWorkspaceHeader = true
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-1/connectors", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing X-Workspace-Id, got %d", rec.Code)
 	}
-	credentials, err := resolver(context.Background(), "conn-scope", "slack", "ws-owner", 0)
-	if err != nil || credentials.APIKey != "secret" {
-		t.Fatalf("valid scoped connection was not resolved: %+v %v", credentials, err)
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-1/connectors", nil)
+	req.Header.Set("X-Workspace-Id", "ws-2")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mismatched X-Workspace-Id, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-1/connectors", strings.NewReader(`{"name":"mycrm","base_url":"https://api.mycrm.example","auth_type":"apiKey"}`))
+	req.Header.Set("X-Workspace-Id", "ws-1")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating custom connector, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-2/connectors/mycrm", nil)
+	req.Header.Set("X-Workspace-Id", "ws-2")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-workspace connector, got %d", rec.Code)
 	}
 }
 
