@@ -202,15 +202,24 @@ func main() {
 
 	var goauthyClient *ampconnectors.GoauthyClient
 	if goauthyURL := strings.TrimSpace(os.Getenv("CONDUCTOR_GOAUTHY_BASE_URL")); goauthyURL != "" {
-		goauthyClient = &ampconnectors.GoauthyClient{
-			BaseURL:     goauthyURL,
-			BearerToken: os.Getenv("CONDUCTOR_GOAUTHY_TOKEN"),
+		goauthyClient, err = ampconnectors.NewGoauthyClient(ampconnectors.GoauthyConfig{
+			BaseURL:           goauthyURL,
+			Issuer:            os.Getenv("CONDUCTOR_GOAUTHY_ISSUER"),
+			ClientID:          os.Getenv("CONDUCTOR_GOAUTHY_CLIENT_ID"),
+			ClientSecret:      os.Getenv("CONDUCTOR_GOAUTHY_CLIENT_SECRET"),
+			Resource:          os.Getenv("CONDUCTOR_GOAUTHY_RESOURCE"),
+			DPoPKeyFile:       os.Getenv("CONDUCTOR_GOAUTHY_DPOP_KEY_FILE"),
+			AllowInsecureHTTP: strings.EqualFold(os.Getenv("CONDUCTOR_ALLOW_INSECURE_CONNECTOR_HTTP"), "true"),
+		})
+		if err != nil {
+			log.Fatal(fmt.Errorf("configure goauthy client: %w", err))
 		}
+		service.SetTokenExchanger(goauthyClient)
 	}
 	ssrfClient := ampconnectors.NewSSRFSafeHTTPClient(nil, allowInsecureCustom)
-	service.SetHostProxy(func(workspaceID, credentialRef string, expiresAt time.Time) handlers.HostConnectorFunc {
+	service.SetHostProxy(func(workspaceID, credentialRef, delegationToken string, expiresAt time.Time) handlers.HostConnectorFunc {
 		return func(callCtx context.Context, callInput json.RawMessage) (json.RawMessage, error) {
-			return catalog.ExecuteProxyCall(callCtx, workspaceID, credentialRef, expiresAt, goauthyClient, ssrfClient, callInput)
+			return catalog.ExecuteProxyCall(callCtx, workspaceID, credentialRef, delegationToken, expiresAt, goauthyClient, ssrfClient, callInput)
 		}
 	})
 

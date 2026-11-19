@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/conductor/internal/executions"
+	"github.com/mrchypark/conductor/internal/handlers"
 	"github.com/mrchypark/conductor/internal/storage"
 )
 
@@ -267,24 +268,56 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request, workspa
 		writeError(w, http.StatusBadRequest, "workspace_id does not match request path")
 		return
 	}
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); len(auth) > len("Bearer ") && strings.EqualFold(auth[:len("Bearer ")], "Bearer ") {
+		request.SubjectToken = strings.TrimSpace(auth[len("Bearer "):])
+	}
 	var execution executions.Execution
 	var err error
 	if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
 		execution, err = s.executions.Submit(r.Context(), request)
 		if err == nil {
 			writeJSON(w, http.StatusAccepted, execution)
+			return
 		}
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-		}
+		writeExecutionError(w, err)
 		return
 	}
 	execution, err = s.executions.SubmitAndExecute(r.Context(), request)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeExecutionError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, execution)
+}
+
+func writeExecutionError(w http.ResponseWriter, err error) {
+	var hErr *handlers.Error
+	if errors.As(err, &hErr) {
+		status := http.StatusBadRequest
+		switch hErr.Class {
+		case "unauthorized", "auth_expired", "auth_mismatch":
+			status = http.StatusUnauthorized
+		case "handler_not_found", "not_found":
+			status = http.StatusNotFound
+		case "idempotency_conflict", "conflict":
+			status = http.StatusConflict
+		case "goauthy_unavailable", "goauthy_misconfigured", "credential_refreshing", "credential_conflict":
+			status = http.StatusServiceUnavailable
+		}
+		writeJSON(w, status, map[string]any{
+			"error": map[string]any{
+				"class":     hErr.Class,
+				"message":   hErr.Message,
+				"retryable": hErr.Retryable,
+			},
+		})
+		return
+	}
+	if strings.Contains(err.Error(), "idempotency_conflict") {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 func (s *server) getExecution(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
