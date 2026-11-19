@@ -138,7 +138,7 @@ func (c *Catalog) invokeScoped(ctx context.Context, request handlers.Request, cl
 }
 
 // ExecuteProxyCall runs one host-mediated connector call on behalf of a Starlark or WASM guest.
-func (c *Catalog) ExecuteProxyCall(ctx context.Context, workspaceID, credentialRef string, expiresAt time.Time, goauthyClient *GoauthyClient, httpClient *http.Client, rawInput json.RawMessage) (json.RawMessage, error) {
+func (c *Catalog) ExecuteProxyCall(ctx context.Context, workspaceID, credentialRef, delegationToken string, expiresAt time.Time, goauthyClient *GoauthyClient, httpClient *http.Client, rawInput json.RawMessage) (json.RawMessage, error) {
 	if c == nil {
 		return nil, &handlers.Error{Class: "connector_unavailable", Message: "connector catalog is unavailable"}
 	}
@@ -173,26 +173,28 @@ func (c *Catalog) ExecuteProxyCall(ctx context.Context, workspaceID, credentialR
 	var creds Credentials
 	if credentialRef != "" {
 		if goauthyClient == nil {
-			return nil, &handlers.Error{Class: "connection_error", Message: "goauthy client is not configured"}
+			return nil, &handlers.Error{Class: "goauthy_misconfigured", Message: "goauthy client is not configured"}
 		}
-		delivered, err := goauthyClient.Exchange(ctx, credentialRef, input.Provider, expiresAt)
+		if !expiresAt.IsZero() && !time.Now().UTC().Before(expiresAt) {
+			return nil, &handlers.Error{Class: "auth_expired", Message: "credential handle has expired"}
+		}
+		delivered, err := fetchAndRecoverCredential(ctx, goauthyClient, credentialRef, delegationToken, info.AuthType == providers.ApiKey)
 		if err != nil {
+			return nil, err
+		}
+		if err := validateDeliveredCredential(delivered, input.Provider, info.AuthType, time.Now().UTC()); err != nil {
 			return nil, err
 		}
 		switch delivered.Kind {
 		case "oauth2":
 			var expiry time.Time
-			if delivered.ExpiresAtUnixMS > 0 {
-				expiry = time.UnixMilli(delivered.ExpiresAtUnixMS).UTC()
+			if delivered.TokenExpiresAtUnixMs > 0 {
+				expiry = time.UnixMilli(delivered.TokenExpiresAtUnixMs).UTC()
 			}
 			tok := &oauth2.Token{AccessToken: delivered.AccessToken, TokenType: delivered.TokenType, Expiry: expiry}
-			creds.TokenSource = NewGoauthyTokenSource(goauthyClient, credentialRef, input.Provider, expiresAt, tok)
+			creds.TokenSource = NewGoauthyTokenSource(goauthyClient, credentialRef, delegationToken, expiresAt, tok)
 		case "api_key":
 			creds.APIKey = delivered.APIKey
-		default:
-			if info.AuthType == providers.ApiKey {
-				creds.APIKey = delivered.APIKey
-			}
 		}
 	}
 	if httpClient == nil {
@@ -207,6 +209,83 @@ func (c *Catalog) ExecuteProxyCall(ctx context.Context, workspaceID, credentialR
 		return nil, err
 	}
 	return res.Output, nil
+}
+
+func fetchAndRecoverCredential(ctx context.Context, client *GoauthyClient, grantID, delegationToken string, isAPIKey bool) (DeliveredCredential, error) {
+	delivered, err := client.FetchCredential(ctx, grantID, delegationToken)
+	if err == nil {
+		return delivered, nil
+	}
+	if !errors.Is(err, ErrCredentialNotFound) {
+		return DeliveredCredential{}, err
+	}
+	if isAPIKey {
+		return DeliveredCredential{}, &handlers.Error{Class: "auth_expired", Message: "api_key credential not found or revoked"}
+	}
+	status, statusErr := client.ProbeCredentialStatus(ctx, grantID, delegationToken)
+	if statusErr != nil {
+		return DeliveredCredential{}, statusErr
+	}
+	switch status.State {
+	case "refreshing":
+		return DeliveredCredential{}, &handlers.Error{Class: "credential_refreshing", Message: "credential is currently refreshing", Retryable: true}
+	case "ready":
+		delivered, err = client.FetchCredential(ctx, grantID, delegationToken)
+		if err == nil {
+			return delivered, nil
+		}
+		if !errors.Is(err, ErrCredentialNotFound) {
+			return DeliveredCredential{}, err
+		}
+		if !status.AllowRefresh {
+			return DeliveredCredential{}, &handlers.Error{Class: "auth_expired", Message: "credential expired and refresh is not allowed"}
+		}
+		if refreshErr := client.RefreshCredential(ctx, grantID, delegationToken, status.Version); refreshErr != nil {
+			return DeliveredCredential{}, refreshErr
+		}
+		delivered, err = client.FetchCredential(ctx, grantID, delegationToken)
+		if err != nil {
+			if errors.Is(err, ErrCredentialNotFound) {
+				return DeliveredCredential{}, &handlers.Error{Class: "auth_expired", Message: "credential not found after refresh"}
+			}
+			return DeliveredCredential{}, err
+		}
+		return delivered, nil
+	default:
+		return DeliveredCredential{}, &handlers.Error{Class: "auth_expired", Message: fmt.Sprintf("credential state %q is not usable", status.State)}
+	}
+}
+
+func validateDeliveredCredential(delivered DeliveredCredential, expectedProvider string, expectedAuth providers.AuthType, now time.Time) error {
+	nowMs := now.UnixMilli()
+	if delivered.ConsentExpiresAtUnixMs > 0 && nowMs >= delivered.ConsentExpiresAtUnixMs {
+		return &handlers.Error{Class: "auth_expired", Message: "consent grant has expired"}
+	}
+	switch delivered.Kind {
+	case "oauth2":
+		if delivered.AccessToken == "" {
+			return &handlers.Error{Class: "goauthy_unavailable", Message: "goauthy oauth2 response missing access_token"}
+		}
+		if delivered.TokenExpiresAtUnixMs > 0 && nowMs >= delivered.TokenExpiresAtUnixMs {
+			return &handlers.Error{Class: "auth_expired", Message: "oauth2 access token has expired"}
+		}
+		if expectedAuth != "" && expectedAuth != providers.Oauth2 {
+			return &handlers.Error{Class: "auth_mismatch", Message: "credential kind oauth2 does not match connector auth_type"}
+		}
+	case "api_key":
+		if delivered.APIKey == "" {
+			return &handlers.Error{Class: "goauthy_unavailable", Message: "goauthy api_key response missing api_key"}
+		}
+		if expectedAuth != "" && expectedAuth != providers.ApiKey {
+			return &handlers.Error{Class: "auth_mismatch", Message: "credential kind api_key does not match connector auth_type"}
+		}
+	default:
+		return &handlers.Error{Class: "auth_mismatch", Message: fmt.Sprintf("unsupported credential kind %q", delivered.Kind)}
+	}
+	if expectedProvider != "" && delivered.ProviderID != "" && !strings.EqualFold(delivered.ProviderID, expectedProvider) {
+		return &handlers.Error{Class: "auth_mismatch", Message: "credential_ref provider mismatch"}
+	}
+	return nil
 }
 
 func dispatchConnector(ctx context.Context, conn amp.Connector, operation string, input invokeInput) (handlers.Result, error) {

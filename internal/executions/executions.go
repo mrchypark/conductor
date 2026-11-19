@@ -4,6 +4,8 @@ package executions
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +71,8 @@ type ExecutionRequest struct {
 	ConnectionID       string          `json:"connection_id"`
 	CredentialRevision int64           `json:"credential_revision"`
 	CredentialRef      string          `json:"credential_ref,omitempty"`
+	SubjectToken       string          `json:"-"`
+	DelegationToken    string          `json:"-"`
 	ExpiresAt          time.Time       `json:"expires_at,omitempty"`
 	Priority           int             `json:"priority,omitempty"`
 	SubjectRef         json.RawMessage `json:"subject_ref,omitempty"`
@@ -174,14 +178,25 @@ type Execution struct {
 	UpdatedAt          time.Time       `json:"updated_at"`
 }
 
+// TokenExchanger exchanges a caller's human subject_token for a DPoP-bound delegation token.
+type TokenExchanger interface {
+	ExchangeToken(ctx context.Context, subjectToken string) ([]byte, time.Time, error)
+}
+
 type Service struct {
 	store     *storage.Store
 	registry  *handlers.Registry
-	hostProxy func(workspaceID, credentialRef string, expiresAt time.Time) handlers.HostConnectorFunc
+	exchanger TokenExchanger
+	hostProxy func(workspaceID, credentialRef, delegationToken string, expiresAt time.Time) handlers.HostConnectorFunc
+}
+
+// SetTokenExchanger configures the RFC 8693 delegation token exchanger.
+func (s *Service) SetTokenExchanger(ex TokenExchanger) {
+	s.exchanger = ex
 }
 
 // SetHostProxy configures the host-mediated connector callback factory for guest handlers.
-func (s *Service) SetHostProxy(fn func(workspaceID, credentialRef string, expiresAt time.Time) handlers.HostConnectorFunc) {
+func (s *Service) SetHostProxy(fn func(workspaceID, credentialRef, delegationToken string, expiresAt time.Time) handlers.HostConnectorFunc) {
 	s.hostProxy = fn
 }
 
@@ -300,12 +315,19 @@ func (s *Service) Submit(ctx context.Context, request ExecutionRequest) (Executi
 	if err := validate(request); err != nil {
 		return Execution{}, err
 	}
-	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
-		return Execution{}, errors.New("credential or execution expires_at has already passed")
-	}
 	id := "exec_" + request.ExecutionRequestID
-	if err := s.checkIdempotencyKey(ctx, request); err != nil {
+	if existing, found, err := s.precheckExisting(ctx, request, id); err != nil {
 		return Execution{}, err
+	} else if found {
+		return existing, nil
+	}
+	var err error
+	request, err = s.prepareDelegation(ctx, request)
+	if err != nil {
+		return Execution{}, err
+	}
+	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
+		return Execution{}, &handlers.Error{Class: "auth_expired", Message: "credential or execution expires_at has already passed"}
 	}
 	created, err := s.store.CreateExecution(ctx, toRecord(request), id)
 	if err != nil {
@@ -320,6 +342,75 @@ func (s *Service) Submit(ctx context.Context, request ExecutionRequest) (Executi
 		}
 	}
 	return s.Get(ctx, id)
+}
+
+func (s *Service) precheckExisting(ctx context.Context, request ExecutionRequest, execID string) (Execution, bool, error) {
+	if err := s.checkIdempotencyKey(ctx, request); err != nil {
+		return Execution{}, false, err
+	}
+	if _, err := s.store.GetExecutionRequest(ctx, request.ExecutionRequestID); err == nil {
+		if err := s.checkIdempotency(ctx, request); err != nil {
+			return Execution{}, false, err
+		}
+		existing, err := s.Get(ctx, execID)
+		if err != nil {
+			return Execution{}, false, err
+		}
+		return existing, true, nil
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return Execution{}, false, err
+	}
+	return Execution{}, false, nil
+}
+
+func (s *Service) prepareDelegation(ctx context.Context, request ExecutionRequest) (ExecutionRequest, error) {
+	if request.CredentialRef == "" {
+		return request, nil
+	}
+	if !request.DeadlineAt.IsZero() && !time.Now().UTC().Before(request.DeadlineAt) {
+		return request, &handlers.Error{Class: "validation_failed", Message: "execution deadline_at has already passed"}
+	}
+	if request.SubjectToken != "" && containsRawToken(request.SubjectToken, request.Input, request.SubjectRef, request.InputRef) {
+		return request, &handlers.Error{Class: "validation_failed", Message: "raw authorization token must not appear in request payload"}
+	}
+	if s.exchanger == nil {
+		return request, nil
+	}
+	if strings.TrimSpace(request.SubjectToken) == "" {
+		return request, &handlers.Error{Class: "unauthorized", Message: "Authorization Bearer token is required when credential_ref is set"}
+	}
+	delToken, delExp, err := s.exchanger.ExchangeToken(ctx, request.SubjectToken)
+	request.SubjectToken = ""
+	if err != nil {
+		return request, err
+	}
+	if !delExp.IsZero() && (request.ExpiresAt.IsZero() || delExp.Before(request.ExpiresAt)) {
+		request.ExpiresAt = delExp
+	}
+	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
+		return request, &handlers.Error{Class: "auth_expired", Message: "delegation token has already expired"}
+	}
+	request.DelegationToken = string(delToken)
+	return request, nil
+}
+
+func containsRawToken(token string, blobs ...[]byte) bool {
+	if token == "" {
+		return false
+	}
+	sum := sha256.Sum256([]byte(token))
+	digest := hex.EncodeToString(sum[:])
+	bearer := "Bearer " + token
+	for _, b := range blobs {
+		if len(b) == 0 {
+			continue
+		}
+		s := string(b)
+		if strings.Contains(s, token) || strings.Contains(s, bearer) || strings.Contains(s, digest) {
+			return true
+		}
+	}
+	return false
 }
 
 // RunWorker drains queued executions and recovers expired leases. It is a
@@ -409,7 +500,7 @@ func (s *Service) startLeaseHeartbeat(ctx context.Context, lease storage.LeaseRe
 }
 
 func fromRecord(r storage.ExecutionRequestRecord) ExecutionRequest {
-	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, CredentialRef: r.CredentialRef, ExpiresAt: r.ExpiresAt, Priority: r.Priority, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
+	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, CredentialRef: r.CredentialRef, DelegationToken: string(r.DelegationToken), ExpiresAt: r.ExpiresAt, Priority: r.Priority, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
 }
 
 func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, lease storage.LeaseRecord, leaseTTL time.Duration) error {
@@ -453,7 +544,7 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 		defer expCancel()
 	}
 	if s.hostProxy != nil {
-		callCtx = handlers.WithHostConnector(callCtx, s.hostProxy(request.WorkspaceID, request.CredentialRef, request.ExpiresAt))
+		callCtx = handlers.WithHostConnector(callCtx, s.hostProxy(request.WorkspaceID, request.CredentialRef, request.DelegationToken, request.ExpiresAt))
 	}
 	maxAttempts := request.Retry.MaxAttempts
 	if maxAttempts < 1 {
@@ -505,14 +596,24 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	if err := validate(request); err != nil {
 		return Execution{}, err
 	}
-	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
-		return Execution{}, errors.New("credential or execution expires_at has already passed")
-	}
 	executionID := "exec_" + request.ExecutionRequestID
-	if err := s.checkIdempotencyKey(ctx, request); err != nil {
+	if _, found, err := s.precheckExisting(ctx, request, executionID); err != nil {
+		return Execution{}, err
+	} else if found {
+		return s.waitForTerminal(ctx, executionID)
+	}
+	var err error
+	request, err = s.prepareDelegation(ctx, request)
+	if err != nil {
 		return Execution{}, err
 	}
-	created, err := s.store.CreateExecution(ctx, toRecord(request), executionID)
+	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
+		return Execution{}, &handlers.Error{Class: "auth_expired", Message: "credential or execution expires_at has already passed"}
+	}
+	// Sync executions keep the delegation token in memory only and never persist it to Rhiza.
+	rec := toRecord(request)
+	rec.DelegationToken = nil
+	created, err := s.store.CreateExecution(ctx, rec, executionID)
 	if err != nil {
 		if conflictErr := s.checkIdempotencyKey(ctx, request); conflictErr != nil {
 			return Execution{}, conflictErr
@@ -597,7 +698,7 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	}
 	defer cancel()
 	if s.hostProxy != nil {
-		executionContext = handlers.WithHostConnector(executionContext, s.hostProxy(request.WorkspaceID, request.CredentialRef, request.ExpiresAt))
+		executionContext = handlers.WithHostConnector(executionContext, s.hostProxy(request.WorkspaceID, request.CredentialRef, request.DelegationToken, request.ExpiresAt))
 	}
 	maxAttempts := request.Retry.MaxAttempts
 	if maxAttempts < 1 {
@@ -868,7 +969,7 @@ func toRecord(request ExecutionRequest) storage.ExecutionRequestRecord {
 	return storage.ExecutionRequestRecord{ID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID,
 		WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowID: request.WorkflowInstanceID,
 		TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion,
-		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, CredentialRef: request.CredentialRef, ExpiresAt: request.ExpiresAt, Priority: request.Priority, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
+		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, CredentialRef: request.CredentialRef, DelegationToken: []byte(request.DelegationToken), ExpiresAt: request.ExpiresAt, Priority: request.Priority, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
 		SubjectRef: append([]byte(nil), request.SubjectRef...), InputRef: append([]byte(nil), request.InputRef...), DeadlineAt: request.DeadlineAt,
 		Input: append([]byte(nil), request.Input...), Timeout: request.Timeout, MaxAttempts: request.Retry.MaxAttempts, RetryBackoff: request.Retry.Backoff, RetryBackoffMode: request.Retry.BackoffMode,
 		CorrelationID: request.CorrelationID, CausationID: request.CausationID, IdempotencyKey: request.IdempotencyKey}
