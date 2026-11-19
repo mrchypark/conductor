@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/amp-labs/connectors/providers"
 	"github.com/mrchypark/conductor/internal/callbacks"
-	"github.com/mrchypark/conductor/internal/connections"
 	ampconnectors "github.com/mrchypark/conductor/internal/connectors"
 	"github.com/mrchypark/conductor/internal/executions"
 	"github.com/mrchypark/conductor/internal/handlers"
@@ -25,44 +25,36 @@ import (
 	"github.com/mrchypark/conductor/internal/storage"
 )
 
-func loadDynamicHandlers(ctx context.Context, store *storage.Store, registry *handlers.Registry) error {
+func loadStarlarkHandlers(ctx context.Context, store *storage.Store, registry *handlers.Registry) error {
 	if store == nil {
 		return nil
 	}
-	records, err := store.ListDynamicHandlers(ctx)
+	records, err := store.ListStarlarkHandlers(ctx)
 	if err != nil {
 		return err
 	}
 	for _, record := range records {
 		sourceHash := fmt.Sprintf("%x", sha256.Sum256(record.Source))
 		if sourceHash != record.SourceHash {
-			return fmt.Errorf("dynamic handler %s@%s source hash mismatch", record.HandlerKey, record.Version)
+			return fmt.Errorf("starlark handler %s/%s@%s source hash mismatch", record.WorkspaceID, record.HandlerKey, record.Version)
 		}
 		var manifest handlers.Manifest
 		if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
-			return fmt.Errorf("dynamic handler %s@%s manifest: %w", record.HandlerKey, record.Version, err)
+			return fmt.Errorf("starlark handler %s/%s@%s manifest: %w", record.WorkspaceID, record.HandlerKey, record.Version, err)
 		}
 		if manifest.Key != record.HandlerKey || manifest.Version != record.Version {
-			return fmt.Errorf("dynamic handler %s@%s manifest identity mismatch", record.HandlerKey, record.Version)
+			return fmt.Errorf("starlark handler %s/%s@%s manifest identity mismatch", record.WorkspaceID, record.HandlerKey, record.Version)
 		}
-		handler, err := handlers.NewKavunHandler(handlers.KavunSpec{
-			Manifest: manifest, Source: record.Source, AllowedModules: record.AllowedModules,
-			MaxFrames: record.MaxFrames, MaxStack: record.MaxStack, Bytecode: record.Bytecode,
-			BytecodeHash: record.BytecodeHash, SourceHash: record.SourceHash, BytecodeSourceHash: record.BytecodeSourceHash, RuntimeABI: record.RuntimeABI,
+		handler, err := handlers.NewStarlarkHandler(handlers.StarlarkSpec{
+			Manifest:   manifest,
+			Source:     record.Source,
+			MaxSteps:   record.MaxSteps,
+			SourceHash: record.SourceHash,
 		})
 		if err != nil {
-			return fmt.Errorf("dynamic handler %s@%s: %w", record.HandlerKey, record.Version, err)
+			return fmt.Errorf("starlark handler %s/%s@%s: %w", record.WorkspaceID, record.HandlerKey, record.Version, err)
 		}
-		bytecode, bytecodeHash, runtimeABI, err := handler.Bytecode()
-		if err != nil {
-			return fmt.Errorf("dynamic handler %s@%s bytecode: %w", record.HandlerKey, record.Version, err)
-		}
-		if handler.BytecodeNeedsRefresh() || record.BytecodeHash != bytecodeHash || record.RuntimeABI != runtimeABI {
-			if err := store.SaveDynamicHandlerBytecode(ctx, record.HandlerKey, record.Version, bytecode, bytecodeHash, record.SourceHash, runtimeABI); err != nil {
-				return fmt.Errorf("dynamic handler %s@%s bytecode cache: %w", record.HandlerKey, record.Version, err)
-			}
-		}
-		if err := registry.Register(handler); err != nil {
+		if err := registry.RegisterScoped(record.WorkspaceID, handler); err != nil {
 			return err
 		}
 	}
@@ -78,15 +70,15 @@ func loadWASMHandlers(ctx context.Context, store *storage.Store, registry *handl
 		return err
 	}
 	for _, record := range records {
-		if record.RuntimeABI != handlers.WASMRuntimeABI {
-			return fmt.Errorf("wasm handler %s@%s uses unsupported ABI %q", record.HandlerKey, record.Version, record.RuntimeABI)
+		if record.RuntimeABI != handlers.WASMRuntimeABI && record.RuntimeABI != handlers.WASMRuntimeABIV2 {
+			return fmt.Errorf("wasm handler %s/%s@%s uses unsupported ABI %q", record.WorkspaceID, record.HandlerKey, record.Version, record.RuntimeABI)
 		}
 		var manifest handlers.Manifest
 		if err := json.Unmarshal(record.ManifestJSON, &manifest); err != nil {
-			return fmt.Errorf("wasm handler %s@%s manifest: %w", record.HandlerKey, record.Version, err)
+			return fmt.Errorf("wasm handler %s/%s@%s manifest: %w", record.WorkspaceID, record.HandlerKey, record.Version, err)
 		}
 		if manifest.Key != record.HandlerKey || manifest.Version != record.Version {
-			return fmt.Errorf("wasm handler %s@%s manifest identity mismatch", record.HandlerKey, record.Version)
+			return fmt.Errorf("wasm handler %s/%s@%s manifest identity mismatch", record.WorkspaceID, record.HandlerKey, record.Version)
 		}
 		record := record
 		loader := func(loadCtx context.Context) ([]byte, error) {
@@ -99,12 +91,32 @@ func loadWASMHandlers(ctx context.Context, store *storage.Store, registry *handl
 			}
 			return artifact.Bytes, nil
 		}
-		handler, err := runtime.NewLazyHandler(handlers.WASMSpec{Manifest: manifest, Load: loader})
+		handler, err := runtime.NewLazyHandler(handlers.WASMSpec{Manifest: manifest, ABI: record.RuntimeABI, Load: loader})
 		if err != nil {
-			return fmt.Errorf("wasm handler %s@%s: %w", record.HandlerKey, record.Version, err)
+			return fmt.Errorf("wasm handler %s/%s@%s: %w", record.WorkspaceID, record.HandlerKey, record.Version, err)
 		}
-		if err := registry.Register(handler); err != nil {
+		if err := registry.RegisterScoped(record.WorkspaceID, handler); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func loadCustomConnectors(ctx context.Context, store *storage.Store, catalog *ampconnectors.Catalog, allowInsecure bool) error {
+	if store == nil || catalog == nil {
+		return nil
+	}
+	records, err := store.ListAllCustomConnectors(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		var info providers.ProviderInfo
+		if err := json.Unmarshal(record.ProviderInfoJSON, &info); err != nil {
+			return fmt.Errorf("custom connector %s/%s: %w", record.WorkspaceID, record.ProviderKey, err)
+		}
+		if err := catalog.RegisterCustom(record.WorkspaceID, record.ProviderKey, info, allowInsecure); err != nil {
+			return fmt.Errorf("custom connector %s/%s: %w", record.WorkspaceID, record.ProviderKey, err)
 		}
 	}
 	return nil
@@ -125,16 +137,27 @@ func main() {
 		log.Fatal(err)
 	}
 	defer store.Close()
+
 	registry := handlers.NewRegistry()
 	wasmRuntime := handlers.NewWASMRuntime(ctx)
 	defer wasmRuntime.Close(ctx)
-	wasmFetch := newOCIWASMFetcher(
-		os.Getenv("CONDUCTOR_WASM_REGISTRIES"),
-		os.Getenv("CONDUCTOR_WASM_REGISTRY_USERNAME"),
-		os.Getenv("CONDUCTOR_WASM_REGISTRY_PASSWORD"),
-		os.Getenv("CONDUCTOR_WASM_REGISTRY_TOKEN"),
-		strings.EqualFold(os.Getenv("CONDUCTOR_WASM_REGISTRY_PLAIN_HTTP"), "true"),
-	)
+
+	wasmRegistry := strings.TrimSpace(os.Getenv("CONDUCTOR_WASM_REGISTRY"))
+	allowedRegistries := strings.TrimSpace(os.Getenv("CONDUCTOR_WASM_REGISTRIES"))
+	if wasmRegistry != "" {
+		if allowedRegistries == "" {
+			allowedRegistries = wasmRegistry
+		} else {
+			allowedRegistries = allowedRegistries + "," + wasmRegistry
+		}
+	}
+	regUser := os.Getenv("CONDUCTOR_WASM_REGISTRY_USERNAME")
+	regPass := os.Getenv("CONDUCTOR_WASM_REGISTRY_PASSWORD")
+	regToken := os.Getenv("CONDUCTOR_WASM_REGISTRY_TOKEN")
+	regPlain := strings.EqualFold(os.Getenv("CONDUCTOR_WASM_REGISTRY_PLAIN_HTTP"), "true")
+	wasmFetch := newOCIWASMFetcher(allowedRegistries, regUser, regPass, regToken, regPlain)
+	wasmPush := newOCIWASMPusher(wasmRegistry, regUser, regPass, regToken, regPlain)
+
 	echo, err := handlers.NewFuncHandler(handlers.Manifest{Key: "payload.echo", Version: "1", DefaultTimeout: 30, Idempotency: "pure", ResourceClass: "small"}, func(_ context.Context, request handlers.Request) (handlers.Result, error) {
 		return handlers.Result{Output: append([]byte(nil), request.Input...)}, nil
 	})
@@ -144,17 +167,53 @@ func main() {
 	if err := registry.Register(echo); err != nil {
 		log.Fatal(err)
 	}
-	if err := loadDynamicHandlers(ctx, store, registry); err != nil {
+	if err := loadStarlarkHandlers(ctx, store, registry); err != nil {
 		log.Fatal(err)
 	}
 	if err := loadWASMHandlers(ctx, store, registry, wasmRuntime, wasmFetch); err != nil {
 		log.Fatal(err)
 	}
+
+	catalog, err := ampconnectors.LoadCatalog()
+	if err != nil {
+		log.Fatal(fmt.Errorf("load connector catalog: %w", err))
+	}
+	if base := os.Getenv("BUSINESS_SERVICE_BASE_URL"); base != "" {
+		catalog.SetBusinessClient(&ampconnectors.BusinessClient{BaseURL: base, Token: os.Getenv("BUSINESS_SERVICE_TOKEN")})
+	}
+	allowInsecureCustom := strings.EqualFold(os.Getenv("CONDUCTOR_ALLOW_INSECURE_CUSTOM_CONNECTORS"), "true")
+	if err := loadCustomConnectors(ctx, store, catalog, allowInsecureCustom); err != nil {
+		log.Fatal(err)
+	}
+
+	connectorHandler, err := catalog.NewInvokeHandlerScoped("2", nil, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := registry.Register(connectorHandler); err != nil {
+		log.Fatal(err)
+	}
+
 	service, err := executions.NewService(store, registry)
 	if err != nil {
 		log.Fatal(err)
 	}
 	service.SetCallbackTarget(os.Getenv("CONDUCTOR_CALLBACK_URL"))
+
+	var goauthyClient *ampconnectors.GoauthyClient
+	if goauthyURL := strings.TrimSpace(os.Getenv("CONDUCTOR_GOAUTHY_BASE_URL")); goauthyURL != "" {
+		goauthyClient = &ampconnectors.GoauthyClient{
+			BaseURL:     goauthyURL,
+			BearerToken: os.Getenv("CONDUCTOR_GOAUTHY_TOKEN"),
+		}
+	}
+	ssrfClient := ampconnectors.NewSSRFSafeHTTPClient(nil, allowInsecureCustom)
+	service.SetHostProxy(func(workspaceID, credentialRef string, expiresAt time.Time) handlers.HostConnectorFunc {
+		return func(callCtx context.Context, callInput json.RawMessage) (json.RawMessage, error) {
+			return catalog.ExecuteProxyCall(callCtx, workspaceID, credentialRef, expiresAt, goauthyClient, ssrfClient, callInput)
+		}
+	})
+
 	callbackDelivery := &callbacks.Delivery{Store: store, Token: os.Getenv("CONDUCTOR_CALLBACK_TOKEN")}
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	defer stopWorker()
@@ -172,33 +231,9 @@ func main() {
 			}
 		}
 	}()
-	catalog, err := ampconnectors.LoadCatalog()
-	if err != nil {
-		log.Fatal(fmt.Errorf("load connector catalog: %w", err))
-	}
-	if base := os.Getenv("BUSINESS_SERVICE_BASE_URL"); base != "" {
-		catalog.SetBusinessClient(&ampconnectors.BusinessClient{BaseURL: base, Token: os.Getenv("BUSINESS_SERVICE_TOKEN")})
-	}
-	var connectionStore *connections.Store
-	if key := os.Getenv("CONDUCTOR_MASTER_KEY"); key != "" {
-		connectionStore, err = connections.NewStore(ctx, store.Persistence(), []byte(key))
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-	resolver := connectorCredentialsResolver(connectionStore, catalog)
-	connectorHandler, err := catalog.NewInvokeHandlerScoped("2", nil, resolver)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := registry.Register(connectorHandler); err != nil {
-		log.Fatal(err)
-	}
-	if err := loadCredentialProviderHandler(os.Getenv("CONDUCTOR_CREDENTIAL_PROVIDER_CONFIG"), os.Getenv("CONDUCTOR_SERVICE_TOKEN"), registry, nil, nil); err != nil {
-		log.Fatal(err)
-	}
+
 	for _, manifest := range registry.Manifests() {
-		if err := store.SaveHandlerManifest(ctx, manifest.Key, manifest.Version, manifest); err != nil {
+		if err := store.SaveHandlerManifest(ctx, "", manifest.Key, manifest.Version, manifest); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -209,14 +244,14 @@ func main() {
 			}
 		}
 	}
-	// Register configured handlers before claiming durable work after a restart.
+
 	startExecutionProcessing(workerCtx, service, store, os.Getenv("CONDUCTOR_WORKER_ID"), 250*time.Millisecond)
 	log.Printf("conductor listening on %s with %d connector providers", *addr, len(catalog.Names()))
 	srv := newServer(service, registry, catalog)
 	srv.store = store
-	srv.oauthStore = connectionStore
 	srv.wasmRuntime = wasmRuntime
 	srv.wasmFetch = wasmFetch
+	srv.wasmPush = wasmPush
 	httpServer := &http.Server{
 		Addr:              *addr,
 		Handler:           srv,
@@ -265,8 +300,8 @@ func startExecutionProcessing(ctx context.Context, service *executions.Service, 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			if err := store.RecoverExpiredInlineLeases(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("execution recovery: %v", err)
+			if err := store.RecoverExpiredExecutions(ctx, time.Now().UTC()); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("execution expiry sweep: %v", err)
 			}
 			select {
 			case <-ctx.Done():

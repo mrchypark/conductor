@@ -26,7 +26,7 @@ start
 ready() {
     attempt=0
     while [ "$attempt" -lt 60 ]; do
-        if response=$(curl -fsS --connect-timeout 1 --max-time 2 "$url/v1/handlers" 2>/dev/null) &&
+        if response=$(curl -fsS --connect-timeout 1 --max-time 2 "$url/v1/workspaces/ws-smoke/handlers" 2>/dev/null) &&
             printf '%s\n' "$response" |
             jq -e 'any(.[]; .handler_key == "payload.echo" and .version == "1")' >/dev/null; then
             return
@@ -41,14 +41,14 @@ ready() {
 ready
 response=$(curl -fsS --connect-timeout 2 --max-time 30 -H 'Content-Type: application/json' \
     -d '{"execution_request_id":"er-smoke","handler":"payload.echo","handler_version":"1","operation":"echo","input":{"smoke":true}}' \
-    "$url/v1/executions")
+    "$url/v1/workspaces/ws-smoke/executions")
 printf '%s\n' "$response" |
     jq -e '.id == "exec_er-smoke" and .status == "succeeded" and .output.smoke == true' >/dev/null
 docker stop -t 5 "$name" >/dev/null
 docker rm "$name" >/dev/null
 start
 ready
-response=$(curl -fsS --connect-timeout 2 --max-time 10 "$url/v1/executions/exec_er-smoke")
+response=$(curl -fsS --connect-timeout 2 --max-time 10 "$url/v1/workspaces/ws-smoke/executions/exec_er-smoke")
 printf '%s\n' "$response" |
     jq -e '.status == "succeeded" and .output.smoke == true' >/dev/null
 echo 'Container smoke passed (echo execution and persistence after replacement)'

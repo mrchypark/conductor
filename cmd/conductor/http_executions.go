@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	ampconnectors "github.com/mrchypark/conductor/internal/connectors"
 	"github.com/mrchypark/conductor/internal/executions"
 	"github.com/mrchypark/conductor/internal/storage"
 )
@@ -51,7 +50,7 @@ type eventResult struct {
 	Status             string `json:"status"`
 }
 
-func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request) {
+func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request, workspaceID string) {
 	var batch eventBatch
 	if err := decodeBody(w, r, &batch); err != nil || len(batch.Events) == 0 {
 		writeError(w, http.StatusBadRequest, "events must contain at least one event")
@@ -68,8 +67,8 @@ func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("event %q: %v", event.Name, err))
 			return
 		}
-		if request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3") {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("credential invocation version %s requires synchronous execution", request.HandlerVersion))
+		if workspaceID != "" && request.WorkspaceID != workspaceID {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("event %q: workspace_id mismatch", event.Name))
 			return
 		}
 		requests[i].event = event
@@ -210,13 +209,12 @@ func unmarshalEventContext(values map[string]json.RawMessage, target *eventExecu
 	return nil
 }
 
-func (s *server) executionEvents(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/executions/"), "/events")
+func (s *server) executionEvents(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "execution not found")
 		return
 	}
-	if _, err := s.executions.Get(r.Context(), id); err != nil {
+	if _, err := s.executions.GetForWorkspace(r.Context(), workspaceID, id); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "execution not found")
 		} else {
@@ -224,7 +222,7 @@ func (s *server) executionEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	events, err := s.executions.Events(r.Context(), id)
+	events, err := s.executions.EventsForWorkspace(r.Context(), workspaceID, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load execution events")
 		return
@@ -232,13 +230,12 @@ func (s *server) executionEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, events)
 }
 
-func (s *server) cancelExecution(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/executions/"), "/cancel")
+func (s *server) cancelExecution(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "execution not found")
 		return
 	}
-	execution, err := s.executions.Cancel(r.Context(), id)
+	execution, err := s.executions.CancelForWorkspace(r.Context(), workspaceID, id)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "execution not found")
@@ -250,7 +247,7 @@ func (s *server) cancelExecution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, execution)
 }
 
-func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
+func (s *server) submitExecution(w http.ResponseWriter, r *http.Request, workspaceID string) {
 	defer r.Body.Close()
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	var raw json.RawMessage
@@ -264,61 +261,14 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "request must contain one JSON value")
 		return
 	}
+	if request.WorkspaceID == "" {
+		request.WorkspaceID = workspaceID
+	} else if request.WorkspaceID != workspaceID {
+		writeError(w, http.StatusBadRequest, "workspace_id does not match request path")
+		return
+	}
 	var execution executions.Execution
 	var err error
-	if s.serviceToken != "" && (request.WorkspaceID == "" || request.Actor.Type == "" || request.Actor.ID == "" || request.IdempotencyKey == "") {
-		writeError(w, http.StatusBadRequest, "workspace_id, actor, and idempotency_key are required")
-		return
-	}
-	humanHeaders := r.Header.Values("X-Conductor-Human-Authorization")
-	isHumanExecution := request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3")
-	if isHumanExecution {
-		if s.serviceToken == "" || len(r.Header.Values("Authorization")) != 1 {
-			writeError(w, http.StatusUnauthorized, "service authentication is required")
-			return
-		}
-		if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("credential invocation version %s requires synchronous execution", request.HandlerVersion))
-			return
-		}
-		var fields map[string]json.RawMessage
-		if json.Unmarshal(raw, &fields) != nil {
-			writeError(w, http.StatusBadRequest, "invalid execution request")
-			return
-		}
-		for key := range fields {
-			if strings.EqualFold(key, "retry") || strings.EqualFold(key, "retry_policy") {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("credential invocation version %s does not accept a retry policy", request.HandlerVersion))
-				return
-			}
-		}
-		if len(humanHeaders) != 1 || !strings.HasPrefix(humanHeaders[0], "Bearer ") {
-			writeError(w, http.StatusBadRequest, "one human Bearer authorization is required")
-			return
-		}
-		token := strings.TrimPrefix(humanHeaders[0], "Bearer ")
-		if len(token) == 0 || len(token) > 8192 || strings.IndexFunc(token, func(r rune) bool { return r < 33 || r > 126 || r == ',' }) >= 0 {
-			writeError(w, http.StatusBadRequest, "invalid human Bearer authorization")
-			return
-		}
-		type executionRequestData executions.ExecutionRequest
-		encoded, err := json.Marshal(executionRequestData(request))
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid execution request")
-			return
-		}
-		var value any
-		requestDecoder := json.NewDecoder(strings.NewReader(string(encoded)))
-		requestDecoder.UseNumber()
-		if requestDecoder.Decode(&value) != nil || containsHumanToken(value, token) {
-			writeError(w, http.StatusBadRequest, "execution request must not contain human authorization")
-			return
-		}
-		r = r.WithContext(ampconnectors.WithHumanToken(r.Context(), token))
-	} else if len(humanHeaders) != 0 {
-		writeError(w, http.StatusBadRequest, "human authorization is only accepted for credential invocation versions 2 and 3")
-		return
-	}
 	if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
 		execution, err = s.executions.Submit(r.Context(), request)
 		if err == nil {
@@ -337,35 +287,12 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, execution)
 }
 
-func containsHumanToken(value any, token string) bool {
-	switch v := value.(type) {
-	case string:
-		return strings.Contains(v, token)
-	case json.Number:
-		return strings.Contains(string(v), token)
-	case map[string]any:
-		for key, item := range v {
-			if strings.Contains(key, token) || containsHumanToken(item, token) {
-				return true
-			}
-		}
-	case []any:
-		for _, item := range v {
-			if containsHumanToken(item, token) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (s *server) getExecution(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/v1/executions/")
+func (s *server) getExecution(w http.ResponseWriter, r *http.Request, workspaceID, id string) {
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "execution not found")
 		return
 	}
-	execution, err := s.executions.Get(r.Context(), id)
+	execution, err := s.executions.GetForWorkspace(r.Context(), workspaceID, id)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "execution not found")

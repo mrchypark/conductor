@@ -68,6 +68,9 @@ type ExecutionRequest struct {
 	OperationKey       string          `json:"operation_key"`
 	ConnectionID       string          `json:"connection_id"`
 	CredentialRevision int64           `json:"credential_revision"`
+	CredentialRef      string          `json:"credential_ref,omitempty"`
+	ExpiresAt          time.Time       `json:"expires_at,omitempty"`
+	Priority           int             `json:"priority,omitempty"`
 	SubjectRef         json.RawMessage `json:"subject_ref,omitempty"`
 	InputRef           json.RawMessage `json:"input_ref,omitempty"`
 	DeadlineAt         time.Time       `json:"deadline_at,omitempty"`
@@ -140,6 +143,9 @@ func (r ExecutionRequest) MarshalJSON() ([]byte, error) {
 	if r.DeadlineAt.IsZero() {
 		delete(wire, "deadline_at")
 	}
+	if r.ExpiresAt.IsZero() {
+		delete(wire, "expires_at")
+	}
 	wire["handler"] = r.HandlerKey
 	if r.OperationKey != "" {
 		wire["operation"] = r.OperationKey
@@ -169,8 +175,14 @@ type Execution struct {
 }
 
 type Service struct {
-	store    *storage.Store
-	registry *handlers.Registry
+	store     *storage.Store
+	registry  *handlers.Registry
+	hostProxy func(workspaceID, credentialRef string, expiresAt time.Time) handlers.HostConnectorFunc
+}
+
+// SetHostProxy configures the host-mediated connector callback factory for guest handlers.
+func (s *Service) SetHostProxy(fn func(workspaceID, credentialRef string, expiresAt time.Time) handlers.HostConnectorFunc) {
+	s.hostProxy = fn
 }
 
 // Claim is the worker-facing pull protocol payload. The worker executes the
@@ -284,12 +296,12 @@ func NewService(store *storage.Store, registry *handlers.Registry) (*Service, er
 func (s *Service) SetCallbackTarget(url string) { s.store.SetCallbackTarget(url) }
 
 func (s *Service) Submit(ctx context.Context, request ExecutionRequest) (Execution, error) {
-	if request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3") {
-		return Execution{}, fmt.Errorf("connector.credentials.invoke version %s requires synchronous execution", request.HandlerVersion)
-	}
-	request = normalizeRetryBudget(request)
+	request = s.normalizeRequest(request)
 	if err := validate(request); err != nil {
 		return Execution{}, err
+	}
+	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
+		return Execution{}, errors.New("credential or execution expires_at has already passed")
 	}
 	id := "exec_" + request.ExecutionRequestID
 	if err := s.checkIdempotencyKey(ctx, request); err != nil {
@@ -397,13 +409,13 @@ func (s *Service) startLeaseHeartbeat(ctx context.Context, lease storage.LeaseRe
 }
 
 func fromRecord(r storage.ExecutionRequestRecord) ExecutionRequest {
-	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
+	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, CredentialRef: r.CredentialRef, ExpiresAt: r.ExpiresAt, Priority: r.Priority, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
 }
 
 func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, lease storage.LeaseRecord, leaseTTL time.Duration) error {
 	stopHB := s.startLeaseHeartbeat(ctx, lease, leaseTTL)
 	defer stopHB()
-	handler, err := s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
+	handler, err := s.registry.ResolveScoped(request.WorkspaceID, request.HandlerKey, request.HandlerVersion)
 	if err != nil {
 		_, err = s.finishLease(ctx, lease, lease.ExecutionID, nil, &handlers.Error{Class: "handler_not_found", Message: err.Error()}, lease.AttemptNumber)
 		return err
@@ -431,12 +443,24 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 		callCtx = deadlineCtx
 		defer deadlineCancel()
 	}
+	if !request.ExpiresAt.IsZero() {
+		if !time.Now().Before(request.ExpiresAt) {
+			_, err = s.finishLease(ctx, lease, lease.ExecutionID, nil, &handlers.Error{Class: "auth_expired", Message: "credential handle has expired"}, lease.AttemptNumber)
+			return err
+		}
+		expCtx, expCancel := context.WithDeadline(callCtx, request.ExpiresAt)
+		callCtx = expCtx
+		defer expCancel()
+	}
+	if s.hostProxy != nil {
+		callCtx = handlers.WithHostConnector(callCtx, s.hostProxy(request.WorkspaceID, request.CredentialRef, request.ExpiresAt))
+	}
 	maxAttempts := request.Retry.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
 	for attempt := lease.AttemptNumber; attempt <= maxAttempts; attempt++ {
-		result, execErr := handler.Execute(callCtx, handlers.Request{ExecutionID: lease.ExecutionID, ExecutionRequestID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID, WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowInstanceID: request.WorkflowInstanceID, TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, SubjectRef: request.SubjectRef, InputRef: request.InputRef, DeadlineAt: request.DeadlineAt, AttemptNumber: attempt, LeaseID: lease.ID, FencingToken: lease.FencingToken, IdempotencyKey: request.IdempotencyKey, ActorType: request.Actor.Type, ActorID: request.Actor.ID, Input: request.Input})
+		result, execErr := handler.Execute(callCtx, handlers.Request{ExecutionID: lease.ExecutionID, ExecutionRequestID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID, WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowInstanceID: request.WorkflowInstanceID, TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, CredentialRef: request.CredentialRef, ExpiresAt: request.ExpiresAt, SubjectRef: request.SubjectRef, InputRef: request.InputRef, DeadlineAt: request.DeadlineAt, AttemptNumber: attempt, LeaseID: lease.ID, FencingToken: lease.FencingToken, IdempotencyKey: request.IdempotencyKey, ActorType: request.Actor.Type, ActorID: request.Actor.ID, Input: request.Input})
 		if execErr == nil {
 			if len(result.Output) > 0 && !json.Valid(result.Output) {
 				_, err = s.finishLease(ctx, lease, lease.ExecutionID, nil, &handlers.Error{Class: "invalid_output", Message: "handler output must be valid JSON"}, attempt)
@@ -477,19 +501,12 @@ func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, le
 // SubmitAndExecute stores a request once, leases it, executes its pinned handler
 // with the requested retry policy, and returns the existing execution for duplicates.
 func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest) (Execution, error) {
-	inlineOnly := request.HandlerKey == "connector.credentials.invoke" && (request.HandlerVersion == "2" || request.HandlerVersion == "3")
-	if inlineOnly && (len(request.SubjectRef) > 0 || len(request.InputRef) > 0) {
-		return Execution{}, fmt.Errorf("credential invocation version %s does not accept subject_ref or input_ref", request.HandlerVersion)
-	}
-	if inlineOnly && len(bytes.TrimSpace(request.Input)) > 0 {
-		var input map[string]json.RawMessage
-		if err := json.Unmarshal(request.Input, &input); err != nil || input == nil || len(input) != 0 {
-			return Execution{}, fmt.Errorf("credential invocation version %s input must be an empty object", request.HandlerVersion)
-		}
-	}
-	request = normalizeRetryBudget(request)
+	request = s.normalizeRequest(request)
 	if err := validate(request); err != nil {
 		return Execution{}, err
+	}
+	if !request.ExpiresAt.IsZero() && !time.Now().UTC().Before(request.ExpiresAt) {
+		return Execution{}, errors.New("credential or execution expires_at has already passed")
 	}
 	executionID := "exec_" + request.ExecutionRequestID
 	if err := s.checkIdempotencyKey(ctx, request); err != nil {
@@ -503,15 +520,12 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 		return Execution{}, err
 	}
 	if !created {
-		if inlineOnly {
-			return Execution{}, fmt.Errorf("idempotency_conflict: credential invocation version %s requires a new execution request", request.HandlerVersion)
-		}
 		if err := s.checkIdempotency(ctx, request); err != nil {
 			return Execution{}, err
 		}
 		return s.waitForTerminal(ctx, executionID)
 	}
-	handler, resolveErr := s.registry.Resolve(request.HandlerKey, request.HandlerVersion)
+	handler, resolveErr := s.registry.ResolveScoped(request.WorkspaceID, request.HandlerKey, request.HandlerVersion)
 	leaseTTL := request.Timeout
 	if leaseTTL <= 0 && resolveErr == nil && handler.Manifest().DefaultTimeout > 0 {
 		seconds := handler.Manifest().DefaultTimeout
@@ -530,24 +544,17 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 	} else {
 		leaseTTL += time.Minute
 	}
-	var lease storage.LeaseRecord
-	if inlineOnly {
-		lease, err = s.store.AcquireInlineLease(ctx, executionID, leaseTTL)
-	} else {
-		lease, err = s.store.AcquireLease(ctx, executionID, "inline:"+executionID, leaseTTL, 1)
-	}
+	lease, err := s.store.AcquireLease(ctx, executionID, "inline:"+executionID, leaseTTL, 1)
 	if err != nil {
 		return Execution{}, err
 	}
 	stopHB := s.startLeaseHeartbeat(ctx, lease, leaseTTL)
 	defer stopHB()
-	if !inlineOnly {
-		defer func() {
-			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = s.store.ReleaseLease(releaseCtx, lease.ID, lease.FencingToken)
-			cancelRelease()
-		}()
-	}
+	defer func() {
+		releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = s.store.ReleaseLease(releaseCtx, lease.ID, lease.FencingToken)
+		cancelRelease()
+	}()
 
 	if resolveErr != nil {
 		return s.finishLease(ctx, lease, executionID, nil, &handlers.Error{Class: "handler_not_found", Message: resolveErr.Error()}, 1)
@@ -575,7 +582,23 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 			previousCancel()
 		}
 	}
+	if !request.ExpiresAt.IsZero() {
+		if !time.Now().Before(request.ExpiresAt) {
+			cancel()
+			return s.finishLease(ctx, lease, executionID, nil, &handlers.Error{Class: "auth_expired", Message: "credential handle has expired"}, 1)
+		}
+		var expCancel context.CancelFunc
+		executionContext, expCancel = context.WithDeadline(executionContext, request.ExpiresAt)
+		previousCancel := cancel
+		cancel = func() {
+			expCancel()
+			previousCancel()
+		}
+	}
 	defer cancel()
+	if s.hostProxy != nil {
+		executionContext = handlers.WithHostConnector(executionContext, s.hostProxy(request.WorkspaceID, request.CredentialRef, request.ExpiresAt))
+	}
 	maxAttempts := request.Retry.MaxAttempts
 	if maxAttempts < 1 {
 		maxAttempts = 1
@@ -585,6 +608,7 @@ func (s *Service) SubmitAndExecute(ctx context.Context, request ExecutionRequest
 			ExecutionID: executionID, ExecutionRequestID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID,
 			WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowInstanceID: request.WorkflowInstanceID, TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey,
 			HandlerVersion: request.HandlerVersion, OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision,
+			CredentialRef: request.CredentialRef, ExpiresAt: request.ExpiresAt,
 			SubjectRef: append(json.RawMessage(nil), request.SubjectRef...), InputRef: append(json.RawMessage(nil), request.InputRef...),
 			DeadlineAt: request.DeadlineAt, AttemptNumber: attempt, LeaseID: lease.ID, FencingToken: lease.FencingToken,
 			IdempotencyKey: request.IdempotencyKey, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
@@ -656,7 +680,7 @@ func (s *Service) checkIdempotency(ctx context.Context, request ExecutionRequest
 	if err != nil {
 		return err
 	}
-	if record.HandlerKey != request.HandlerKey || record.HandlerVersion != request.HandlerVersion || record.OperationKey != request.OperationKey || record.WorkspaceID != request.WorkspaceID || record.WorkflowKey != request.WorkflowKey || record.WorkflowVersion != request.WorkflowVersion || record.WorkflowID != request.WorkflowInstanceID || record.TaskID != request.TaskID || record.NodeKey != request.NodeKey || record.ConnectionID != request.ConnectionID || record.CredentialRevision != request.CredentialRevision || record.ActorType != request.Actor.Type || record.ActorID != request.Actor.ID || !bytes.Equal(record.SubjectRef, request.SubjectRef) || !bytes.Equal(record.InputRef, request.InputRef) || !record.DeadlineAt.Equal(request.DeadlineAt) || record.Timeout != request.Timeout || record.MaxAttempts != request.Retry.MaxAttempts || record.RetryBackoff != request.Retry.Backoff || record.RetryBackoffMode != request.Retry.BackoffMode || record.CorrelationID != request.CorrelationID || record.CausationID != request.CausationID || record.IdempotencyKey != request.IdempotencyKey || !bytes.Equal(record.Input, request.Input) {
+	if record.HandlerKey != request.HandlerKey || record.HandlerVersion != request.HandlerVersion || record.OperationKey != request.OperationKey || record.WorkspaceID != request.WorkspaceID || record.WorkflowKey != request.WorkflowKey || record.WorkflowVersion != request.WorkflowVersion || record.WorkflowID != request.WorkflowInstanceID || record.TaskID != request.TaskID || record.NodeKey != request.NodeKey || record.ConnectionID != request.ConnectionID || record.CredentialRevision != request.CredentialRevision || record.CredentialRef != request.CredentialRef || record.Priority != request.Priority || record.ActorType != request.Actor.Type || record.ActorID != request.Actor.ID || !bytes.Equal(record.SubjectRef, request.SubjectRef) || !bytes.Equal(record.InputRef, request.InputRef) || !record.DeadlineAt.Equal(request.DeadlineAt) || record.Timeout != request.Timeout || record.MaxAttempts != request.Retry.MaxAttempts || record.RetryBackoff != request.Retry.Backoff || record.RetryBackoffMode != request.Retry.BackoffMode || record.CorrelationID != request.CorrelationID || record.CausationID != request.CausationID || record.IdempotencyKey != request.IdempotencyKey || !bytes.Equal(record.Input, request.Input) {
 		return errors.New("idempotency_conflict: execution request already exists with different content")
 	}
 	return nil
@@ -695,13 +719,25 @@ func (s *Service) Get(ctx context.Context, id string) (Execution, error) {
 	if err != nil {
 		return Execution{}, err
 	}
+	return executionFromRecord(record), nil
+}
+
+func (s *Service) GetForWorkspace(ctx context.Context, workspaceID, id string) (Execution, error) {
+	record, err := s.store.GetExecutionForWorkspace(ctx, workspaceID, id)
+	if err != nil {
+		return Execution{}, err
+	}
+	return executionFromRecord(record), nil
+}
+
+func executionFromRecord(record storage.ExecutionRecord) Execution {
 	execution := Execution{ID: record.ID, ExecutionRequestID: record.ExecutionRequestID, Status: record.Status,
 		HandlerKey: record.HandlerKey, HandlerVersion: record.HandlerVersion, OperationKey: record.OperationKey,
 		ConnectionID: record.ConnectionID, Input: record.Input, Output: record.Output, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 	if record.ErrorClass != "" {
 		execution.Error = &handlers.Error{Class: record.ErrorClass, Message: record.ErrorMessage, Retryable: record.ErrorRetryable}
 	}
-	return execution, nil
+	return execution
 }
 
 func (s *Service) Cancel(ctx context.Context, id string) (Execution, error) {
@@ -718,7 +754,28 @@ func (s *Service) Cancel(ctx context.Context, id string) (Execution, error) {
 	return s.Get(ctx, id)
 }
 
+func (s *Service) CancelForWorkspace(ctx context.Context, workspaceID, id string) (Execution, error) {
+	e, err := s.GetForWorkspace(ctx, workspaceID, id)
+	if err != nil {
+		return Execution{}, err
+	}
+	if e.Status == "succeeded" || e.Status == "failed" || e.Status == "timed_out" || e.Status == "cancelled" {
+		return e, nil
+	}
+	if err := s.store.CancelExecution(ctx, id); err != nil {
+		return Execution{}, err
+	}
+	return s.GetForWorkspace(ctx, workspaceID, id)
+}
+
 func (s *Service) Events(ctx context.Context, id string) ([]storage.ExecutionEventRecord, error) {
+	return s.store.ListExecutionEvents(ctx, id)
+}
+
+func (s *Service) EventsForWorkspace(ctx context.Context, workspaceID, id string) ([]storage.ExecutionEventRecord, error) {
+	if _, err := s.store.GetExecutionForWorkspace(ctx, workspaceID, id); err != nil {
+		return nil, err
+	}
 	return s.store.ListExecutionEvents(ctx, id)
 }
 
@@ -741,15 +798,24 @@ func validate(request ExecutionRequest) error {
 	return nil
 }
 
-// Connector mutations remain executable, but Conductor does not replay them
-// until a provider adapter can prove idempotency. Reads retain the caller's
-// retry budget. This uses the already-pinned operation instead of adding a
-// second effect or capability model.
-func normalizeRetryBudget(request ExecutionRequest) ExecutionRequest {
-	if request.HandlerKey != "connector.invoke" || connectorReadOperation(request.OperationKey) || request.Retry.MaxAttempts <= 1 {
+func (s *Service) normalizeRequest(request ExecutionRequest) ExecutionRequest {
+	if request.CredentialRef != "" && request.ExpiresAt.IsZero() {
+		request.ExpiresAt = time.Now().UTC().Add(5 * time.Minute)
+	}
+	if request.Retry.MaxAttempts <= 1 {
 		return request
 	}
-	request.Retry.MaxAttempts = 1
+	if request.HandlerKey == "connector.invoke" && !connectorReadOperation(request.OperationKey) {
+		request.Retry.MaxAttempts = 1
+		return request
+	}
+	if s.registry != nil {
+		if h, err := s.registry.ResolveScoped(request.WorkspaceID, request.HandlerKey, request.HandlerVersion); err == nil {
+			if h.Manifest().Idempotency == "side_effecting" {
+				request.Retry.MaxAttempts = 1
+			}
+		}
+	}
 	return request
 }
 
@@ -802,7 +868,7 @@ func toRecord(request ExecutionRequest) storage.ExecutionRequestRecord {
 	return storage.ExecutionRequestRecord{ID: request.ExecutionRequestID, WorkspaceID: request.WorkspaceID,
 		WorkflowKey: request.WorkflowKey, WorkflowVersion: request.WorkflowVersion, WorkflowID: request.WorkflowInstanceID,
 		TaskID: request.TaskID, NodeKey: request.NodeKey, HandlerKey: request.HandlerKey, HandlerVersion: request.HandlerVersion,
-		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
+		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, CredentialRef: request.CredentialRef, ExpiresAt: request.ExpiresAt, Priority: request.Priority, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
 		SubjectRef: append([]byte(nil), request.SubjectRef...), InputRef: append([]byte(nil), request.InputRef...), DeadlineAt: request.DeadlineAt,
 		Input: append([]byte(nil), request.Input...), Timeout: request.Timeout, MaxAttempts: request.Retry.MaxAttempts, RetryBackoff: request.Retry.Backoff, RetryBackoffMode: request.Retry.BackoffMode,
 		CorrelationID: request.CorrelationID, CausationID: request.CausationID, IdempotencyKey: request.IdempotencyKey}

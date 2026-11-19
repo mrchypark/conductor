@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	amp "github.com/amp-labs/connectors"
 	"github.com/amp-labs/connectors/common"
+	"github.com/amp-labs/connectors/providers"
 	"github.com/mrchypark/conductor/internal/handlers"
+	"golang.org/x/oauth2"
 )
 
 // CredentialsResolver keeps provider secrets outside execution requests.
@@ -127,11 +130,86 @@ func (c *Catalog) invokeScoped(ctx context.Context, request handlers.Request, cl
 	if input.Module == "" && creds.Metadata != nil {
 		input.Module = creds.Metadata["module"]
 	}
-	conn, err := c.NewWithModule(ctx, input.Provider, input.Module, client, request.WorkspaceID, creds.Metadata, creds)
+	conn, err := c.NewWithModuleForWorkspace(ctx, request.WorkspaceID, input.Provider, input.Module, client, request.WorkspaceID, creds.Metadata, creds)
 	if err != nil {
 		return handlers.Result{}, connectorError(err)
 	}
+	return dispatchConnector(ctx, conn, operation, input)
+}
 
+// ExecuteProxyCall runs one host-mediated connector call on behalf of a Starlark or WASM guest.
+func (c *Catalog) ExecuteProxyCall(ctx context.Context, workspaceID, credentialRef string, expiresAt time.Time, goauthyClient *GoauthyClient, httpClient *http.Client, rawInput json.RawMessage) (json.RawMessage, error) {
+	if c == nil {
+		return nil, &handlers.Error{Class: "connector_unavailable", Message: "connector catalog is unavailable"}
+	}
+	var input invokeInput
+	if len(rawInput) == 0 || !json.Valid(rawInput) {
+		return nil, &handlers.Error{Class: "invalid_input", Message: "connector call input must be valid JSON"}
+	}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return nil, &handlers.Error{Class: "invalid_input", Message: err.Error()}
+	}
+	if input.Provider == "" {
+		return nil, &handlers.Error{Class: "invalid_input", Message: "provider is required"}
+	}
+	if input.ObjectName == "" {
+		input.ObjectName = input.ObjectKey
+	}
+	operation := strings.ToLower(strings.TrimSpace(input.Operation))
+	if operation == "" {
+		if input.Path != "" {
+			operation = "raw"
+		} else {
+			return nil, &handlers.Error{Class: "invalid_input", Message: "operation or path is required"}
+		}
+	}
+	if parts := strings.Split(operation, "."); len(parts) > 1 {
+		operation = parts[len(parts)-1]
+	}
+	info, err := c.InfoForWorkspace(workspaceID, input.Provider)
+	if err != nil {
+		return nil, &handlers.Error{Class: "not_found", Message: fmt.Sprintf("unknown provider %q", input.Provider)}
+	}
+	var creds Credentials
+	if credentialRef != "" {
+		if goauthyClient == nil {
+			return nil, &handlers.Error{Class: "connection_error", Message: "goauthy client is not configured"}
+		}
+		delivered, err := goauthyClient.Exchange(ctx, credentialRef, input.Provider, expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		switch delivered.Kind {
+		case "oauth2":
+			var expiry time.Time
+			if delivered.ExpiresAtUnixMS > 0 {
+				expiry = time.UnixMilli(delivered.ExpiresAtUnixMS).UTC()
+			}
+			tok := &oauth2.Token{AccessToken: delivered.AccessToken, TokenType: delivered.TokenType, Expiry: expiry}
+			creds.TokenSource = NewGoauthyTokenSource(goauthyClient, credentialRef, input.Provider, expiresAt, tok)
+		case "api_key":
+			creds.APIKey = delivered.APIKey
+		default:
+			if info.AuthType == providers.ApiKey {
+				creds.APIKey = delivered.APIKey
+			}
+		}
+	}
+	if httpClient == nil {
+		httpClient = NewSSRFSafeHTTPClient(nil, false)
+	}
+	conn, err := c.NewWithModuleForWorkspace(ctx, workspaceID, input.Provider, input.Module, httpClient, workspaceID, creds.Metadata, creds)
+	if err != nil {
+		return nil, connectorError(err)
+	}
+	res, err := dispatchConnector(ctx, conn, operation, input)
+	if err != nil {
+		return nil, err
+	}
+	return res.Output, nil
+}
+
+func dispatchConnector(ctx context.Context, conn amp.Connector, operation string, input invokeInput) (handlers.Result, error) {
 	switch operation {
 	case "read", "list", "search":
 		reader, ok := conn.(amp.ReadConnector)

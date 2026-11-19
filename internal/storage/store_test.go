@@ -22,48 +22,43 @@ func TestOpenInitializesAuthoritativeSchema(t *testing.T) {
 	}
 }
 
-func TestDynamicHandlerDefinitionIsImmutableAndReloadable(t *testing.T) {
+func TestStarlarkHandlerDefinitionIsImmutableAndReloadable(t *testing.T) {
 	store, err := Open(context.Background(), "file:"+t.TempDir()+"/db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	source := []byte(`output = input`)
+	source := []byte("def run(input):\n    return input\n")
 	hash := sha256.Sum256(source)
-	record := DynamicHandlerRecord{HandlerKey: "transform.kavun", Version: "1", ManifestJSON: json.RawMessage(`{"handler_key":"transform.kavun","version":"1"}`), Source: source, AllowedModules: []string{"math"}, MaxFrames: 256, MaxStack: 2048, SourceHash: hex.EncodeToString(hash[:])}
-	created, err := store.SaveDynamicHandler(context.Background(), record)
+	record := StarlarkHandlerRecord{WorkspaceID: "ws-1", HandlerKey: "transform.starlark", Version: "1", ManifestJSON: json.RawMessage(`{"handler_key":"transform.starlark","version":"1"}`), Source: source, MaxSteps: 1000000, SourceHash: hex.EncodeToString(hash[:])}
+	created, err := store.SaveStarlarkHandler(context.Background(), record)
 	if err != nil || !created {
-		t.Fatalf("save dynamic handler: created=%v err=%v", created, err)
+		t.Fatalf("save starlark handler: created=%v err=%v", created, err)
 	}
-	created, err = store.SaveDynamicHandler(context.Background(), record)
+	created, err = store.SaveStarlarkHandler(context.Background(), record)
 	if err != nil || created {
 		t.Fatalf("identical save should be idempotent: created=%v err=%v", created, err)
 	}
-	bytecode := []byte("compiled")
-	bytecodeHash := sha256.Sum256(bytecode)
-	if err := store.SaveDynamicHandlerBytecode(context.Background(), record.HandlerKey, record.Version, bytecode, hex.EncodeToString(bytecodeHash[:]), record.SourceHash, "kavun-v0.6.4/compiler-o3/input-output"); err != nil {
-		t.Fatal(err)
-	}
-	record.Source = []byte(`output = 1`)
+	record.Source = []byte("def run(input):\n    return 1\n")
 	otherHash := sha256.Sum256(record.Source)
 	record.SourceHash = hex.EncodeToString(otherHash[:])
-	if _, err := store.SaveDynamicHandler(context.Background(), record); err == nil || !strings.Contains(err.Error(), "different definition") {
+	if _, err := store.SaveStarlarkHandler(context.Background(), record); err == nil || !strings.Contains(err.Error(), "different definition") {
 		t.Fatalf("expected immutable version conflict, got %v", err)
 	}
-	records, err := store.ListDynamicHandlers(context.Background())
-	if err != nil || len(records) != 1 || records[0].HandlerKey != "transform.kavun" || string(records[0].Source) != `output = input` || string(records[0].Bytecode) != "compiled" || records[0].BytecodeHash != hex.EncodeToString(bytecodeHash[:]) || records[0].BytecodeSourceHash != hex.EncodeToString(hash[:]) || len(records[0].AllowedModules) != 1 {
-		t.Fatalf("unexpected dynamic handler records: %#v err=%v", records, err)
+	records, err := store.ListStarlarkHandlers(context.Background())
+	if err != nil || len(records) != 1 || records[0].WorkspaceID != "ws-1" || records[0].HandlerKey != "transform.starlark" || string(records[0].Source) != string(source) {
+		t.Fatalf("unexpected starlark handler records: %#v err=%v", records, err)
 	}
 }
 
-func TestOpenReloadsDynamicHandlerFromRhiza(t *testing.T) {
+func TestOpenReloadsStarlarkHandlerFromRhiza(t *testing.T) {
 	dsn := "file:" + t.TempDir() + "/db"
 	store, err := Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := DynamicHandlerRecord{HandlerKey: "reload.kavun", Version: "1", ManifestJSON: []byte(`{"handler_key":"reload.kavun","version":"1"}`), Source: []byte("output = input"), SourceHash: "hash", MaxFrames: 1, MaxStack: 1}
-	if _, err := store.SaveDynamicHandler(context.Background(), record); err != nil {
+	record := StarlarkHandlerRecord{WorkspaceID: "ws-1", HandlerKey: "reload.starlark", Version: "1", ManifestJSON: []byte(`{"handler_key":"reload.starlark","version":"1"}`), Source: []byte("def run(input):\n    return input\n"), SourceHash: "hash", MaxSteps: 1000}
+	if _, err := store.SaveStarlarkHandler(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -74,9 +69,9 @@ func TestOpenReloadsDynamicHandlerFromRhiza(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	records, err := reopened.ListDynamicHandlers(context.Background())
-	if err != nil || len(records) != 1 || records[0].HandlerKey != record.HandlerKey {
-		t.Fatalf("dynamic handler was not restored: %#v %v", records, err)
+	records, err := reopened.ListStarlarkHandlers(context.Background())
+	if err != nil || len(records) != 1 || records[0].HandlerKey != record.HandlerKey || records[0].WorkspaceID != "ws-1" {
+		t.Fatalf("starlark handler was not restored: %#v %v", records, err)
 	}
 }
 
