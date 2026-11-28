@@ -76,8 +76,17 @@ func (s *server) ingestEvents(w http.ResponseWriter, r *http.Request, workspaceI
 		requests[i].request = request
 	}
 
+	headerCausation := strings.TrimSpace(r.Header.Get("X-Causation-Event-ID"))
+	headerAttempt := strings.TrimSpace(r.Header.Get("X-Attempt-ID"))
+
 	results := make([]eventResult, 0, len(requests))
 	for _, item := range requests {
+		if item.request.CausationID == "" && headerCausation != "" {
+			item.request.CausationID = headerCausation
+		}
+		if item.request.AttemptID == "" && headerAttempt != "" {
+			item.request.AttemptID = headerAttempt
+		}
 		execution, err := s.executions.Submit(r.Context(), item.request)
 		if err != nil {
 			writeError(w, http.StatusConflict, err.Error())
@@ -245,6 +254,7 @@ func (s *server) cancelExecution(w http.ResponseWriter, r *http.Request, workspa
 		}
 		return
 	}
+	writeCausationHeaders(w, execution)
 	writeJSON(w, http.StatusOK, execution)
 }
 
@@ -271,11 +281,18 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request, workspa
 	if auth := strings.TrimSpace(r.Header.Get("Authorization")); len(auth) > len("Bearer ") && strings.EqualFold(auth[:len("Bearer ")], "Bearer ") {
 		request.SubjectToken = strings.TrimSpace(auth[len("Bearer "):])
 	}
+	if request.CausationID == "" {
+		request.CausationID = strings.TrimSpace(r.Header.Get("X-Causation-Event-ID"))
+	}
+	if request.AttemptID == "" {
+		request.AttemptID = strings.TrimSpace(r.Header.Get("X-Attempt-ID"))
+	}
 	var execution executions.Execution
 	var err error
 	if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
 		execution, err = s.executions.Submit(r.Context(), request)
 		if err == nil {
+			writeCausationHeaders(w, execution)
 			writeJSON(w, http.StatusAccepted, execution)
 			return
 		}
@@ -287,7 +304,17 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request, workspa
 		writeExecutionError(w, err)
 		return
 	}
+	writeCausationHeaders(w, execution)
 	writeJSON(w, http.StatusOK, execution)
+}
+
+func writeCausationHeaders(w http.ResponseWriter, execution executions.Execution) {
+	if execution.CausationID != "" {
+		w.Header().Set("X-Causation-Event-ID", execution.CausationID)
+	}
+	if execution.AttemptID != "" {
+		w.Header().Set("X-Attempt-ID", execution.AttemptID)
+	}
 }
 
 func writeExecutionError(w http.ResponseWriter, err error) {
@@ -334,5 +361,6 @@ func (s *server) getExecution(w http.ResponseWriter, r *http.Request, workspaceI
 		writeError(w, http.StatusInternalServerError, "failed to load execution")
 		return
 	}
+	writeCausationHeaders(w, execution)
 	writeJSON(w, http.StatusOK, execution)
 }

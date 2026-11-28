@@ -28,10 +28,11 @@ type ExecutionRequestRecord struct {
 	Timeout                                                                             time.Duration
 	MaxAttempts                                                                         int
 	RetryBackoff                                                                        time.Duration
-	RetryBackoffMode, CorrelationID, CausationID, IdempotencyKey                        string
+	RetryBackoffMode, CorrelationID, CausationID, AttemptID, IdempotencyKey             string
 }
 type ExecutionRecord struct {
 	ID, ExecutionRequestID, Status, HandlerKey, HandlerVersion, OperationKey, ConnectionID string
+	CorrelationID, CausationID, AttemptID                                                  string
 	Input, Output                                                                          []byte
 	ErrorClass, ErrorMessage                                                               string
 	ErrorRetryable                                                                         bool
@@ -54,12 +55,25 @@ func (s *Store) CreateExecution(ctx context.Context, r ExecutionRequestRecord, e
 	}
 	t := now()
 	status := "queued"
+	reqPayload := []byte("{}")
+	if r.CausationID != "" || r.AttemptID != "" {
+		meta := map[string]string{}
+		if r.CausationID != "" {
+			meta["causation_id"] = r.CausationID
+		}
+		if r.AttemptID != "" {
+			meta["attempt_id"] = r.AttemptID
+		}
+		if b, err := json.Marshal(meta); err == nil {
+			reqPayload = b
+		}
+	}
 	ss := []persistence.Statement{
 		stm(`INSERT OR IGNORE INTO submission_claims(request_id,claim_id,created_at) VALUES(?,?,?)`, r.ID, claim, t),
-		stm(`INSERT INTO execution_requests(id,workspace_id,workflow_key,workflow_version,workflow_instance_id,task_id,node_key,handler_key,handler_version,operation_key,connection_id,actor_type,actor_id,subject_ref,input_ref,deadline_at,input,timeout_ns,max_attempts,retry_backoff_ns,retry_backoff_mode,correlation_id,causation_id,idempotency_key,created_at,credential_ref,priority,expires_at,delegation_token) SELECT ?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.WorkspaceID, r.WorkflowKey, int64(r.WorkflowVersion), r.WorkflowID, r.TaskID, r.NodeKey, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, r.ActorType, r.ActorID, encodeBlob(r.SubjectRef), encodeBlob(r.InputRef), ft(r.DeadlineAt), encodeBlob(r.Input), r.Timeout.Nanoseconds(), r.MaxAttempts, r.RetryBackoff.Nanoseconds(), r.RetryBackoffMode, r.CorrelationID, r.CausationID, r.IdempotencyKey, t, r.CredentialRef, r.Priority, ft(r.ExpiresAt), encodeBlob(r.DelegationToken), r.ID, claim),
+		stm(`INSERT INTO execution_requests(id,workspace_id,workflow_key,workflow_version,workflow_instance_id,task_id,node_key,handler_key,handler_version,operation_key,connection_id,actor_type,actor_id,subject_ref,input_ref,deadline_at,input,timeout_ns,max_attempts,retry_backoff_ns,retry_backoff_mode,correlation_id,causation_id,idempotency_key,created_at,credential_ref,priority,expires_at,delegation_token,attempt_id) SELECT ?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,? ,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.WorkspaceID, r.WorkflowKey, int64(r.WorkflowVersion), r.WorkflowID, r.TaskID, r.NodeKey, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, r.ActorType, r.ActorID, encodeBlob(r.SubjectRef), encodeBlob(r.InputRef), ft(r.DeadlineAt), encodeBlob(r.Input), r.Timeout.Nanoseconds(), r.MaxAttempts, r.RetryBackoff.Nanoseconds(), r.RetryBackoffMode, r.CorrelationID, r.CausationID, r.IdempotencyKey, t, r.CredentialRef, r.Priority, ft(r.ExpiresAt), encodeBlob(r.DelegationToken), r.AttemptID, r.ID, claim),
 		stm(`INSERT INTO execution_request_credentials(execution_request_id,connection_id,credential_revision) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, r.ID, r.ConnectionID, r.CredentialRevision, r.ID, claim),
 		stm(`INSERT INTO executions(id,execution_request_id,status,handler_key,handler_version,operation_key,connection_id,input,output,error_class,error_message,error_retryable,created_at,updated_at,workspace_id,priority,expires_at) SELECT ?,?,?,?,?,?,?,?,'','','',0,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, executionID, r.ID, status, r.HandlerKey, r.HandlerVersion, r.OperationKey, r.ConnectionID, encodeBlob(r.Input), t, t, r.WorkspaceID, r.Priority, ft(r.ExpiresAt), r.ID, claim),
-		stm(`INSERT INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT ?,?,'execution.requested',0,'{}',? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, `event_`+executionID+`:requested`, executionID, t, r.ID, claim)}
+		stm(`INSERT INTO execution_events(id,execution_id,event_type,attempt_number,payload,occurred_at) SELECT ?,?,'execution.requested',0,?,? WHERE EXISTS(SELECT 1 FROM submission_claims WHERE request_id=? AND claim_id=?)`, `event_`+executionID+`:requested`, executionID, encodeBlob(reqPayload), t, r.ID, claim)}
 	if _, e = s.db.Mutate(ctx, "create execution "+r.ID+" "+claim, ss...); e != nil {
 		return false, e
 	}
@@ -73,7 +87,7 @@ func (s *Store) CreateExecution(ctx context.Context, r ExecutionRequestRecord, e
 	return str(rows[0][0]) == claim, nil
 }
 func (s *Store) GetExecutionRequest(ctx context.Context, id string) (ExecutionRequestRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT r.id,r.workspace_id,r.workflow_key,r.workflow_version,r.workflow_instance_id,r.task_id,r.node_key,r.handler_key,r.handler_version,r.operation_key,r.connection_id,r.actor_type,r.actor_id,r.subject_ref,r.input_ref,r.deadline_at,r.input,r.timeout_ns,r.max_attempts,r.retry_backoff_ns,r.retry_backoff_mode,r.correlation_id,r.causation_id,r.idempotency_key,COALESCE(c.credential_revision,0),r.credential_ref,r.priority,r.expires_at,r.delegation_token FROM execution_requests r LEFT JOIN execution_request_credentials c ON c.execution_request_id=r.id WHERE r.id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT r.id,r.workspace_id,r.workflow_key,r.workflow_version,r.workflow_instance_id,r.task_id,r.node_key,r.handler_key,r.handler_version,r.operation_key,r.connection_id,r.actor_type,r.actor_id,r.subject_ref,r.input_ref,r.deadline_at,r.input,r.timeout_ns,r.max_attempts,r.retry_backoff_ns,r.retry_backoff_mode,r.correlation_id,r.causation_id,r.idempotency_key,COALESCE(c.credential_revision,0),r.credential_ref,r.priority,r.expires_at,r.delegation_token,r.attempt_id FROM execution_requests r LEFT JOIN execution_request_credentials c ON c.execution_request_id=r.id WHERE r.id=?`, id)
 	if e != nil {
 		return ExecutionRequestRecord{}, e
 	}
@@ -81,7 +95,7 @@ func (s *Store) GetExecutionRequest(ctx context.Context, id string) (ExecutionRe
 		return ExecutionRequestRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	x := rows[0]
-	r := ExecutionRequestRecord{ID: str(x[0]), WorkspaceID: str(x[1]), WorkflowKey: str(x[2]), WorkflowVersion: uint64(i64(x[3])), WorkflowID: str(x[4]), TaskID: str(x[5]), NodeKey: str(x[6]), HandlerKey: str(x[7]), HandlerVersion: str(x[8]), OperationKey: str(x[9]), ConnectionID: str(x[10]), ActorType: str(x[11]), ActorID: str(x[12]), SubjectRef: blob(x[13]), InputRef: blob(x[14]), DeadlineAt: pt(str(x[15])), Input: blob(x[16]), Timeout: time.Duration(i64(x[17])), MaxAttempts: num(x[18]), RetryBackoff: time.Duration(i64(x[19])), RetryBackoffMode: str(x[20]), CorrelationID: str(x[21]), CausationID: str(x[22]), IdempotencyKey: str(x[23]), CredentialRevision: i64(x[24]), CredentialRef: str(x[25]), Priority: num(x[26]), ExpiresAt: pt(str(x[27])), DelegationToken: blob(x[28])}
+	r := ExecutionRequestRecord{ID: str(x[0]), WorkspaceID: str(x[1]), WorkflowKey: str(x[2]), WorkflowVersion: uint64(i64(x[3])), WorkflowID: str(x[4]), TaskID: str(x[5]), NodeKey: str(x[6]), HandlerKey: str(x[7]), HandlerVersion: str(x[8]), OperationKey: str(x[9]), ConnectionID: str(x[10]), ActorType: str(x[11]), ActorID: str(x[12]), SubjectRef: blob(x[13]), InputRef: blob(x[14]), DeadlineAt: pt(str(x[15])), Input: blob(x[16]), Timeout: time.Duration(i64(x[17])), MaxAttempts: num(x[18]), RetryBackoff: time.Duration(i64(x[19])), RetryBackoffMode: str(x[20]), CorrelationID: str(x[21]), CausationID: str(x[22]), IdempotencyKey: str(x[23]), CredentialRevision: i64(x[24]), CredentialRef: str(x[25]), Priority: num(x[26]), ExpiresAt: pt(str(x[27])), DelegationToken: blob(x[28]), AttemptID: str(x[29])}
 	return r, nil
 }
 func (s *Store) FindExecutionRequestByIdempotency(ctx context.Context, ws, key string) (ExecutionRequestRecord, error) {
@@ -95,7 +109,7 @@ func (s *Store) FindExecutionRequestByIdempotency(ctx context.Context, ws, key s
 	return s.GetExecutionRequest(ctx, str(rows[0][0]))
 }
 func (s *Store) GetExecution(ctx context.Context, id string) (ExecutionRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT id,execution_request_id,status,handler_key,handler_version,operation_key,connection_id,input,output,error_class,error_message,error_retryable,created_at,updated_at FROM executions WHERE id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,e.status,e.handler_key,e.handler_version,e.operation_key,e.connection_id,e.input,e.output,e.error_class,e.error_message,e.error_retryable,e.created_at,e.updated_at,r.correlation_id,r.causation_id,r.attempt_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
 	if e != nil {
 		return ExecutionRecord{}, e
 	}
@@ -103,7 +117,7 @@ func (s *Store) GetExecution(ctx context.Context, id string) (ExecutionRecord, e
 		return ExecutionRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	x := rows[0]
-	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13]))}, nil
+	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13])), CorrelationID: str(x[14]), CausationID: str(x[15]), AttemptID: str(x[16])}, nil
 }
 
 func (s *Store) CompleteExecution(ctx context.Context, id, status string, out []byte, class, msg string) error {
@@ -122,7 +136,7 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 	if a < 1 {
 		return errors.New("attempt number must be positive")
 	}
-	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.handler_key,r.handler_version FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.attempt_id,r.handler_key,r.handler_version FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
 	if e != nil {
 		return e
 	}
@@ -130,7 +144,7 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 		return ErrNotFound
 	}
 	x := rows[0]
-	request, ws, task, wf, corr, cause, handlerKey, handlerVersion := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7])
+	request, ws, task, wf, corr, cause, attemptID, handlerKey, handlerVersion := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7]), str(x[8])
 	t := ft(n)
 	cb := map[string]any{"callback_id": "cb_" + id, "execution_request_id": request, "execution_id": id, "workspace_id": ws, "provider_key": handlerKey, "provider_run_ref": id, "handler_version": handlerVersion, "runtime_status": status, "attempt_count": a, "result": json.RawMessage(out), "error_class": nil, "error_detail": nil, "occurred_at": t}
 	if task != "" {
@@ -144,6 +158,9 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 	}
 	if cause != "" {
 		cb["causation_id"] = cause
+	}
+	if attemptID != "" {
+		cb["attempt_id"] = attemptID
 	}
 	if class != "" {
 		cb["error_class"] = class
@@ -201,7 +218,7 @@ func (s *Store) complete(ctx context.Context, id, status string, out []byte, cla
 // CancelExecution atomically transitions a non-terminal execution to cancelled,
 // releases any active worker lease, and cancels scheduled retry timers.
 func (s *Store) CancelExecution(ctx context.Context, id string) error {
-	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.handler_key,r.handler_version,COALESCE((SELECT MAX(attempt_number) FROM attempts WHERE execution_id=e.id),0)+1 FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.attempt_id,r.handler_key,r.handler_version,COALESCE((SELECT MAX(attempt_number) FROM attempts WHERE execution_id=e.id),0)+1 FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
 	if e != nil {
 		return e
 	}
@@ -209,7 +226,7 @@ func (s *Store) CancelExecution(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	x := rows[0]
-	request, ws, task, wf, corr, cause, handlerKey, handlerVersion, attempt := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7]), num(x[8])
+	request, ws, task, wf, corr, cause, attemptID, handlerKey, handlerVersion, attempt := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7]), str(x[8]), num(x[9])
 	if attempt < 1 {
 		attempt = 1
 	}
@@ -226,6 +243,9 @@ func (s *Store) CancelExecution(ctx context.Context, id string) error {
 	}
 	if cause != "" {
 		cb["causation_id"] = cause
+	}
+	if attemptID != "" {
+		cb["attempt_id"] = attemptID
 	}
 	payload, e := json.Marshal(cb)
 	if e != nil {
@@ -266,7 +286,7 @@ func (s *Store) ListExecutionEvents(ctx context.Context, id string) ([]Execution
 
 // GetExecutionForWorkspace loads an execution only when it belongs to workspaceID.
 func (s *Store) GetExecutionForWorkspace(ctx context.Context, workspaceID, id string) (ExecutionRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,e.status,e.handler_key,e.handler_version,e.operation_key,e.connection_id,e.input,e.output,e.error_class,e.error_message,e.error_retryable,e.created_at,e.updated_at FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=? AND r.workspace_id=?`, id, workspaceID)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,e.status,e.handler_key,e.handler_version,e.operation_key,e.connection_id,e.input,e.output,e.error_class,e.error_message,e.error_retryable,e.created_at,e.updated_at,r.correlation_id,r.causation_id,r.attempt_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=? AND r.workspace_id=?`, id, workspaceID)
 	if e != nil {
 		return ExecutionRecord{}, e
 	}
@@ -274,20 +294,20 @@ func (s *Store) GetExecutionForWorkspace(ctx context.Context, workspaceID, id st
 		return ExecutionRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	x := rows[0]
-	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13]))}, nil
+	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13])), CorrelationID: str(x[14]), CausationID: str(x[15]), AttemptID: str(x[16])}, nil
 }
 
 // ExpireQueuedExecutions transitions queued or retry_wait executions whose
 // expires_at has passed to timed_out and enqueues their terminal callbacks.
 func (s *Store) ExpireQueuedExecutions(ctx context.Context, n time.Time) error {
 	nowStr := ft(n)
-	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.handler_key,r.handler_version,COALESCE((SELECT MAX(attempt_number) FROM attempts WHERE execution_id=e.id),0)+1 FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status IN('queued','retry_wait') AND e.expires_at<>'' AND e.expires_at<=?`, nowStr)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,r.workspace_id,r.task_id,r.workflow_instance_id,r.correlation_id,r.causation_id,r.attempt_id,r.handler_key,r.handler_version,COALESCE((SELECT MAX(attempt_number) FROM attempts WHERE execution_id=e.id),0)+1 FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.status IN('queued','retry_wait') AND e.expires_at<>'' AND e.expires_at<=?`, nowStr)
 	if e != nil {
 		return e
 	}
 	var firstErr error
 	for _, x := range rows {
-		id, request, ws, task, wf, corr, cause, handlerKey, handlerVersion, attempt := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7]), str(x[8]), num(x[9])
+		id, request, ws, task, wf, corr, cause, attemptID, handlerKey, handlerVersion, attempt := str(x[0]), str(x[1]), str(x[2]), str(x[3]), str(x[4]), str(x[5]), str(x[6]), str(x[7]), str(x[8]), str(x[9]), num(x[10])
 		if attempt < 1 {
 			attempt = 1
 		}
@@ -303,6 +323,9 @@ func (s *Store) ExpireQueuedExecutions(ctx context.Context, n time.Time) error {
 		}
 		if cause != "" {
 			cb["causation_id"] = cause
+		}
+		if attemptID != "" {
+			cb["attempt_id"] = attemptID
 		}
 		payload, err := json.Marshal(cb)
 		if err != nil {

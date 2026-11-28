@@ -89,7 +89,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	ddl := []string{
 		`CREATE TABLE IF NOT EXISTS schema_metadata(id INTEGER PRIMARY KEY CHECK(id=1),identity TEXT NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,workflow_key TEXT NOT NULL,workflow_version INTEGER NOT NULL,workflow_instance_id TEXT NOT NULL,task_id TEXT NOT NULL,node_key TEXT NOT NULL,handler_key TEXT NOT NULL,handler_version TEXT NOT NULL,operation_key TEXT NOT NULL,connection_id TEXT NOT NULL,actor_type TEXT NOT NULL,actor_id TEXT NOT NULL,subject_ref BLOB NOT NULL,input_ref BLOB NOT NULL,deadline_at TEXT NOT NULL,input BLOB NOT NULL,timeout_ns INTEGER NOT NULL,max_attempts INTEGER NOT NULL,retry_backoff_ns INTEGER NOT NULL,retry_backoff_mode TEXT NOT NULL,correlation_id TEXT NOT NULL,causation_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,created_at TEXT NOT NULL,credential_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,expires_at TEXT NOT NULL DEFAULT '',delegation_token BLOB NOT NULL DEFAULT x'')`,
+		`CREATE TABLE IF NOT EXISTS execution_requests(id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,workflow_key TEXT NOT NULL,workflow_version INTEGER NOT NULL,workflow_instance_id TEXT NOT NULL,task_id TEXT NOT NULL,node_key TEXT NOT NULL,handler_key TEXT NOT NULL,handler_version TEXT NOT NULL,operation_key TEXT NOT NULL,connection_id TEXT NOT NULL,actor_type TEXT NOT NULL,actor_id TEXT NOT NULL,subject_ref BLOB NOT NULL,input_ref BLOB NOT NULL,deadline_at TEXT NOT NULL,input BLOB NOT NULL,timeout_ns INTEGER NOT NULL,max_attempts INTEGER NOT NULL,retry_backoff_ns INTEGER NOT NULL,retry_backoff_mode TEXT NOT NULL,correlation_id TEXT NOT NULL,causation_id TEXT NOT NULL,idempotency_key TEXT NOT NULL,created_at TEXT NOT NULL,credential_ref TEXT NOT NULL DEFAULT '',priority INTEGER NOT NULL DEFAULT 0,expires_at TEXT NOT NULL DEFAULT '',delegation_token BLOB NOT NULL DEFAULT x'',attempt_id TEXT NOT NULL DEFAULT '')`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_requests_idempotency ON execution_requests(workspace_id,idempotency_key) WHERE idempotency_key<>''`,
 		`CREATE TABLE IF NOT EXISTS execution_request_credentials(execution_request_id TEXT PRIMARY KEY REFERENCES execution_requests(id),connection_id TEXT NOT NULL,credential_revision INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS submission_claims(request_id TEXT PRIMARY KEY,claim_id TEXT NOT NULL,created_at TEXT NOT NULL)`,
@@ -172,6 +172,7 @@ func (s *Store) ensureRedesignSchema(ctx context.Context) error {
 		{"execution_requests", "priority", "INTEGER NOT NULL DEFAULT 0"},
 		{"execution_requests", "expires_at", "TEXT NOT NULL DEFAULT ''"},
 		{"execution_requests", "delegation_token", "BLOB NOT NULL DEFAULT x''"},
+		{"execution_requests", "attempt_id", "TEXT NOT NULL DEFAULT ''"},
 		{"executions", "workspace_id", "TEXT NOT NULL DEFAULT ''"},
 		{"executions", "priority", "INTEGER NOT NULL DEFAULT 0"},
 		{"executions", "expires_at", "TEXT NOT NULL DEFAULT ''"},

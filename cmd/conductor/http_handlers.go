@@ -63,23 +63,110 @@ func (s *server) getHandlerDefinition(w http.ResponseWriter, r *http.Request, wo
 }
 
 type handlerRegisterRequest struct {
-	Kind     string            `json:"kind,omitempty"`
-	Manifest handlers.Manifest `json:"manifest"`
-	Source   string            `json:"source"`
-	MaxSteps int               `json:"max_steps,omitempty"`
-	Artifact string            `json:"artifact,omitempty"`
-	ABI      string            `json:"abi,omitempty"`
+	Kind       string            `json:"kind,omitempty"`
+	FunctionID string            `json:"function_id,omitempty"`
+	Manifest   handlers.Manifest `json:"manifest"`
+	Source     string            `json:"source"`
+	MaxSteps   int               `json:"max_steps,omitempty"`
+	Artifact   string            `json:"artifact,omitempty"`
+	ABI        string            `json:"abi,omitempty"`
 }
 
 func (s *server) registerHandler(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	s.registerHandlerWithKey(w, r, workspaceID, "")
+}
+
+func (s *server) registerFunctionVersion(w http.ResponseWriter, r *http.Request, workspaceID, functionID string) {
+	if functionID == "" || strings.Contains(functionID, "/") {
+		writeError(w, http.StatusNotFound, "function not found")
+		return
+	}
+	s.registerHandlerWithKey(w, r, workspaceID, functionID)
+}
+
+func (s *server) listFunctionVersions(w http.ResponseWriter, _ *http.Request, workspaceID, functionID string) {
+	if functionID == "" || strings.Contains(functionID, "/") {
+		writeError(w, http.StatusNotFound, "function not found")
+		return
+	}
+	versions := s.registry.ManifestsForFunction(workspaceID, functionID)
+	if len(versions) == 0 {
+		writeError(w, http.StatusNotFound, "function not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, versions)
+}
+
+func (s *server) deleteFunctionVersion(w http.ResponseWriter, r *http.Request, workspaceID, functionID, version string) {
+	if functionID == "" || version == "" || strings.Contains(functionID, "/") || strings.Contains(version, "/") {
+		writeError(w, http.StatusNotFound, "function version not found")
+		return
+	}
+	if !s.registry.HasScoped(workspaceID, functionID, version) {
+		writeError(w, http.StatusNotFound, "function version not found")
+		return
+	}
+	if s.store != nil {
+		if rec, err := s.store.GetStarlarkHandler(r.Context(), workspaceID, functionID, version); err == nil {
+			if delErr := s.store.DeleteStarlarkHandler(r.Context(), workspaceID, functionID, version, rec.SourceHash); delErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to delete starlark function version")
+				return
+			}
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, "failed to check starlark function version")
+			return
+		}
+		if rec, err := s.store.GetWASMHandler(r.Context(), workspaceID, functionID, version); err == nil {
+			if delErr := s.store.DeleteWASMHandler(r.Context(), workspaceID, functionID, version, rec.ManifestDigest); delErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to delete wasm function version")
+				return
+			}
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, "failed to check wasm function version")
+			return
+		}
+	}
+	s.registry.UnregisterScoped(workspaceID, functionID, version)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) getFunctionVersion(w http.ResponseWriter, _ *http.Request, workspaceID, functionID, version string) {
+	if functionID == "" || version == "" || strings.Contains(functionID, "/") || strings.Contains(version, "/") {
+		writeError(w, http.StatusNotFound, "function version not found")
+		return
+	}
+	handler, err := s.registry.ResolveScoped(workspaceID, functionID, version)
+	if err != nil {
+		if errors.Is(err, handlers.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "function version not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load function version")
+		return
+	}
+	writeJSON(w, http.StatusOK, handler.Manifest())
+}
+
+func (s *server) registerHandlerWithKey(w http.ResponseWriter, r *http.Request, workspaceID, expectedKey string) {
 	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
-		s.registerWASMUploadHandler(w, r, workspaceID)
+		s.registerWASMUploadHandlerWithKey(w, r, workspaceID, expectedKey)
 		return
 	}
 	var input handlerRegisterRequest
 	if err := decodeBody(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid handler registration request")
 		return
+	}
+	if input.Manifest.Key == "" && input.FunctionID != "" {
+		input.Manifest.Key = input.FunctionID
+	}
+	if expectedKey != "" {
+		if input.Manifest.Key == "" {
+			input.Manifest.Key = expectedKey
+		} else if input.Manifest.Key != expectedKey {
+			writeError(w, http.StatusBadRequest, "manifest handler_key does not match function id")
+			return
+		}
 	}
 	if input.Kind == "" {
 		input.Kind = "starlark"
@@ -137,6 +224,10 @@ func (s *server) registerStarlarkHandler(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *server) registerWASMUploadHandler(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	s.registerWASMUploadHandlerWithKey(w, r, workspaceID, "")
+}
+
+func (s *server) registerWASMUploadHandlerWithKey(w http.ResponseWriter, r *http.Request, workspaceID, expectedKey string) {
 	if s.wasmRuntime == nil || s.wasmPush == nil {
 		writeError(w, http.StatusServiceUnavailable, "wasm upload runtime or OCI registry is not configured")
 		return
@@ -155,6 +246,14 @@ func (s *server) registerWASMUploadHandler(w http.ResponseWriter, r *http.Reques
 	if err := json.Unmarshal([]byte(manifestRaw), &manifest); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid manifest JSON")
 		return
+	}
+	if expectedKey != "" {
+		if manifest.Key == "" {
+			manifest.Key = expectedKey
+		} else if manifest.Key != expectedKey {
+			writeError(w, http.StatusBadRequest, "manifest handler_key does not match function id")
+			return
+		}
 	}
 	abi := r.FormValue("abi")
 	if abi == "" {
