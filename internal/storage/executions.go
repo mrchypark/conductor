@@ -32,6 +32,7 @@ type ExecutionRequestRecord struct {
 }
 type ExecutionRecord struct {
 	ID, ExecutionRequestID, Status, HandlerKey, HandlerVersion, OperationKey, ConnectionID string
+	CorrelationID, CausationID, AttemptID                                                  string
 	Input, Output                                                                          []byte
 	ErrorClass, ErrorMessage                                                               string
 	ErrorRetryable                                                                         bool
@@ -108,7 +109,7 @@ func (s *Store) FindExecutionRequestByIdempotency(ctx context.Context, ws, key s
 	return s.GetExecutionRequest(ctx, str(rows[0][0]))
 }
 func (s *Store) GetExecution(ctx context.Context, id string) (ExecutionRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT id,execution_request_id,status,handler_key,handler_version,operation_key,connection_id,input,output,error_class,error_message,error_retryable,created_at,updated_at FROM executions WHERE id=?`, id)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,e.status,e.handler_key,e.handler_version,e.operation_key,e.connection_id,e.input,e.output,e.error_class,e.error_message,e.error_retryable,e.created_at,e.updated_at,r.correlation_id,r.causation_id,r.attempt_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=?`, id)
 	if e != nil {
 		return ExecutionRecord{}, e
 	}
@@ -116,7 +117,7 @@ func (s *Store) GetExecution(ctx context.Context, id string) (ExecutionRecord, e
 		return ExecutionRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	x := rows[0]
-	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13]))}, nil
+	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13])), CorrelationID: str(x[14]), CausationID: str(x[15]), AttemptID: str(x[16])}, nil
 }
 
 func (s *Store) CompleteExecution(ctx context.Context, id, status string, out []byte, class, msg string) error {
@@ -285,7 +286,7 @@ func (s *Store) ListExecutionEvents(ctx context.Context, id string) ([]Execution
 
 // GetExecutionForWorkspace loads an execution only when it belongs to workspaceID.
 func (s *Store) GetExecutionForWorkspace(ctx context.Context, workspaceID, id string) (ExecutionRecord, error) {
-	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,e.status,e.handler_key,e.handler_version,e.operation_key,e.connection_id,e.input,e.output,e.error_class,e.error_message,e.error_retryable,e.created_at,e.updated_at FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=? AND r.workspace_id=?`, id, workspaceID)
+	rows, e := s.db.Query(ctx, `SELECT e.id,e.execution_request_id,e.status,e.handler_key,e.handler_version,e.operation_key,e.connection_id,e.input,e.output,e.error_class,e.error_message,e.error_retryable,e.created_at,e.updated_at,r.correlation_id,r.causation_id,r.attempt_id FROM executions e JOIN execution_requests r ON r.id=e.execution_request_id WHERE e.id=? AND r.workspace_id=?`, id, workspaceID)
 	if e != nil {
 		return ExecutionRecord{}, e
 	}
@@ -293,7 +294,7 @@ func (s *Store) GetExecutionForWorkspace(ctx context.Context, workspaceID, id st
 		return ExecutionRecord{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	x := rows[0]
-	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13]))}, nil
+	return ExecutionRecord{ID: str(x[0]), ExecutionRequestID: str(x[1]), Status: str(x[2]), HandlerKey: str(x[3]), HandlerVersion: str(x[4]), OperationKey: str(x[5]), ConnectionID: str(x[6]), Input: blob(x[7]), Output: blob(x[8]), ErrorClass: str(x[9]), ErrorMessage: str(x[10]), ErrorRetryable: num(x[11]) != 0, CreatedAt: pt(str(x[12])), UpdatedAt: pt(str(x[13])), CorrelationID: str(x[14]), CausationID: str(x[15]), AttemptID: str(x[16])}, nil
 }
 
 // ExpireQueuedExecutions transitions queued or retry_wait executions whose

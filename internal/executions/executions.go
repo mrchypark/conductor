@@ -96,6 +96,7 @@ func (r *ExecutionRequest) UnmarshalJSON(data []byte) error {
 		*alias
 		Handler        string          `json:"handler"`
 		HandlerKey     string          `json:"handler_key"`
+		FunctionID     string          `json:"function_id"`
 		Operation      string          `json:"operation"`
 		OperationKey   string          `json:"operation_key"`
 		TimeoutSeconds *float64        `json:"timeout_seconds"`
@@ -110,6 +111,9 @@ func (r *ExecutionRequest) UnmarshalJSON(data []byte) error {
 	}
 	if r.HandlerKey == "" {
 		r.HandlerKey = wire.HandlerKey
+	}
+	if r.HandlerKey == "" {
+		r.HandlerKey = wire.FunctionID
 	}
 	if r.OperationKey == "" {
 		r.OperationKey = wire.Operation
@@ -172,6 +176,9 @@ type Execution struct {
 	HandlerVersion     string          `json:"handler_version"`
 	OperationKey       string          `json:"operation_key"`
 	ConnectionID       string          `json:"connection_id"`
+	CorrelationID      string          `json:"correlation_id,omitempty"`
+	CausationID        string          `json:"causation_id,omitempty"`
+	AttemptID          string          `json:"attempt_id,omitempty"`
 	Input              json.RawMessage `json:"input"`
 	Output             json.RawMessage `json:"output,omitempty"`
 	Error              *handlers.Error `json:"error,omitempty"`
@@ -835,7 +842,8 @@ func (s *Service) GetForWorkspace(ctx context.Context, workspaceID, id string) (
 func executionFromRecord(record storage.ExecutionRecord) Execution {
 	execution := Execution{ID: record.ID, ExecutionRequestID: record.ExecutionRequestID, Status: record.Status,
 		HandlerKey: record.HandlerKey, HandlerVersion: record.HandlerVersion, OperationKey: record.OperationKey,
-		ConnectionID: record.ConnectionID, Input: record.Input, Output: record.Output, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+		ConnectionID: record.ConnectionID, CorrelationID: record.CorrelationID, CausationID: record.CausationID, AttemptID: record.AttemptID,
+		Input: record.Input, Output: record.Output, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 	if record.ErrorClass != "" {
 		execution.Error = &handlers.Error{Class: record.ErrorClass, Message: record.ErrorMessage, Retryable: record.ErrorRetryable}
 	}

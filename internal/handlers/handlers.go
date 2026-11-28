@@ -237,6 +237,29 @@ func (r *Registry) ManifestsForWorkspace(workspaceID string) []Manifest {
 	return manifests
 }
 
+// ManifestsForFunction returns all versions of handlerKey visible to workspaceID.
+func (r *Registry) ManifestsForFunction(workspaceID, handlerKey string) []Manifest {
+	all := r.ManifestsForWorkspace(workspaceID)
+	out := make([]Manifest, 0)
+	for _, m := range all {
+		if m.Key == handlerKey {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// HasScoped reports whether workspaceID owns a specific handler version directly (excluding global built-ins).
+func (r *Registry) HasScoped(workspaceID, handlerKey, version string) bool {
+	if workspaceID == "" {
+		return false
+	}
+	r.mu.RLock()
+	_, ok := r.handlers[scopedKey(workspaceID, handlerKey, version)]
+	r.mu.RUnlock()
+	return ok
+}
+
 // ValidateJSON applies the small, deterministic JSON-Schema subset needed at
 // the handler boundary: type, required, properties, additionalProperties,
 // items, and enum. Complex business schemas remain owned by the business service.

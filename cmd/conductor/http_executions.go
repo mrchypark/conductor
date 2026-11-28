@@ -254,6 +254,7 @@ func (s *server) cancelExecution(w http.ResponseWriter, r *http.Request, workspa
 		}
 		return
 	}
+	writeCausationHeaders(w, execution)
 	writeJSON(w, http.StatusOK, execution)
 }
 
@@ -291,6 +292,7 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request, workspa
 	if strings.Contains(strings.ToLower(r.Header.Get("Prefer")), "respond-async") {
 		execution, err = s.executions.Submit(r.Context(), request)
 		if err == nil {
+			writeCausationHeaders(w, execution)
 			writeJSON(w, http.StatusAccepted, execution)
 			return
 		}
@@ -302,7 +304,17 @@ func (s *server) submitExecution(w http.ResponseWriter, r *http.Request, workspa
 		writeExecutionError(w, err)
 		return
 	}
+	writeCausationHeaders(w, execution)
 	writeJSON(w, http.StatusOK, execution)
+}
+
+func writeCausationHeaders(w http.ResponseWriter, execution executions.Execution) {
+	if execution.CausationID != "" {
+		w.Header().Set("X-Causation-Event-ID", execution.CausationID)
+	}
+	if execution.AttemptID != "" {
+		w.Header().Set("X-Attempt-ID", execution.AttemptID)
+	}
 }
 
 func writeExecutionError(w http.ResponseWriter, err error) {
@@ -349,5 +361,6 @@ func (s *server) getExecution(w http.ResponseWriter, r *http.Request, workspaceI
 		writeError(w, http.StatusInternalServerError, "failed to load execution")
 		return
 	}
+	writeCausationHeaders(w, execution)
 	writeJSON(w, http.StatusOK, execution)
 }

@@ -82,7 +82,19 @@ func TestWorkspaceFunctionsContractAndCausationPropagation(t *testing.T) {
 		t.Fatalf("POST /functions/{id}/versions status=%d body=%s", verRec.Code, verRec.Body.String())
 	}
 
-	// 4. GET /v1/workspaces/ws-alpha/functions/fn.greet/versions/2
+	// 4. GET /v1/workspaces/ws-alpha/functions/fn.greet (list all versions of function)
+	listVerReq := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-alpha/functions/fn.greet", nil)
+	listVerRec := httptest.NewRecorder()
+	srv.ServeHTTP(listVerRec, listVerReq)
+	if listVerRec.Code != http.StatusOK {
+		t.Fatalf("GET /functions/{id} status=%d body=%s", listVerRec.Code, listVerRec.Body.String())
+	}
+	var fnVersions []handlers.Manifest
+	if err := json.Unmarshal(listVerRec.Body.Bytes(), &fnVersions); err != nil || len(fnVersions) != 2 {
+		t.Fatalf("expected 2 versions for fn.greet, got %s err=%v", listVerRec.Body.String(), err)
+	}
+
+	// 4b. GET /v1/workspaces/ws-alpha/functions/fn.greet/versions/2
 	getVerReq := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-alpha/functions/fn.greet/versions/2", nil)
 	getVerRec := httptest.NewRecorder()
 	srv.ServeHTTP(getVerRec, getVerReq)
@@ -102,10 +114,10 @@ func TestWorkspaceFunctionsContractAndCausationPropagation(t *testing.T) {
 		t.Fatalf("expected 404 for cross-workspace function version, got %d", isoRec.Code)
 	}
 
-	// 5. POST /v1/workspaces/ws-alpha/executions with X-Attempt-ID & X-Causation-Event-ID
+	// 5. POST /v1/workspaces/ws-alpha/executions using function_id alias + X-Attempt-ID & X-Causation-Event-ID
 	execReq := httptest.NewRequest(http.MethodPost, "/v1/workspaces/ws-alpha/executions", bytes.NewBufferString(`{
 		"execution_request_id": "req-cause-1",
-		"handler_key": "fn.greet",
+		"function_id": "fn.greet",
 		"handler_version": "2",
 		"input": {"name": "operable"}
 	}`))
@@ -116,9 +128,20 @@ func TestWorkspaceFunctionsContractAndCausationPropagation(t *testing.T) {
 	if execRec.Code != http.StatusOK {
 		t.Fatalf("POST /executions status=%d body=%s", execRec.Code, execRec.Body.String())
 	}
+	if execRec.Header().Get("X-Causation-Event-ID") != "evt-cause-99" || execRec.Header().Get("X-Attempt-ID") != "att-42" {
+		t.Fatalf("expected causation headers on POST /executions response, got %+v", execRec.Header())
+	}
 	var execResp executions.Execution
-	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil || execResp.Status != "succeeded" {
+	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil || execResp.Status != "succeeded" || execResp.CausationID != "evt-cause-99" || execResp.AttemptID != "att-42" {
 		t.Fatalf("unexpected execution response: %+v err=%v", execResp, err)
+	}
+
+	// 5b. GET /v1/workspaces/ws-alpha/executions/{id} preserves causation headers & fields
+	getExecReq := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-alpha/executions/"+execResp.ID, nil)
+	getExecRec := httptest.NewRecorder()
+	srv.ServeHTTP(getExecRec, getExecReq)
+	if getExecRec.Code != http.StatusOK || getExecRec.Header().Get("X-Causation-Event-ID") != "evt-cause-99" || getExecRec.Header().Get("X-Attempt-ID") != "att-42" {
+		t.Fatalf("unexpected GET /executions/{id} status=%d headers=%+v", getExecRec.Code, getExecRec.Header())
 	}
 
 	// 6. GET /v1/workspaces/ws-alpha/executions/{id}/events includes causation metadata
@@ -142,5 +165,19 @@ func TestWorkspaceFunctionsContractAndCausationPropagation(t *testing.T) {
 	}
 	if webhookBody["causation_id"] != "evt-cause-99" || webhookBody["attempt_id"] != "att-42" {
 		t.Fatalf("unexpected webhook body causation fields: %+v", webhookBody)
+	}
+
+	// 8. DELETE /v1/workspaces/ws-alpha/functions/fn.greet/versions/2
+	delReq := httptest.NewRequest(http.MethodDelete, "/v1/workspaces/ws-alpha/functions/fn.greet/versions/2", nil)
+	delRec := httptest.NewRecorder()
+	srv.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /functions/{id}/versions/{ver} status=%d body=%s", delRec.Code, delRec.Body.String())
+	}
+	afterDelReq := httptest.NewRequest(http.MethodGet, "/v1/workspaces/ws-alpha/functions/fn.greet/versions/2", nil)
+	afterDelRec := httptest.NewRecorder()
+	srv.ServeHTTP(afterDelRec, afterDelReq)
+	if afterDelRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after DELETE, got %d", afterDelRec.Code)
 	}
 }

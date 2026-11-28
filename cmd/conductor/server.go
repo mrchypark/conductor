@@ -112,12 +112,17 @@ func (s *server) serveWorkspace(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && strings.HasPrefix(subPath, "/functions/") && strings.HasSuffix(subPath, "/versions"):
 		id := strings.TrimSuffix(strings.TrimPrefix(subPath, "/functions/"), "/versions")
 		s.registerFunctionVersion(w, r, workspaceID, id)
-	case r.Method == http.MethodGet && strings.HasPrefix(subPath, "/functions/"):
+	case (r.Method == http.MethodGet || r.Method == http.MethodDelete) && strings.HasPrefix(subPath, "/functions/"):
 		fnRest := strings.TrimPrefix(subPath, "/functions/")
 		parts := strings.Split(fnRest, "/")
-		if len(parts) == 3 && parts[1] == "versions" {
+		switch {
+		case r.Method == http.MethodGet && len(parts) == 1 && parts[0] != "":
+			s.listFunctionVersions(w, r, workspaceID, parts[0])
+		case r.Method == http.MethodGet && len(parts) == 3 && parts[1] == "versions":
 			s.getFunctionVersion(w, r, workspaceID, parts[0], parts[2])
-		} else {
+		case r.Method == http.MethodDelete && len(parts) == 3 && parts[1] == "versions":
+			s.deleteFunctionVersion(w, r, workspaceID, parts[0], parts[2])
+		default:
 			writeError(w, http.StatusNotFound, "route not found")
 		}
 	case r.Method == http.MethodGet && subPath == "/connectors":
