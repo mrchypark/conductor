@@ -72,14 +72,51 @@ type handlerRegisterRequest struct {
 }
 
 func (s *server) registerHandler(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	s.registerHandlerWithKey(w, r, workspaceID, "")
+}
+
+func (s *server) registerFunctionVersion(w http.ResponseWriter, r *http.Request, workspaceID, functionID string) {
+	if functionID == "" || strings.Contains(functionID, "/") {
+		writeError(w, http.StatusNotFound, "function not found")
+		return
+	}
+	s.registerHandlerWithKey(w, r, workspaceID, functionID)
+}
+
+func (s *server) getFunctionVersion(w http.ResponseWriter, _ *http.Request, workspaceID, functionID, version string) {
+	if functionID == "" || version == "" || strings.Contains(functionID, "/") || strings.Contains(version, "/") {
+		writeError(w, http.StatusNotFound, "function version not found")
+		return
+	}
+	handler, err := s.registry.ResolveScoped(workspaceID, functionID, version)
+	if err != nil {
+		if errors.Is(err, handlers.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "function version not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load function version")
+		return
+	}
+	writeJSON(w, http.StatusOK, handler.Manifest())
+}
+
+func (s *server) registerHandlerWithKey(w http.ResponseWriter, r *http.Request, workspaceID, expectedKey string) {
 	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
-		s.registerWASMUploadHandler(w, r, workspaceID)
+		s.registerWASMUploadHandlerWithKey(w, r, workspaceID, expectedKey)
 		return
 	}
 	var input handlerRegisterRequest
 	if err := decodeBody(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid handler registration request")
 		return
+	}
+	if expectedKey != "" {
+		if input.Manifest.Key == "" {
+			input.Manifest.Key = expectedKey
+		} else if input.Manifest.Key != expectedKey {
+			writeError(w, http.StatusBadRequest, "manifest handler_key does not match function id")
+			return
+		}
 	}
 	if input.Kind == "" {
 		input.Kind = "starlark"
@@ -137,6 +174,10 @@ func (s *server) registerStarlarkHandler(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *server) registerWASMUploadHandler(w http.ResponseWriter, r *http.Request, workspaceID string) {
+	s.registerWASMUploadHandlerWithKey(w, r, workspaceID, "")
+}
+
+func (s *server) registerWASMUploadHandlerWithKey(w http.ResponseWriter, r *http.Request, workspaceID, expectedKey string) {
 	if s.wasmRuntime == nil || s.wasmPush == nil {
 		writeError(w, http.StatusServiceUnavailable, "wasm upload runtime or OCI registry is not configured")
 		return
@@ -155,6 +196,14 @@ func (s *server) registerWASMUploadHandler(w http.ResponseWriter, r *http.Reques
 	if err := json.Unmarshal([]byte(manifestRaw), &manifest); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid manifest JSON")
 		return
+	}
+	if expectedKey != "" {
+		if manifest.Key == "" {
+			manifest.Key = expectedKey
+		} else if manifest.Key != expectedKey {
+			writeError(w, http.StatusBadRequest, "manifest handler_key does not match function id")
+			return
+		}
 	}
 	abi := r.FormValue("abi")
 	if abi == "" {

@@ -84,6 +84,7 @@ type ExecutionRequest struct {
 	Retry              RetryPolicy     `json:"retry"`
 	CorrelationID      string          `json:"correlation_id"`
 	CausationID        string          `json:"causation_id"`
+	AttemptID          string          `json:"attempt_id,omitempty"`
 	IdempotencyKey     string          `json:"idempotency_key"`
 }
 
@@ -500,7 +501,7 @@ func (s *Service) startLeaseHeartbeat(ctx context.Context, lease storage.LeaseRe
 }
 
 func fromRecord(r storage.ExecutionRequestRecord) ExecutionRequest {
-	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, CredentialRef: r.CredentialRef, DelegationToken: string(r.DelegationToken), ExpiresAt: r.ExpiresAt, Priority: r.Priority, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, IdempotencyKey: r.IdempotencyKey}
+	return ExecutionRequest{ExecutionRequestID: r.ID, WorkspaceID: r.WorkspaceID, WorkflowKey: r.WorkflowKey, WorkflowVersion: r.WorkflowVersion, WorkflowInstanceID: r.WorkflowID, TaskID: r.TaskID, NodeKey: r.NodeKey, HandlerKey: r.HandlerKey, HandlerVersion: r.HandlerVersion, OperationKey: r.OperationKey, ConnectionID: r.ConnectionID, CredentialRevision: r.CredentialRevision, CredentialRef: r.CredentialRef, DelegationToken: string(r.DelegationToken), ExpiresAt: r.ExpiresAt, Priority: r.Priority, SubjectRef: r.SubjectRef, InputRef: r.InputRef, DeadlineAt: r.DeadlineAt, Actor: Actor{Type: r.ActorType, ID: r.ActorID}, Input: r.Input, Timeout: r.Timeout, Retry: RetryPolicy{MaxAttempts: r.MaxAttempts, Backoff: r.RetryBackoff, BackoffMode: r.RetryBackoffMode}, CorrelationID: r.CorrelationID, CausationID: r.CausationID, AttemptID: r.AttemptID, IdempotencyKey: r.IdempotencyKey}
 }
 
 func (s *Service) executeClaim(ctx context.Context, request ExecutionRequest, lease storage.LeaseRecord, leaseTTL time.Duration) error {
@@ -781,7 +782,7 @@ func (s *Service) checkIdempotency(ctx context.Context, request ExecutionRequest
 	if err != nil {
 		return err
 	}
-	if record.HandlerKey != request.HandlerKey || record.HandlerVersion != request.HandlerVersion || record.OperationKey != request.OperationKey || record.WorkspaceID != request.WorkspaceID || record.WorkflowKey != request.WorkflowKey || record.WorkflowVersion != request.WorkflowVersion || record.WorkflowID != request.WorkflowInstanceID || record.TaskID != request.TaskID || record.NodeKey != request.NodeKey || record.ConnectionID != request.ConnectionID || record.CredentialRevision != request.CredentialRevision || record.CredentialRef != request.CredentialRef || record.Priority != request.Priority || record.ActorType != request.Actor.Type || record.ActorID != request.Actor.ID || !bytes.Equal(record.SubjectRef, request.SubjectRef) || !bytes.Equal(record.InputRef, request.InputRef) || !record.DeadlineAt.Equal(request.DeadlineAt) || record.Timeout != request.Timeout || record.MaxAttempts != request.Retry.MaxAttempts || record.RetryBackoff != request.Retry.Backoff || record.RetryBackoffMode != request.Retry.BackoffMode || record.CorrelationID != request.CorrelationID || record.CausationID != request.CausationID || record.IdempotencyKey != request.IdempotencyKey || !bytes.Equal(record.Input, request.Input) {
+	if record.HandlerKey != request.HandlerKey || record.HandlerVersion != request.HandlerVersion || record.OperationKey != request.OperationKey || record.WorkspaceID != request.WorkspaceID || record.WorkflowKey != request.WorkflowKey || record.WorkflowVersion != request.WorkflowVersion || record.WorkflowID != request.WorkflowInstanceID || record.TaskID != request.TaskID || record.NodeKey != request.NodeKey || record.ConnectionID != request.ConnectionID || record.CredentialRevision != request.CredentialRevision || record.CredentialRef != request.CredentialRef || record.Priority != request.Priority || record.ActorType != request.Actor.Type || record.ActorID != request.Actor.ID || !bytes.Equal(record.SubjectRef, request.SubjectRef) || !bytes.Equal(record.InputRef, request.InputRef) || !record.DeadlineAt.Equal(request.DeadlineAt) || record.Timeout != request.Timeout || record.MaxAttempts != request.Retry.MaxAttempts || record.RetryBackoff != request.Retry.Backoff || record.RetryBackoffMode != request.Retry.BackoffMode || record.CorrelationID != request.CorrelationID || record.CausationID != request.CausationID || record.AttemptID != request.AttemptID || record.IdempotencyKey != request.IdempotencyKey || !bytes.Equal(record.Input, request.Input) {
 		return errors.New("idempotency_conflict: execution request already exists with different content")
 	}
 	return nil
@@ -972,5 +973,5 @@ func toRecord(request ExecutionRequest) storage.ExecutionRequestRecord {
 		OperationKey: request.OperationKey, ConnectionID: request.ConnectionID, CredentialRevision: request.CredentialRevision, CredentialRef: request.CredentialRef, DelegationToken: []byte(request.DelegationToken), ExpiresAt: request.ExpiresAt, Priority: request.Priority, ActorType: request.Actor.Type, ActorID: request.Actor.ID,
 		SubjectRef: append([]byte(nil), request.SubjectRef...), InputRef: append([]byte(nil), request.InputRef...), DeadlineAt: request.DeadlineAt,
 		Input: append([]byte(nil), request.Input...), Timeout: request.Timeout, MaxAttempts: request.Retry.MaxAttempts, RetryBackoff: request.Retry.Backoff, RetryBackoffMode: request.Retry.BackoffMode,
-		CorrelationID: request.CorrelationID, CausationID: request.CausationID, IdempotencyKey: request.IdempotencyKey}
+		CorrelationID: request.CorrelationID, CausationID: request.CausationID, AttemptID: request.AttemptID, IdempotencyKey: request.IdempotencyKey}
 }

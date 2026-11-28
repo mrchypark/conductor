@@ -4,6 +4,7 @@ package callbacks
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,6 +58,18 @@ func (d *Delivery) RunOnce(ctx context.Context) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", item.ID)
+		var causationMeta struct {
+			CausationID string `json:"causation_id"`
+			AttemptID   string `json:"attempt_id"`
+		}
+		if json.Unmarshal(item.Payload, &causationMeta) == nil {
+			if causationMeta.CausationID != "" {
+				req.Header.Set("X-Causation-Event-ID", causationMeta.CausationID)
+			}
+			if causationMeta.AttemptID != "" {
+				req.Header.Set("X-Attempt-ID", causationMeta.AttemptID)
+			}
+		}
 		if d.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+d.Token)
 		}
